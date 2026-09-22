@@ -1,4 +1,4 @@
-"# IRC Client" 
+# IRC Client
 
 This IRC Client is based on mIRC client.  
 alot of stuff have to be done to make it to work same as mIRC   

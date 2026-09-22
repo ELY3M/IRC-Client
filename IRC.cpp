@@ -10,6 +10,7 @@
 #define SECURITY_WIN32
 #include <sspi.h>
 #include <schannel.h>
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
@@ -43,7 +44,7 @@ static CString Bare(CString s) { s.TrimLeft(L"@+%&~"); return s; }
 class CTls {
 public:
     CredHandle cred = {}; CtxtHandle ctx = {}; SecPkgContext_StreamSizes sz = {};
-    bool hasCred = false, hasCtx = false, ready = false, lax = false;
+    bool hasCred = false, hasCtx = false, ready = false, lax = false; long lastStatus = 0;
     std::string in, out, tosend; CString host;
     ~CTls() { if (hasCtx) DeleteSecurityContext(&ctx); if (hasCred) FreeCredentialsHandle(&cred); }
     bool Init(const CString& h, bool l) {
@@ -64,11 +65,14 @@ public:
             SECURITY_STATUS r = InitializeSecurityContextW(&cred, hasCtx ? &ctx : nullptr, (SEC_WCHAR*)(LPCWSTR)host, fl, 0, 0,
                                                            hasCtx ? &ibd : nullptr, 0, &ctx, &obd, &at, nullptr);
             if (r == SEC_E_INCOMPLETE_MESSAGE) return true;
-            if (r != SEC_E_OK && r != SEC_I_CONTINUE_NEEDED) return false;
+            if (r != SEC_E_OK && r != SEC_I_CONTINUE_NEEDED && r != SEC_I_INCOMPLETE_CREDENTIALS) { lastStatus = r; return false; }
             hasCtx = true;
             if (ob.pvBuffer) { tosend.append((char*)ob.pvBuffer, ob.cbBuffer); FreeContextBuffer(ob.pvBuffer); }
             if (ib[1].BufferType == SECBUFFER_EXTRA) in.erase(0, in.size() - ib[1].cbBuffer); else in.clear();
             if (r == SEC_E_OK) { QueryContextAttributes(&ctx, SECPKG_ATTR_STREAM_SIZES, &sz); ready = true; return true; }
+            // The server asked for a client certificate; we have none, so loop straight back and send that
+            // "no certificate" reply immediately, even though there's no new server data waiting in 'in'.
+            if (r == SEC_I_INCOMPLETE_CREDENTIALS) continue;
             if (in.empty()) return true;
         }
     }
@@ -78,7 +82,7 @@ public:
             SecBufferDesc d = { SECBUFFER_VERSION, 4, b };
             SECURITY_STATUS r = DecryptMessage(&ctx, &d, 0, nullptr);
             if (r == SEC_E_INCOMPLETE_MESSAGE) return true;
-            if (r != SEC_E_OK) return false;
+            if (r != SEC_E_OK) { lastStatus = r; return false; }
             std::string extra;
             for (auto& x : b) {
                 if (x.BufferType == SECBUFFER_DATA) out.append((char*)x.pvBuffer, x.cbBuffer);
@@ -146,6 +150,13 @@ public:
         SetDlgItemText(IDC_JOIN, o.autojoin); CheckDlgButton(IDC_TLS, o.tls); CheckDlgButton(IDC_LAX, o.lax);
         return TRUE;
     }
+    // Ticking/unticking TLS flips the port between the plaintext and TLS defaults, unless the user
+    // has already typed something else — connecting TLS to a plaintext port is the #1 cause of "SSL doesn't work".
+    afx_msg void OnTlsClick() {
+        int p = GetDlgItemInt(IDC_PORT); bool on = IsDlgButtonChecked(IDC_TLS) != 0;
+        if (p == 6667 || p == 6697) SetDlgItemInt(IDC_PORT, on ? 6697 : 6667);
+    }
+    DECLARE_MESSAGE_MAP()
     void OnOK() override {
         GetDlgItemText(IDC_HOST, o.host); o.host.Trim(); if (o.host.IsEmpty()) return;
         o.port = GetDlgItemInt(IDC_PORT); GetDlgItemText(IDC_NICK, o.nick); GetDlgItemText(IDC_USER, o.user);
@@ -157,6 +168,9 @@ public:
         CDialog::OnOK();
     }
 };
+BEGIN_MESSAGE_MAP(CConnDlg, CDialog)
+    ON_BN_CLICKED(IDC_TLS, OnTlsClick)
+END_MESSAGE_MAP()
 
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
 class CIrcSock : public CAsyncSocket {
@@ -178,7 +192,7 @@ public:
     void OnSend(int) override { Flush(); }
     void OnConnect(int e) override {
         if (e || !tls) { if (onConn) onConn(e); return; }
-        if (!tls->Handshake()) { if (onConn) onConn(-1); return; }
+        if (!tls->Handshake()) { if (onConn) onConn((int)tls->lastStatus); return; }
         Queue(tls->tosend); tls->tosend.clear();          // send ClientHello; onConn fires when TLS is ready
     }
     void OnReceive(int) override {
@@ -188,7 +202,7 @@ public:
         if (tls) {
             tls->in.append(b, n);
             if (!tls->ready) {
-                if (!tls->Handshake()) { Close(); if (onConn) onConn(-1); return; }
+                if (!tls->Handshake()) { Close(); if (onConn) onConn((int)tls->lastStatus); return; }
                 Queue(tls->tosend); tls->tosend.clear();
                 if (tls->ready && onConn) onConn(0);
             }
@@ -725,7 +739,13 @@ class CMainFrame : public CMDIFrameWnd {
 public:
     void Start() {
         m_sock.onConn = [this](int err) {
-            if (err) { SetState(L"Connection failed"); Note(L"Connection/TLS failed (error " + CString(std::to_wstring(err).c_str()) + L")", cPart); return; }
+            if (err) {
+                CString hex; hex.Format(L"0x%08X", (unsigned)err);
+                SetState(L"Connection failed");
+                Note(L"Connection/TLS failed (status " + hex + L"). If TLS is on, the most common cause is connecting to a plaintext port; "
+                     L"try the server's TLS port (often 6697) instead.", cPart);
+                return;
+            }
             m_conn = true; Note(L"Connected. Registering...");
             SetState(L"Connected to " + m_o.host + (m_o.tls ? L" (TLS)" : L"") + L", registering...");
             if (!m_o.pass.IsEmpty()) Send(L"PASS " + m_o.pass);
@@ -799,12 +819,15 @@ public:
     BOOL InitInstance() override {
         CWinApp::InitInstance();
 		//need to change this to ini file for portable version
-        SetRegistryKey(L"IRCClient"); AfxSocketInit(); AfxInitRichEdit2();
-
+        SetRegistryKey(L"IRCClient"); 
+        
+        
+        AfxSocketInit(); 
+        AfxInitRichEdit2();
         auto* f = new CMainFrame; m_pMainWnd = f;
         f->Create(nullptr, L"IRC Client", WS_OVERLAPPEDWINDOW, CRect(100, 100, 1100, 700));
         HICON hi = (HICON)::LoadImage(AfxGetInstanceHandle(), MAKEINTRESOURCE(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
-        if (hi) { f->SetIcon(hi, TRUE); f->SetIcon(hi, FALSE); }   // no-op if IRCClient.rc wasn't linked in
+        if (hi) { f->SetIcon(hi, TRUE); f->SetIcon(hi, FALSE); }   // no-op if IRC.rc wasn't linked in
         f->ShowWindow(SW_SHOW); f->UpdateWindow();
         f->Start();
         return TRUE;
