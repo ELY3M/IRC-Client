@@ -152,8 +152,8 @@ public:
         GetDlgItemText(IDC_REAL, o.real); GetDlgItemText(IDC_PASS, o.pass); GetDlgItemText(IDC_JOIN, o.autojoin);
         o.tls = IsDlgButtonChecked(IDC_TLS); o.lax = IsDlgButtonChecked(IDC_LAX);
         if (o.port <= 0 || o.port > 65535) o.port = o.tls ? 6697 : 6667;
-        if (o.nick.IsEmpty()) o.nick = L"MiniUser";
-        if (o.user.IsEmpty()) o.user = L"miniirc";
+        if (o.nick.IsEmpty()) o.nick = L"IRCClient";
+        if (o.user.IsEmpty()) o.user = L"irc";
         CDialog::OnOK();
     }
 };
@@ -441,7 +441,7 @@ END_MESSAGE_MAP()
 
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
-    CIrcSock m_sock; bool m_conn = false; CString m_nick = L"MiniUser"; Opts m_o; CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true;
+    CIrcSock m_sock; bool m_conn = false; CString m_nick = L"IRCClient"; Opts m_o; CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true;
     CString m_state = L"Not connected", m_tabKey, m_actKey, m_bt[4]; int m_seqn = 0; std::vector<CString> m_tabKeys;
     std::map<CString, CChatWnd*> m_w;
 
@@ -564,7 +564,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"me" && inChat) Say(w->m_name, arg, true);
         else if (cmd == L"notice") { CString t = Word(arg); Send(L"NOTICE " + t + L" :" + arg); Note(L"-> -" + t + L"- " + arg, cNote); }
         else if (cmd == L"topic" && w->m_chan) Send(arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
-        else if (cmd == L"quit") { Send(L"QUIT :" + (arg.IsEmpty() ? CString(L"MiniIRC") : arg)); m_conn = false; m_sock.Close(); SetState(L"Disconnected"); }
+        else if (cmd == L"quit") { Send(L"QUIT :" + (arg.IsEmpty() ? CString(L"IRCClient") : arg)); m_conn = false; m_sock.Close(); SetState(L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
         else if (cmd == L"raw" || cmd == L"quote") Send(arg);
         else if (cmd == L"help") Note(L"/server host [+port = TLS] /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
@@ -782,7 +782,7 @@ public:
         };
         if (!m_sw.m_hWnd) AfxMessageBox(L"Switchbar creation failed");
         RecalcLayout(); LayoutBars(); SetTimer(1, 500, nullptr);
-        Note(L"MiniIRC ready. Use File > Connect, or /server host [+port for TLS]. Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
+        Note(L"IRC Client ready. Use File > Connect, or /server host [+port for TLS]. Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
         PostMessage(WM_COMMAND, IDM_CONNECT);
     }
 };
@@ -794,15 +794,17 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom)
 END_MESSAGE_MAP()
 
-class CMiniApp : public CWinApp {
+class CIRCClientApp : public CWinApp {
 public:
     BOOL InitInstance() override {
         CWinApp::InitInstance();
-        SetRegistryKey(L"MiniIRC"); AfxSocketInit(); AfxInitRichEdit2();
+		//need to change this to ini file for portable version
+        SetRegistryKey(L"IRCClient"); AfxSocketInit(); AfxInitRichEdit2();
+
         auto* f = new CMainFrame; m_pMainWnd = f;
-        f->Create(nullptr, L"MiniIRC", WS_OVERLAPPEDWINDOW, CRect(100, 100, 1100, 700));
+        f->Create(nullptr, L"IRC Client", WS_OVERLAPPEDWINDOW, CRect(100, 100, 1100, 700));
         HICON hi = (HICON)::LoadImage(AfxGetInstanceHandle(), MAKEINTRESOURCE(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
-        if (hi) { f->SetIcon(hi, TRUE); f->SetIcon(hi, FALSE); }   // no-op if MiniIRC.rc wasn't linked in
+        if (hi) { f->SetIcon(hi, TRUE); f->SetIcon(hi, FALSE); }   // no-op if IRCClient.rc wasn't linked in
         f->ShowWindow(SW_SHOW); f->UpdateWindow();
         f->Start();
         return TRUE;
