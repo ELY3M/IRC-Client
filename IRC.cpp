@@ -19,6 +19,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <afxcmn.h>
 #include <afxsock.h>
 #include <afxext.h>
+#include <afxdlgs.h>
 #include <map>
 #include <vector>
 #include <functional>
@@ -126,7 +127,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -274,11 +275,13 @@ public:
     std::function<void(CString)> onOpen;      // open/join a nick or #channel
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
 
-    void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {
+    void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
         m_out.SetSel(-1, -1);
         CHARFORMAT2 cf = {}; cf.cbSize = sizeof cf;
-        cf.dwMask = CFM_COLOR | CFM_BACKCOLOR | CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE;
-        cf.crTextColor = fg; cf.crBackColor = bg == CLR_NONE ? RGB(255, 255, 255) : bg; cf.dwEffects = fx;
+        cf.dwMask = CFM_COLOR | CFM_BACKCOLOR | CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_FACE | CFM_SIZE;
+        cf.crTextColor = fg; cf.crBackColor = bg == CLR_NONE ? RGB(255, 255, 255) : bg;
+        cf.dwEffects = fx | (m_baseBold ? CFE_BOLD : 0) | (m_baseItalic ? CFE_ITALIC : 0);
+        cf.yHeight = m_fontTwips; wcsncpy_s(cf.szFaceName, m_face, LF_FACESIZE - 1);
         m_out.SetSelectionCharFormat(cf);
         m_out.ReplaceSel(t);
     }
@@ -327,6 +330,23 @@ public:
     void Clear() { m_out.SetWindowText(L""); }
     void SetTopic(const CString& t) { if (m_chan) m_topic.SetWindowText(Strip(t)); }
     void AddNick(const CString& n) { if (m_chan && !n.IsEmpty() && !HasNick(Bare(n))) m_nicks.AddString(n); }
+    void ApplyFont(const LOGFONT& lf) {   // called once at creation and again whenever the user changes the font
+        m_font.DeleteObject(); m_font.CreateFontIndirectW(&lf);
+        wcsncpy_s(m_face, lf.lfFaceName, LF_FACESIZE - 1);
+        m_baseBold = lf.lfWeight >= FW_BOLD; m_baseItalic = lf.lfItalic != 0;
+        if (m_out.m_hWnd) {
+            CClientDC dc(&m_out); m_fontTwips = -MulDiv(lf.lfHeight, 1440, dc.GetDeviceCaps(LOGPIXELSY));
+            // A Rich Edit control mostly ignores WM_SETFONT (what CWnd::SetFont sends) once it has text, so
+            // that alone won't restyle anything. Force the font onto every existing character explicitly instead.
+            CHARFORMAT2 cf = {}; cf.cbSize = sizeof cf; cf.dwMask = CFM_FACE | CFM_SIZE;
+            cf.yHeight = m_fontTwips; wcsncpy_s(cf.szFaceName, m_face, LF_FACESIZE - 1);
+            long s = 0, e = 0; m_out.GetSel(s, e);
+            m_out.SetSel(0, -1); m_out.SetSelectionCharFormat(cf);   // keeps each line's own color, only changes face/size
+            m_out.SetSel(s, e);
+        }
+        if (m_in.m_hWnd) m_in.SetFont(&m_font);
+        if (m_chan) { if (m_topic.m_hWnd) m_topic.SetFont(&m_font); if (m_nicks.m_hWnd) m_nicks.SetFont(&m_font); }
+    }
     void ClearNicks() { if (m_chan) m_nicks.ResetContent(); }
     int NickCount() { return m_chan ? m_nicks.GetCount() : 0; }
     int FindNick(const CString& n) {
@@ -341,6 +361,7 @@ public:
     bool DelNick(const CString& n) { int i = FindNick(n); if (i < 0) return false; m_nicks.DeleteString(i); return true; }
 
 protected:
+    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = L"Fixedsys"; bool m_baseBold = false, m_baseItalic = false;
     CLogEdit m_out; CEdit m_in, m_topic; CListBox m_nicks; CFont m_font;
 
     afx_msg int OnCreate(LPCREATESTRUCT cs) {
@@ -349,7 +370,7 @@ protected:
         m_out.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, z, this, 1);
         m_out.LimitText(0x7FFFFFF); m_out.onLink = [this](CString w) { if (onOpen) onOpen(w); };
         m_in.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, z, this, 2);
-        m_font.CreatePointFont(100, L"Consolas");
+        m_font.CreatePointFont(100, L"Fixedsys");
         m_out.SetFont(&m_font); m_in.SetFont(&m_font);
         if (m_chan) {
             m_topic.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, z, this, 3);
@@ -473,7 +494,7 @@ END_MESSAGE_MAP()
 
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
-    CIrcSock m_sock; bool m_conn = false; CString m_nick = L"IRCClient"; Opts m_o; CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true;
+    CIrcSock m_sock; bool m_conn = false; CString m_nick = L"User"; Opts m_o; CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
     CString m_state = L"Not connected", m_tabKey, m_actKey, m_bt[4]; int m_seqn = 0; std::vector<CString> m_tabKeys;
     std::map<CString, CChatWnd*> m_w;
 
@@ -531,6 +552,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->onOpen = [this](CString t) { Goto(t); };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        w->ApplyFont(m_chatFont);
         m_w[Key(name)] = w;
         return w;
     }
@@ -551,7 +573,6 @@ class CMainFrame : public CMDIFrameWnd {
         u += "\r\n";
         m_sock.Write(std::string((LPCSTR)u, u.GetLength()));
     }
-
     void Say(const CString& target, const CString& text, bool action = false) {
         CChatWnd* w = Find(target); if (!w) w = Open(target, IsChan(target));
         if (action) { Send(L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + m_nick + L" " + text, cAct); }
@@ -683,6 +704,27 @@ class CMainFrame : public CMDIFrameWnd {
     }
 
     BOOL OnCreateClient(LPCREATESTRUCT lpcs, CCreateContext*) override { return CreateClient(lpcs, nullptr); }
+    void MakeFont(LOGFONT& lf, const CString& face, int pt, bool bold, bool italic) {
+        ZeroMemory(&lf, sizeof lf);
+        CClientDC dc(this);
+        lf.lfHeight = -MulDiv(pt, dc.GetDeviceCaps(LOGPIXELSY), 72);
+        lf.lfWeight = bold ? FW_BOLD : FW_NORMAL; lf.lfItalic = italic;
+        lf.lfCharSet = DEFAULT_CHARSET; lf.lfOutPrecision = OUT_DEFAULT_PRECIS; lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+        lf.lfQuality = DEFAULT_QUALITY; lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+        wcsncpy_s(lf.lfFaceName, face.IsEmpty() ? CString(L"Consolas") : face, LF_FACESIZE - 1);
+    }
+    void LoadFont() {
+        CWinApp* a = AfxGetApp();
+        CString face = a->GetProfileString(L"Font", L"Face", L"Consolas");
+        int pt = a->GetProfileInt(L"Font", L"Size", 10);
+        MakeFont(m_chatFont, face, pt, a->GetProfileInt(L"Font", L"Bold", 0) != 0, a->GetProfileInt(L"Font", L"Italic", 0) != 0);
+    }
+    void SaveFont() {
+        CWinApp* a = AfxGetApp(); CClientDC dc(this);
+        int pt = -MulDiv(m_chatFont.lfHeight, 72, dc.GetDeviceCaps(LOGPIXELSY));
+        a->WriteProfileString(L"Font", L"Face", m_chatFont.lfFaceName); a->WriteProfileInt(L"Font", L"Size", pt);
+        a->WriteProfileInt(L"Font", L"Bold", m_chatFont.lfWeight >= FW_BOLD); a->WriteProfileInt(L"Font", L"Italic", m_chatFont.lfItalic);
+    }
     void LoadOpts() {
         CWinApp* a = AfxGetApp();
         m_o.host = a->GetProfileString(L"Conn", L"Host", m_o.host); m_o.port = a->GetProfileInt(L"Conn", L"Port", m_o.port);
@@ -730,6 +772,13 @@ class CMainFrame : public CMDIFrameWnd {
         CConnDlg d(m_o, this);
         if (d.DoModal() == IDOK) { SaveOpts(); m_nick = m_o.nick; Connect(m_o.host, m_o.port); }
     }
+    afx_msg void OnFont() {
+        LOGFONT lf = m_chatFont;
+        CFontDialog dlg(&lf, CF_SCREENFONTS, nullptr, this);
+        if (dlg.DoModal() != IDOK) return;
+        dlg.GetCurrentFont(&lf); m_chatFont = lf; SaveFont();
+        for (auto& kv : m_w) kv.second->ApplyFont(m_chatFont);   // applies to every open window; new text in each uses it too
+    }
     afx_msg void OnDisconnect() { OnInput(Status(), L"/quit"); }
     afx_msg void OnCascade() { MDICascade(); }
     afx_msg void OnTile() { MDITile(MDITILE_HORIZONTAL); }
@@ -772,9 +821,10 @@ public:
         };
         m_sock.onLine = [this](const CString& s) { OnLine(s); };
         m_sock.onDrop = [this]() { m_conn = false; SetState(L"Disconnected"); Note(L"Disconnected.", cPart); };
-        LoadOpts(); m_nick = m_o.nick;
+        LoadOpts(); LoadFont(); m_nick = m_o.nick;
         CMenu f, w;
         f.CreatePopupMenu(); f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
+        f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
         f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_EXIT, L"E&xit");
         w.CreatePopupMenu(); w.AppendMenu(MF_STRING, IDM_CASCADE, L"&Cascade"); w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
         w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
@@ -828,7 +878,7 @@ public:
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
-    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_WM_TIMER() ON_WM_SIZE()
+    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_WM_TIMER() ON_WM_SIZE()
     ON_COMMAND(IDM_SWTOP, OnSwTop) ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
     ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom)
 END_MESSAGE_MAP()
