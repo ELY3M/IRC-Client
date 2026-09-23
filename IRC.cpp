@@ -820,11 +820,14 @@ public:
     BOOL InitInstance() override {
         CWinApp::InitInstance();
 		//need to change this to ini file for portable version
-        SetRegistryKey(L"IRCClient"); 
+        //SetRegistryKey(L"IRCClient"); 
         
         
         AfxSocketInit(); 
         AfxInitRichEdit2();
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        CString ini = exe; ini = ini.Left(ini.ReverseFind(L'\\') + 1) + L"IRC.ini";
+        free((void*)m_pszProfileName); m_pszProfileName = _wcsdup(ini);
         auto* f = new CMainFrame; m_pMainWnd = f;
         f->Create(nullptr, L"IRC Client", WS_OVERLAPPEDWINDOW, CRect(100, 100, 1100, 700));
         HICON hi = (HICON)::LoadImage(AfxGetInstanceHandle(), MAKEINTRESOURCE(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
