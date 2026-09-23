@@ -726,6 +726,7 @@ class CMainFrame : public CMDIFrameWnd {
         LayoutBars();
     }
     void LayoutBars() {   // then we carve the switchbar's strip off the top OR bottom of that MDI-client area
+        RecalcLayout();   // reset the MDI client to its full size first, or repeated calls (e.g. switching top/bottom) compound
         if (!m_sw.m_hWnd || !m_hWndMDIClient) return;
         CRect r; ::GetWindowRect(m_hWndMDIClient, &r); ScreenToClient(&r);
         int h = CSwitchBar::HEIGHT;
