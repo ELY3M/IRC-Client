@@ -29,6 +29,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <schannel.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
 #define VERSION L"IRC Client 1.0"
