@@ -60,6 +60,10 @@ static CString Word(CString& s) {
     return w;
 }
 static CString Bare(CString s) { s.TrimLeft(L"@+%&~"); return s; }
+static CString IniPath(LPCWSTR name) {   // e.g. IniPath(L"servers.ini") -> full path next to the .exe
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    CString p = exe; return p.Left(p.ReverseFind(L'\\') + 1) + name;
+}
 
 // ---------------- TLS client layer (Windows SChannel, no external libs) ----------------
 class CTls {
@@ -129,12 +133,13 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
     int port = 6667; BOOL tls = FALSE, lax = FALSE;
 };
+struct Bookmark { CString name; Opts o; };   // one saved entry in the server list (servers.ini); password is never saved
 class CConnDlg : public CDialog {
     Opts& o; std::vector<WORD> t; int cnt = 0;
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
@@ -219,6 +224,63 @@ public:
     BOOL OnInitDialog() override { CDialog::OnInitDialog(); SetDlgItemText(101, val); return TRUE; }
     void OnOK() override { GetDlgItemText(101, val); CDialog::OnOK(); }
 };
+
+// ---------------- Server List: saved bookmarks (host/port/nick/etc.), stored in servers.ini ----------------
+enum { IDC_SLIST = 201, IDC_SL_CONNECT = 210, IDC_SL_NEW, IDC_SL_EDIT, IDC_SL_DELETE };
+class CServerListDlg : public CDialog {
+    std::vector<Bookmark>& bm; std::vector<WORD> t; int cnt = 0; CListBox m_list;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    void Refill() {
+        m_list.ResetContent();
+        for (auto& e : bm) { CString p; p.Format(L"%d", e.o.port); m_list.AddString(e.name + L"  (" + e.o.host + L":" + p + (e.o.tls ? L", TLS)" : L")")); }
+    }
+public:
+    int connectIdx = -1;
+    CServerListDlg(std::vector<Bookmark>& b, CWnd* parent) : bm(b) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(254); t.push_back(156);
+        t.push_back(0); t.push_back(0); S(L"Server List"); t.push_back(9); S(L"Segoe UI");
+        Item(LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 6, 8, 242, 118, IDC_SLIST, 0x0083, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 6, 132, 48, 16, IDC_SL_CONNECT, 0x0080, L"Connect");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 58, 132, 44, 16, IDC_SL_NEW, 0x0080, L"New...");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 106, 132, 44, 16, IDC_SL_EDIT, 0x0080, L"Edit...");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 154, 132, 50, 16, IDC_SL_DELETE, 0x0080, L"Delete");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 208, 132, 40, 16, IDCANCEL, 0x0080, L"Close");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override { CDialog::OnInitDialog(); m_list.SubclassDlgItem(IDC_SLIST, this); Refill(); return TRUE; }
+    afx_msg void OnConnectBtn() { int i = m_list.GetCurSel(); if (i >= 0) { connectIdx = i; CDialog::OnOK(); } }
+    afx_msg void OnNewBtn() {
+        Opts o; CConnDlg d(o, this);
+        if (d.DoModal() != IDOK) return;
+        CString name = o.host; CPromptDlg pd(name, L"Server List", L"Name for this entry:", this);
+        if (pd.DoModal() != IDOK || name.IsEmpty()) return;
+        Bookmark e; e.name = name; e.o = o; bm.push_back(e); Refill();
+    }
+    afx_msg void OnEditBtn() {
+        int i = m_list.GetCurSel(); if (i < 0) return;
+        CConnDlg d(bm[i].o, this);
+        if (d.DoModal() == IDOK) Refill();
+    }
+    afx_msg void OnDeleteBtn() {
+        int i = m_list.GetCurSel(); if (i < 0) return;
+        if (AfxMessageBox(L"Delete this server entry?", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        bm.erase(bm.begin() + i); Refill();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CServerListDlg, CDialog)
+    ON_BN_CLICKED(IDC_SL_CONNECT, OnConnectBtn) ON_BN_CLICKED(IDC_SL_NEW, OnNewBtn)
+    ON_BN_CLICKED(IDC_SL_EDIT, OnEditBtn) ON_BN_CLICKED(IDC_SL_DELETE, OnDeleteBtn)
+END_MESSAGE_MAP()
 
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
 class CIrcSock : public CAsyncSocket {
@@ -559,6 +621,7 @@ struct Net {
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
+    std::vector<Bookmark> m_bookmarks;   // saved server list (servers.ini)
     CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
     CString m_bt[4]; int m_seqn = 0; std::vector<CChatWnd*> m_tabWnds;
     std::map<CString, CChatWnd*> m_w;
@@ -867,8 +930,52 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileString(L"Conn", L"Real", m_defOpts.real); a->WriteProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         a->WriteProfileInt(L"Conn", L"TLS", m_defOpts.tls); a->WriteProfileInt(L"Conn", L"Lax", m_defOpts.lax);
     }
-    void BuildToolbar() {   // 16x16 glyphs of our own design: green=connect, red=disconnect, blue squares=window layout
-        const int W = 16, H = 16, N = 4;
+    void LoadBookmarks() {   // servers.ini is separate from MiniIRC.ini — a plain bookmark list, not app settings
+        m_bookmarks.clear();
+        CString path = IniPath(L"servers.ini");
+        int n = GetPrivateProfileIntW(L"Servers", L"Count", 0, path);
+        wchar_t buf[256];
+        for (int i = 0; i < n; i++) {
+            CString sec; sec.Format(L"Server%d", i);
+            Bookmark e;
+            GetPrivateProfileStringW(sec, L"Name", L"", buf, 256, path); e.name = buf;
+            GetPrivateProfileStringW(sec, L"Host", L"", buf, 256, path); e.o.host = buf;
+            e.o.port = GetPrivateProfileIntW(sec, L"Port", 6667, path);
+            GetPrivateProfileStringW(sec, L"Nick", L"YourNickname", buf, 256, path); e.o.nick = buf;
+            GetPrivateProfileStringW(sec, L"User", L"irc", buf, 256, path); e.o.user = buf;
+            GetPrivateProfileStringW(sec, L"Real", L"IRC user", buf, 256, path); e.o.real = buf;
+            GetPrivateProfileStringW(sec, L"Join", L"", buf, 256, path); e.o.autojoin = buf;
+            e.o.tls = GetPrivateProfileIntW(sec, L"TLS", 0, path); e.o.lax = GetPrivateProfileIntW(sec, L"Lax", 0, path);
+            if (!e.name.IsEmpty() || !e.o.host.IsEmpty()) m_bookmarks.push_back(e);
+        }
+    }
+    void SaveBookmarks() {   // password is deliberately never saved here either
+        CString path = IniPath(L"servers.ini");
+        ::DeleteFileW(path);   // simplest way to cleanly rewrite the whole list, since entries can be deleted/reordered
+        CString cs; cs.Format(L"%d", (int)m_bookmarks.size());
+        WritePrivateProfileStringW(L"Servers", L"Count", cs, path);
+        for (size_t i = 0; i < m_bookmarks.size(); i++) {
+            CString sec; sec.Format(L"Server%d", (int)i); auto& e = m_bookmarks[i];
+            WritePrivateProfileStringW(sec, L"Name", e.name, path); WritePrivateProfileStringW(sec, L"Host", e.o.host, path);
+            CString ps; ps.Format(L"%d", e.o.port); WritePrivateProfileStringW(sec, L"Port", ps, path);
+            WritePrivateProfileStringW(sec, L"Nick", e.o.nick, path); WritePrivateProfileStringW(sec, L"User", e.o.user, path);
+            WritePrivateProfileStringW(sec, L"Real", e.o.real, path); WritePrivateProfileStringW(sec, L"Join", e.o.autojoin, path);
+            WritePrivateProfileStringW(sec, L"TLS", e.o.tls ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Lax", e.o.lax ? L"1" : L"0", path);
+        }
+    }
+    afx_msg void OnServerList() {
+        CServerListDlg d(m_bookmarks, this);
+        d.DoModal();   // Close returns IDCANCEL either way; connectIdx tells us whether "Connect" was used
+        SaveBookmarks();   // persist any add/edit/delete the user made, regardless of how the dialog was closed
+        if (d.connectIdx < 0 || d.connectIdx >= (int)m_bookmarks.size()) return;
+        Bookmark& e = m_bookmarks[d.connectIdx];
+        Net* net = NewNet(); net->o = e.o; net->nick = e.o.nick; net->tag = e.o.host;
+        Status(net);
+        Connect(net, e.o.host, e.o.port);
+    }
+
+    void BuildToolbar() {   // 16x16 glyphs of our own design: green=connect, red=disconnect, blue squares=window layout, bars=server list
+        const int W = 16, H = 16, N = 5;
         CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
         CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
         CBitmap* oldBmp = mem.SelectObject(&bmp);
@@ -881,18 +988,23 @@ class CMainFrame : public CMDIFrameWnd {
         };
         glyph(0, RGB(0, 160, 0), true); glyph(1, RGB(190, 0, 0), true);
         glyph(2, RGB(70, 110, 200), false); glyph(3, RGB(70, 110, 200), false);
+        { CBrush br(RGB(120, 80, 170)); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(40, 40, 40)); CPen* op = mem.SelectObject(&pn);
+          for (int k = 0; k < 3; k++) mem.Rectangle(CRect(4 * W + 3, 4 + k * 4, 4 * W + 13, 6 + k * 4));   // 3 bars = "list" glyph
+          mem.SelectObject(ob); mem.SelectObject(op); }
         mem.SelectObject(oldBmp);
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0); m_tbImg.Add(&bmp, RGB(255, 0, 255));
         m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        TBBUTTON b[6] = {};
+        TBBUTTON b[8] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
-        b[3].iBitmap = 2; b[3].idCommand = IDM_CASCADE; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
-        b[4].iBitmap = 3; b[4].idCommand = IDM_TILE; b[4].fsState = TBSTATE_ENABLED; b[4].fsStyle = TBSTYLE_BUTTON;
-        b[5].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(6, b);
+        b[3].iBitmap = 4; b[3].idCommand = IDM_SERVERS; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
+        b[4].fsStyle = TBSTYLE_SEP;
+        b[5].iBitmap = 2; b[5].idCommand = IDM_CASCADE; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;
+        b[6].iBitmap = 3; b[6].idCommand = IDM_TILE; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;
+        b[7].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(8, b);
         m_tb.GetToolBarCtrl().SetButtonSize(CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // always starts a brand-new, independent network (like /server -m)
@@ -969,10 +1081,11 @@ class CMainFrame : public CMDIFrameWnd {
     DECLARE_MESSAGE_MAP()
 public:
     void Start() {
-        LoadOpts(); LoadFont();
+        LoadOpts(); LoadFont(); LoadBookmarks();
         CMenu f, w;
         f.CreatePopupMenu(); f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
         f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
+        f.AppendMenu(MF_STRING, IDM_SERVERS, L"&Server List...");
         f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_EXIT, L"E&xit");
         w.CreatePopupMenu(); w.AppendMenu(MF_STRING, IDM_CASCADE, L"&Cascade"); w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
         w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
@@ -1037,7 +1150,7 @@ public:
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
-    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_WM_TIMER() ON_WM_SIZE()
+    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SERVERS, OnServerList) ON_WM_TIMER() ON_WM_SIZE()
     ON_COMMAND(IDM_SWTOP, OnSwTop) ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
     ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom) ON_WM_INITMENUPOPUP()
 END_MESSAGE_MAP()
