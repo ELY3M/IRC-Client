@@ -193,6 +193,33 @@ BEGIN_MESSAGE_MAP(CConnDlg, CDialog)
     ON_BN_CLICKED(IDC_TLS, OnTlsClick)
 END_MESSAGE_MAP()
 
+// ---------------- One-line text prompt (used for "Notice") ----------------
+class CPromptDlg : public CDialog {
+    CString& val; CString title, label; std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    CPromptDlg(CString& v, CString ttl, CString lbl, CWnd* parent) : val(v), title(ttl), label(lbl) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(220); t.push_back(66);
+        t.push_back(0); t.push_back(0); S(title); t.push_back(9); S(L"Segoe UI");
+        Item(SS_LEFT, 8, 8, 204, 10, 0xFFFF, 0x0082, label);
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 204, 12, 101, 0x0081, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 100, 40, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 156, 40, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override { CDialog::OnInitDialog(); SetDlgItemText(101, val); return TRUE; }
+    void OnOK() override { GetDlgItemText(101, val); CDialog::OnOK(); }
+};
+
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
 class CIrcSock : public CAsyncSocket {
 public:
@@ -271,6 +298,25 @@ END_MESSAGE_MAP()
 // ---------------- MDI child: status / channel / query window ----------------
 struct Net;   // forward decl: each chat window belongs to one network (see the Net struct, defined near CMainFrame)
 
+// ---------------- Nick list: right-click a nick for Whois / Query / Notice ----------------
+class CNickList : public CListBox {
+public:
+    std::function<void(CString, CPoint)> onRClick;
+protected:
+    afx_msg void OnRButtonDown(UINT, CPoint p) {
+        BOOL outside = TRUE; int idx = ItemFromPoint(p, outside);
+        if (idx < 0 || outside) return;
+        SetCurSel(idx);
+        CString s; GetText(idx, s);
+        CPoint sp = p; ClientToScreen(&sp);
+        if (onRClick) onRClick(s, sp);
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CNickList, CListBox)
+    ON_WM_RBUTTONDOWN()
+END_MESSAGE_MAP()
+
 class CChatWnd : public CMDIChildWnd {
 public:
     CString m_name; bool m_chan, m_refresh = false; int m_act = 0, m_seq = 0;   // m_act: 0 none, 1 event, 2 message
@@ -278,6 +324,7 @@ public:
     std::function<void(CChatWnd*, CString)> onInput;
     std::function<void(CChatWnd*)> onClose;
     std::function<void(CChatWnd*, CString)> onOpen;      // open/join a nick or #channel, on this window's network
+    std::function<void(CChatWnd*, CString, CPoint)> onNickMenu;   // right-click a nick in the user list
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
 
     void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
@@ -367,7 +414,7 @@ public:
 
 protected:
     long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = DEFAULT_FONT; bool m_baseBold = false, m_baseItalic = false;
-    CLogEdit m_out; CEdit m_in, m_topic; CListBox m_nicks; CFont m_font;
+    CLogEdit m_out; CEdit m_in, m_topic; CNickList m_nicks; CFont m_font;
 
     afx_msg int OnCreate(LPCREATESTRUCT cs) {
         if (CMDIChildWnd::OnCreate(cs) == -1) return -1;
@@ -380,6 +427,7 @@ protected:
         if (m_chan) {
             m_topic.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, z, this, 3);
             m_nicks.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_SORT | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, z, this, 4);
+            m_nicks.onRClick = [this](CString n, CPoint pt) { if (onNickMenu) onNickMenu(this, Bare(n), pt); };
             m_topic.SetFont(&m_font); m_nicks.SetFont(&m_font);
         }
         return 0;
@@ -501,7 +549,7 @@ END_MESSAGE_MAP()
 struct Net {
     CIrcSock sock;
     bool conn = false;
-    CString nick = L"MiniUser";
+    CString nick = L"User";
     Opts o;
     CString state = L"Not connected";
     CString tag;      // short label prefixed onto this network's windows in the switchbar, once there's more than one
@@ -522,7 +570,7 @@ class CMainFrame : public CMDIFrameWnd {
     Net* NewNet() {   // a brand-new, independent connection: its own socket, nick, status window and channels
         m_nets.push_back(std::make_unique<Net>());
         Net* net = m_nets.back().get();
-        net->id = ++m_netSeq; net->o = m_defOpts; net->nick = m_defOpts.nick.IsEmpty() ? CString(L"MiniUser") : m_defOpts.nick;
+        net->id = ++m_netSeq; net->o = m_defOpts; net->nick = m_defOpts.nick.IsEmpty() ? CString(L"User") : m_defOpts.nick;
         WireNet(net);
         return net;
     }
@@ -598,6 +646,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
+        w->onNickMenu = [this](CChatWnd* c, CString nick, CPoint pt) { ShowNickMenu(c, nick, pt); };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
@@ -640,6 +689,28 @@ class CMainFrame : public CMDIFrameWnd {
         if (!net->sock.Create() || (!net->sock.Connect(host, port) && GetLastError() != WSAEWOULDBLOCK))
             Note(net, L"Connect failed", cPart);
     }
+    void ShowNickMenu(CChatWnd* c, const CString& nick, CPoint pt) {   // right-click a nick in the user list
+        Net* net = c->net; if (!net) return;
+        CMenu m; m.CreatePopupMenu();
+        m.AppendMenu(MF_STRING, 1, L"Whois");
+        m.AppendMenu(MF_STRING, 2, L"Query (Privmsg)");
+        m.AppendMenu(MF_STRING, 3, L"Notice");
+        SetForegroundWindow();
+        m_menuOpen = true;
+        int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        m_menuOpen = false;
+        PostMessage(WM_NULL, 0, 0);
+        switch (cmd) {
+            case 1: Send(net, L"WHOIS " + nick); break;
+            case 2: Activate(Open(net, nick, false)); break;
+            case 3: {
+                CString txt;
+                CPromptDlg d(txt, L"Send Notice", L"Notice to " + nick + L":", this);
+                if (d.DoModal() == IDOK && !txt.IsEmpty()) { Send(net, L"NOTICE " + nick + L" :" + txt); Note(net, L"-> -" + nick + L"- " + txt, cNote); }
+                break;
+            }
+        }
+    }
 
     // ---- user input ----
     void OnInput(CChatWnd* w, CString s) {
@@ -673,7 +744,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"me" && inChat) Say(net, w->m_name, arg, true);
         else if (cmd == L"notice") { CString t = Word(arg); Send(net, L"NOTICE " + t + L" :" + arg); Note(net, L"-> -" + t + L"- " + arg, cNote); }
         else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
-        else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(L"MiniIRC") : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
+        else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
@@ -703,7 +774,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (!txt.IsEmpty() && txt[0] == 1) {
                 txt.Trim(CString(wchar_t(1)));
                 if (txt.Left(6) == L"ACTION") Show(w, L"* " + nick + txt.Mid(6), cAct);
-                else if (txt == L"VERSION" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION MiniIRC 1.0 (MFC)" + CString(wchar_t(1)));
+                else if (txt == L"VERSION" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
                 else Show(w, L"[CTCP " + txt + L" from " + nick + L"]", cNote);
             }
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNote);
@@ -975,9 +1046,6 @@ class CIRCClientApp : public CWinApp {
 public:
     BOOL InitInstance() override {
         CWinApp::InitInstance();
-		//need to change this to ini file for portable version
-        //SetRegistryKey(L"IRCClient"); 
-        
         
         AfxSocketInit(); 
         AfxInitRichEdit2();
