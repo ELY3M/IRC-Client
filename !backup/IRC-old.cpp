@@ -21,7 +21,6 @@ along with this program.  If not, see <https://gnu.org>.
 #include <afxext.h>
 #include <afxdlgs.h>
 #include <map>
-#include <memory>
 #include <vector>
 #include <functional>
 #include <string>
@@ -35,7 +34,6 @@ along with this program.  If not, see <https://gnu.org>.
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
 #define VERSION L"IRC Client 1.0 - https://github.com/ELY3M/IRC-Client"
-#define DEFAULT_FONT L"Fixedsys"
 
 static const COLORREF cText = RGB(0,0,0), cJoin = RGB(0,140,0), cPart = RGB(150,0,0),
                       cNote = RGB(200,110,0), cAct = RGB(150,0,150), cInfo = RGB(0,0,180);
@@ -269,15 +267,12 @@ BEGIN_MESSAGE_MAP(CLogEdit, CRichEditCtrl)
 END_MESSAGE_MAP()
 
 // ---------------- MDI child: status / channel / query window ----------------
-struct Net;   // forward decl: each chat window belongs to one network (see the Net struct, defined near CMainFrame)
-
 class CChatWnd : public CMDIChildWnd {
 public:
     CString m_name; bool m_chan, m_refresh = false; int m_act = 0, m_seq = 0;   // m_act: 0 none, 1 event, 2 message
-    Net* net = nullptr;   // which network this window belongs to; set by the frame right after construction
     std::function<void(CChatWnd*, CString)> onInput;
     std::function<void(CChatWnd*)> onClose;
-    std::function<void(CChatWnd*, CString)> onOpen;      // open/join a nick or #channel, on this window's network
+    std::function<void(CString)> onOpen;      // open/join a nick or #channel
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
 
     void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
@@ -366,16 +361,16 @@ public:
     bool DelNick(const CString& n) { int i = FindNick(n); if (i < 0) return false; m_nicks.DeleteString(i); return true; }
 
 protected:
-    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = DEFAULT_FONT; bool m_baseBold = false, m_baseItalic = false;
+    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = L"Fixedsys"; bool m_baseBold = false, m_baseItalic = false;
     CLogEdit m_out; CEdit m_in, m_topic; CListBox m_nicks; CFont m_font;
 
     afx_msg int OnCreate(LPCREATESTRUCT cs) {
         if (CMDIChildWnd::OnCreate(cs) == -1) return -1;
         CRect z(0, 0, 0, 0);
         m_out.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, z, this, 1);
-        m_out.LimitText(0x7FFFFFF); m_out.onLink = [this](CString w) { if (onOpen) onOpen(this, w); };
+        m_out.LimitText(0x7FFFFFF); m_out.onLink = [this](CString w) { if (onOpen) onOpen(w); };
         m_in.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, z, this, 2);
-        m_font.CreatePointFont(100, DEFAULT_FONT);
+        m_font.CreatePointFont(100, L"Fixedsys");
         m_out.SetFont(&m_font); m_in.SetFont(&m_font);
         if (m_chan) {
             m_topic.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, z, this, 3);
@@ -395,7 +390,7 @@ protected:
     }
     afx_msg void OnNickDbl() {   // double-click a nick in the list -> open a query window
         int i = m_nicks.GetCurSel(); CString n;
-        if (i >= 0 && onOpen) { m_nicks.GetText(i, n); onOpen(this, Bare(n)); }
+        if (i >= 0 && onOpen) { m_nicks.GetText(i, n); onOpen(Bare(n)); }
     }
     afx_msg void OnSetFocus(CWnd*) { m_in.SetFocus(); }
     afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClose) onClose(this); }
@@ -497,191 +492,140 @@ BEGIN_MESSAGE_MAP(CSwitchBar, CWnd)
     ON_WM_PAINT() ON_WM_LBUTTONDOWN() ON_WM_RBUTTONUP() ON_WM_MBUTTONUP()
 END_MESSAGE_MAP()
 
-// ---------------- Net: one IRC connection (its own socket, nick, options and status text) ----------------
-struct Net {
-    CIrcSock sock;
-    bool conn = false;
-    CString nick = L"MiniUser";
-    Opts o;
-    CString state = L"Not connected";
-    CString tag;      // short label prefixed onto this network's windows in the switchbar, once there's more than one
-    int id = 0;
-};
-
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
-    std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
-    CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
-    CString m_bt[4]; int m_seqn = 0; std::vector<CChatWnd*> m_tabWnds;
+    CIrcSock m_sock; bool m_conn = false; CString m_nick = L"User"; Opts m_o; CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
+    CString m_state = L"Not connected", m_tabKey, m_actKey, m_bt[4]; int m_seqn = 0; std::vector<CString> m_tabKeys;
     std::map<CString, CChatWnd*> m_w;
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
-    static CString Key(Net* net, CString s) { s.MakeLower(); CString k; k.Format(L"%d:", net ? net->id : 0); return k + s; }
-    CChatWnd* Find(Net* net, const CString& n) { auto i = m_w.find(Key(net, n)); return i == m_w.end() ? nullptr : i->second; }
-    CChatWnd* Status(Net* net) { return Open(net, L"*status*", false); }
-    Net* NewNet() {   // a brand-new, independent connection: its own socket, nick, status window and channels
-        m_nets.push_back(std::make_unique<Net>());
-        Net* net = m_nets.back().get();
-        net->id = ++m_netSeq; net->o = m_defOpts; net->nick = m_defOpts.nick.IsEmpty() ? CString(L"MiniUser") : m_defOpts.nick;
-        WireNet(net);
-        return net;
-    }
-    void WireNet(Net* net) {   // hooks this network's socket callbacks; called once, right after NewNet()
-        net->sock.onConn = [this, net](int err) {
-            if (err) {
-                CString hex; hex.Format(L"0x%08X", (unsigned)err);
-                SetState(net, L"Connection failed");
-                Note(net, L"Connection/TLS failed (status " + hex + L"). If TLS is on, the most common cause is connecting to a plaintext port; "
-                     L"try the server's TLS port (often 6697) instead.", cPart);
-                return;
-            }
-            net->conn = true; Note(net, L"Connected. Registering...");
-            SetState(net, L"Connected to " + net->o.host + (net->o.tls ? L" (TLS)" : L"") + L", registering...");
-            if (!net->o.pass.IsEmpty()) Send(net, L"PASS " + net->o.pass);
-            Send(net, L"NICK " + net->nick); Send(net, L"USER " + net->o.user + L" 0 * :" + net->o.real);
-        };
-        net->sock.onLine = [this, net](const CString& s) { OnLine(net, s); };
-        net->sock.onDrop = [this, net]() { net->conn = false; SetState(net, L"Disconnected"); Note(net, L"Disconnected.", cPart); };
-    }
+    static CString Key(CString s) { s.MakeLower(); return s; }
+    CChatWnd* Find(const CString& n) { auto i = m_w.find(Key(n)); return i == m_w.end() ? nullptr : i->second; }
+    CChatWnd* Status() { return Open(L"*status*", false); }
     void Show(CChatWnd* w, const CString& t, COLORREF c = cText) {
         if (!w) return;
         w->AddLine(t, c);
         if (w != static_cast<CChatWnd*>(MDIGetActive())) w->m_act = (std::max)(w->m_act, (c == cText || c == cAct) ? 2 : 1);
     }
     void Activate(CChatWnd* w) { if (w->IsIconic()) MDIRestore(w); MDIActivate(w); }
-    void Goto(Net* net, const CString& t) {   // switchbar / double-click target: existing window is activated, unknown #chan is joined
-        if (IsChan(t)) { if (CChatWnd* w = Find(net, t)) Activate(w); else Send(net, L"JOIN " + t); }
-        else Activate(Open(net, t, false));
+    void Goto(const CString& t) {   // switchbar / double-click target: existing window is activated, unknown #chan is joined
+        if (IsChan(t)) { if (CChatWnd* w = Find(t)) Activate(w); else Send(L"JOIN " + t); }
+        else Activate(Open(t, false));
     }
-    CChatWnd* OpenBg(Net* net, const CString& n) {   // incoming PM: open the query but keep focus where it was; its button turns red
-        if (CChatWnd* e = Find(net, n)) return e;
-        CMDIChildWnd* prev = MDIGetActive(); CChatWnd* w = Open(net, n, false);
+    CChatWnd* OpenBg(const CString& n) {   // incoming PM: open the query but keep focus where it was; its button turns red
+        if (CChatWnd* e = Find(n)) return e;
+        CMDIChildWnd* prev = MDIGetActive(); CChatWnd* w = Open(n, false);
         if (prev) MDIActivate(prev);
         return w;
     }
-    void Note(Net* net, const CString& t, COLORREF c = cInfo) { Show(Status(net), t, c); }
-    void SetState(Net* net, const CString& t) { net->state = t; RefreshBars(); }
+    void Note(const CString& t, COLORREF c = cInfo) { Show(Status(), t, c); }
+    void SetState(const CString& t) { m_state = t; RefreshBars(); }
     void RefreshBars() {   // switchbar buttons + status bar panes: [server state] [nick] [active window] [channels]
         if (!m_bar.m_hWnd || !m_sw.m_hWnd) return;
         std::vector<CChatWnd*> ws;
         for (auto& kv : m_w) ws.push_back(kv.second);
-        std::sort(ws.begin(), ws.end(), [](CChatWnd* x, CChatWnd* y) {   // group by network first, then creation order within it
-            int nx = x->net ? x->net->id : 0, ny = y->net ? y->net->id : 0;
-            return nx != ny ? nx < ny : x->m_seq < y->m_seq;
-        });
+        std::sort(ws.begin(), ws.end(), [](CChatWnd* x, CChatWnd* y) { return x->m_seq < y->m_seq; });   // creation order, like mIRC
         auto* a = static_cast<CChatWnd*>(MDIGetActive());
         if (a) a->m_act = 0;                                   // activity clears once the window is active
-        bool multi = m_nets.size() > 1;                        // more than one network: prefix window labels with its tag
-        std::vector<CSwitchBar::Btn> bs; CString chans; m_tabWnds = ws;
+        std::vector<CSwitchBar::Btn> bs; CString chans; m_tabKeys.clear();
         for (auto* w : ws) {
-            CSwitchBar::Btn b; CString lbl = w->m_name == L"*status*" ? CString(L"Status") : w->m_name;
-            b.text = (multi && w->net) ? (w->net->tag + L": " + lbl) : lbl;
-            b.act = w->m_act; b.sel = (w == a); bs.push_back(b);
-            if (w->m_chan && (!a || w->net == a->net)) chans += w->m_name + L" ";   // only the active window's network
+            CSwitchBar::Btn b; b.text = w->m_name == L"*status*" ? CString(L"Status") : w->m_name;
+            b.act = w->m_act; b.sel = (w == a); bs.push_back(b); m_tabKeys.push_back(w->m_name);
+            if (w->m_chan) chans += w->m_name + L" ";
         }
         m_sw.Set(bs);
-        CString act, state, nick;
-        if (a && a->net) {
+        CString act;
+        if (a) {
             CString n; n.Format(L"%d", a->NickCount());
             act = a->m_chan ? a->m_name + L": " + n + L" users" : (a->m_name == L"*status*" ? CString(L"Status window") : L"Query: " + a->m_name);
-            state = multi ? (a->net->tag + L" - " + a->net->state) : a->net->state; nick = a->net->nick;
-        } else state = m_nets.empty() ? CString(L"Not connected") : CString(L"");
+        }
         auto set = [&](int i, const CString& t) { if (m_bt[i] != t) { m_bt[i] = t; m_bar.SetPaneText(i, t); } };
-        set(0, state); set(1, nick.IsEmpty() ? CString(L"") : L"Nick: " + nick); set(2, act);
+        set(0, m_state); set(1, L"Nick: " + m_nick); set(2, act);
         set(3, chans.IsEmpty() ? CString(L"No channels") : L"Channels: " + chans);
     }
 
-    CChatWnd* Open(Net* net, const CString& name, bool chan) {
-        if (auto* e = Find(net, name)) return e;
+    CChatWnd* Open(const CString& name, bool chan) {
+        if (auto* e = Find(name)) return e;
         auto* w = new CChatWnd(name, chan);
-        w->net = net;
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
         w->onClose = [this](CChatWnd* c) { Forget(c); };
-        w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
+        w->onOpen = [this](CString t) { Goto(t); };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
-        m_w[Key(net, name)] = w;
+        m_w[Key(name)] = w;
         return w;
     }
     void Forget(CChatWnd* c) {   // user closed the window
-        Net* net = c->net;
         for (auto i = m_w.begin(); i != m_w.end(); ++i)
-            if (i->second == c) { if (c->m_chan && net && net->conn) Send(net, L"PART " + c->m_name); m_w.erase(i); break; }
-        if (net && c->m_name == L"*status*" && net->conn) { Send(net, CString(VERSION)); net->sock.Close(); net->conn = false; }
+            if (i->second == c) { if (c->m_chan && m_conn) Send(L"PART " + c->m_name); m_w.erase(i); break; }
     }
-    void Drop(Net* net, const CString& n) {  // server-driven close (no PART echo)
-        auto i = m_w.find(Key(net, n)); if (i == m_w.end()) return;
+    void Drop(const CString& n) {  // server-driven close (no PART echo)
+        auto i = m_w.find(Key(n)); if (i == m_w.end()) return;
         CChatWnd* w = i->second; m_w.erase(i); w->DestroyWindow();
     }
-    void Send(Net* net, CString l) {
-        if (!net || !net->conn) { Note(net, L"Not connected. Use /server <host> [port]", cPart); return; }
+
+    void Send(CString l) {
+        if (!m_conn) { Note(L"Not connected. Use /server <host> [port]", cPart); return; }
         l.Remove(L'\r'); l.Remove(L'\n');
         CW2A conv(l, CP_UTF8);
         CStringA u((LPCSTR)conv);
         u += "\r\n";
-        net->sock.Write(std::string((LPCSTR)u, u.GetLength()));
+        m_sock.Write(std::string((LPCSTR)u, u.GetLength()));
     }
-    void Say(Net* net, const CString& target, const CString& text, bool action = false) {
-        CChatWnd* w = Find(net, target); if (!w) w = Open(net, target, IsChan(target));
-        if (action) { Send(net, L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + net->nick + L" " + text, cAct); }
-        else        { Send(net, L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + net->nick + L"> " + text); }
+    void Say(const CString& target, const CString& text, bool action = false) {
+        CChatWnd* w = Find(target); if (!w) w = Open(target, IsChan(target));
+        if (action) { Send(L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + m_nick + L" " + text, cAct); }
+        else        { Send(L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + m_nick + L"> " + text); }
     }
-    void Connect(Net* net, const CString& host, UINT port) {
-        if (net->sock.m_hSocket != INVALID_SOCKET) net->sock.Close();
-        net->conn = false; net->sock.buf.Empty(); net->sock.sendq.clear();
-        delete net->sock.tls; net->sock.tls = nullptr;
-        if (net->o.tls) {
-            net->sock.tls = new CTls;
-            if (!net->sock.tls->Init(host, net->o.lax)) { Note(net, L"TLS initialisation failed", cPart); return; }
+    void Connect(const CString& host, UINT port) {
+        if (m_sock.m_hSocket != INVALID_SOCKET) m_sock.Close();
+        m_conn = false; m_sock.buf.Empty(); m_sock.sendq.clear();
+        delete m_sock.tls; m_sock.tls = nullptr;
+        if (m_o.tls) {
+            m_sock.tls = new CTls;
+            if (!m_sock.tls->Init(host, m_o.lax)) { Note(L"TLS initialisation failed", cPart); return; }
         }
-        Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L"...");
-        SetState(net, L"Connecting to " + host + L"...");
-        if (!net->sock.Create() || (!net->sock.Connect(host, port) && GetLastError() != WSAEWOULDBLOCK))
-            Note(net, L"Connect failed", cPart);
+        Note(L"Connecting to " + host + (m_o.tls ? L" (TLS)" : L"") + L"...");
+        SetState(L"Connecting to " + host + L"...");
+        if (!m_sock.Create() || (!m_sock.Connect(host, port) && GetLastError() != WSAEWOULDBLOCK))
+            Note(L"Connect failed", cPart);
     }
 
     // ---- user input ----
     void OnInput(CChatWnd* w, CString s) {
-        Net* net = w->net;
         if (s[0] != L'/' || s.Left(2) == L"//") {
             if (s.Left(2) == L"//") s = s.Mid(1);
-            if (w->m_name == L"*status*") Note(net, L"You're not in a channel or query.", cPart);
-            else Say(net, w->m_name, s);
+            if (w->m_name == L"*status*") Note(L"You're not in a channel or query.", cPart);
+            else Say(w->m_name, s);
             return;
         }
         CString arg = s.Mid(1), cmd = Word(arg); cmd.MakeLower();
         bool inChat = w->m_name != L"*status*";
         if (cmd == L"server" || cmd == L"connect") {
-            bool multi = false; arg.TrimLeft();
-            if (arg.Left(2).CompareNoCase(L"-m") == 0) { multi = true; arg = arg.Mid(2); arg.TrimLeft(); }
             CString h = Word(arg); arg.Trim();
-            if (h.IsEmpty()) { Note(net, L"Usage: /server [-m] <host> [port | +port for TLS]  (-m: connect as a separate, additional network)", cPart); return; }
-            Net* target = multi ? NewNet() : net;                 // -m: brand-new independent network; else replace this window's own network
-            bool tls = target->o.tls;
-            if (arg.Left(1) == L"+") { tls = true; arg = arg.Mid(1); } else if (!arg.IsEmpty()) tls = false;
-            target->o.tls = tls; target->o.host = h; target->o.port = _ttoi(arg) ? _ttoi(arg) : (tls ? 6697 : 6667);
-            target->tag = h; m_defOpts = target->o; SaveOpts();
-            Status(target); if (multi) Activate(Status(target));
-            Connect(target, h, target->o.port);
+            if (h.IsEmpty()) { Note(L"Usage: /server <host> [port | +port for TLS]", cPart); return; }
+            if (arg.Left(1) == L"+") { m_o.tls = TRUE; arg = arg.Mid(1); } else if (!arg.IsEmpty()) m_o.tls = FALSE;
+            m_o.host = h; m_o.port = _ttoi(arg) ? _ttoi(arg) : (m_o.tls ? 6697 : 6667);
+            Connect(h, m_o.port);
         }
-        else if (cmd == L"nick") { if (net->conn) Send(net, L"NICK " + arg); else net->nick = arg; }
-        else if (cmd == L"join" || cmd == L"j") Send(net, L"JOIN " + arg);
-        else if (cmd == L"part" || cmd == L"leave") Send(net, L"PART " + (arg.IsEmpty() && w->m_chan ? w->m_name : arg));
-        else if (cmd == L"msg" || cmd == L"m") { CString t = Word(arg); Say(net, t, arg); }
-        else if (cmd == L"query" || cmd == L"q") { CString t = Word(arg); Open(net, t, false); if (!arg.IsEmpty()) Say(net, t, arg); }
-        else if (cmd == L"me" && inChat) Say(net, w->m_name, arg, true);
-        else if (cmd == L"notice") { CString t = Word(arg); Send(net, L"NOTICE " + t + L" :" + arg); Note(net, L"-> -" + t + L"- " + arg, cNote); }
-        else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
-        else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(L"MiniIRC") : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
+        else if (cmd == L"nick") { if (m_conn) Send(L"NICK " + arg); else m_nick = arg; }
+        else if (cmd == L"join" || cmd == L"j") Send(L"JOIN " + arg);
+        else if (cmd == L"part" || cmd == L"leave") Send(L"PART " + (arg.IsEmpty() && w->m_chan ? w->m_name : arg));
+        else if (cmd == L"msg" || cmd == L"m") { CString t = Word(arg); Say(t, arg); }
+        else if (cmd == L"query" || cmd == L"q") { CString t = Word(arg); Open(t, false); if (!arg.IsEmpty()) Say(t, arg); }
+        else if (cmd == L"me" && inChat) Say(w->m_name, arg, true);
+        else if (cmd == L"notice") { CString t = Word(arg); Send(L"NOTICE " + t + L" :" + arg); Note(L"-> -" + t + L"- " + arg, cNote); }
+        else if (cmd == L"topic" && w->m_chan) Send(arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
+        else if (cmd == L"quit") { Send(L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); m_conn = false; m_sock.Close(); SetState(L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
-        else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
-        else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
+        else if (cmd == L"raw" || cmd == L"quote") Send(arg);
+        else if (cmd == L"help") Note(L"/server host [+port = TLS] /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
+        else { cmd.MakeUpper(); Send(cmd + L" " + arg); }
     }
 
     // ---- server input ----
-    void OnLine(Net* net, const CString& raw) {
+    void OnLine(const CString& raw) {
         CString l = raw, prefix, trail; bool hasT = false;
         if (l.Left(1) == L":") { int sp = l.Find(L' '); if (sp < 0) return; prefix = l.Mid(1, sp - 1); l = l.Mid(sp + 1); }
         int t = l.Find(L" :"); if (t >= 0) { trail = l.Mid(t + 2); l = l.Left(t); hasT = true; }
@@ -693,70 +637,70 @@ class CMainFrame : public CMDIFrameWnd {
         auto P = [&](size_t i) { return i < p.size() ? p[i] : CString(); };
         CString nick = prefix, host; int b = nick.Find(L'!');
         if (b >= 0) { host = nick.Mid(b + 1); nick = nick.Left(b); }
-        bool me = nick.CompareNoCase(net->nick) == 0;
+        bool me = nick.CompareNoCase(m_nick) == 0;
 
-        if (cmd == L"PING") { Send(net, L"PONG :" + P(0)); }
+        if (cmd == L"PING") { Note(L"PING PONG...", cPart);  Send(L"PONG :" + P(0)); }
         else if (cmd == L"PRIVMSG" || cmd == L"NOTICE") {
             CString tgt = P(0), txt = P(1); bool notice = cmd == L"NOTICE";
-            bool priv = tgt.CompareNoCase(net->nick) == 0;
-            CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
+            bool priv = tgt.CompareNoCase(m_nick) == 0;
+            CChatWnd* w = (notice && (priv || !Find(tgt))) ? Status() : (priv ? OpenBg(nick) : Open(tgt, IsChan(tgt)));
             if (!txt.IsEmpty() && txt[0] == 1) {
                 txt.Trim(CString(wchar_t(1)));
                 if (txt.Left(6) == L"ACTION") Show(w, L"* " + nick + txt.Mid(6), cAct);
-                else if (txt == L"VERSION" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION MiniIRC 1.0 (MFC)" + CString(wchar_t(1)));
+                else if (txt == L"VERSION" && !notice) Send(L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + VERSION + CString(wchar_t(1)));
                 else Show(w, L"[CTCP " + txt + L" from " + nick + L"]", cNote);
             }
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNote);
             else Show(w, L"<" + nick + L"> " + txt);
         }
         else if (cmd == L"JOIN") {
-            CString ch = P(0); CChatWnd* w = me ? Open(net, ch, true) : Find(net, ch); if (!w) return;
+            CString ch = P(0); CChatWnd* w = me ? Open(ch, true) : Find(ch); if (!w) return;
             if (!me) w->AddNick(nick);
             Show(w, L"* " + nick + L" (" + host + L") has joined " + ch, cJoin);
         }
         else if (cmd == L"PART") {
-            if (me) { Drop(net, P(0)); return; }
-            if (CChatWnd* w = Find(net, P(0))) { w->DelNick(nick); Show(w, L"* " + nick + L" has left " + P(0) + L" (" + P(1) + L")", cPart); }
+            if (me) { Drop(P(0)); return; }
+            if (CChatWnd* w = Find(P(0))) { w->DelNick(nick); Show(w, L"* " + nick + L" has left " + P(0) + L" (" + P(1) + L")", cPart); }
         }
         else if (cmd == L"KICK") {
-            if (P(1).CompareNoCase(net->nick) == 0) { Note(net, L"You were kicked from " + P(0) + L" by " + nick + L" (" + P(2) + L")", cPart); Drop(net, P(0)); return; }
-            if (CChatWnd* w = Find(net, P(0))) { w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cPart); }
+            if (P(1).CompareNoCase(m_nick) == 0) { Note(L"You were kicked from " + P(0) + L" by " + nick + L" (" + P(2) + L")", cPart); Drop(P(0)); return; }
+            if (CChatWnd* w = Find(P(0))) { w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cPart); }
         }
         else if (cmd == L"QUIT") {
             for (auto& kv : m_w) {
-                CChatWnd* w = kv.second; if (w->net != net) continue;
+                CChatWnd* w = kv.second;
                 if (w->DelNick(nick) || (!w->m_chan && w->m_name.CompareNoCase(nick) == 0))
                     Show(w, L"* " + nick + L" has quit (" + P(0) + L")", cPart);
             }
         }
         else if (cmd == L"NICK") {
-            CString nn = P(0); if (me) net->nick = nn;
+            CString nn = P(0); if (me) m_nick = nn;
             for (auto& kv : m_w) {
-                CChatWnd* w = kv.second; if (w->net != net) continue;
+                CChatWnd* w = kv.second;
                 if (w->DelNick(nick)) { w->AddNick(nn); Show(w, L"* " + nick + L" is now known as " + nn, cInfo); }
             }
         }
         else if (cmd == L"TOPIC") {
-            if (CChatWnd* w = Find(net, P(0))) { w->SetTopic(P(1)); Show(w, L"* " + nick + L" changed the topic to: " + P(1), cInfo); }
+            if (CChatWnd* w = Find(P(0))) { w->SetTopic(P(1)); Show(w, L"* " + nick + L" changed the topic to: " + P(1), cInfo); }
         }
         else if (cmd == L"MODE") {
-            CChatWnd* w = Find(net, P(0)); CString m; for (size_t i = 1; i < p.size(); i++) m += p[i] + L" ";
-            Show(w ? w : Status(net), L"* " + nick + L" sets mode " + m, cInfo);
-            if (w && p.size() > 2) { w->m_refresh = true; Send(net, L"NAMES " + P(0)); }
+            CChatWnd* w = Find(P(0)); CString m; for (size_t i = 1; i < p.size(); i++) m += p[i] + L" ";
+            Show(w ? w : Status(), L"* " + nick + L" sets mode " + m, cInfo);
+            if (w && p.size() > 2) { w->m_refresh = true; Send(L"NAMES " + P(0)); }
         }
-        else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cInfo); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
-            if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
-        else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic: " + P(2), cInfo); } }
+        else if (cmd == L"001") { m_nick = P(0); Note(P(1), cInfo); SetState(L"Connected: " + (prefix.IsEmpty() ? m_o.host : prefix) + (m_o.tls ? L" (TLS)" : L""));
+            if (!m_o.autojoin.IsEmpty()) Send(L"JOIN " + m_o.autojoin); }
+        else if (cmd == L"332") { if (CChatWnd* w = Find(P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic: " + P(2), cInfo); } }
         else if (cmd == L"353") {
-            if (CChatWnd* w = Find(net, P(2))) {
+            if (CChatWnd* w = Find(P(2))) {
                 if (w->m_refresh) { w->ClearNicks(); w->m_refresh = false; }
                 int q = 0; CString names = P(3);
                 for (CString n = names.Tokenize(L" ", q); !n.IsEmpty(); n = names.Tokenize(L" ", q)) w->AddNick(n);
             }
         }
         else if (cmd == L"366") {}
-        else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cPart); Send(net, L"NICK " + net->nick); }
-        else { CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" "; Note(net, j.IsEmpty() ? raw : j, cText); }
+        else if (cmd == L"433") { m_nick += L"_"; Note(L"Nickname in use, trying " + m_nick, cPart); Send(L"NICK " + m_nick); }
+        else { CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" "; Note(j.IsEmpty() ? raw : j, cText); }
     }
 
     BOOL OnCreateClient(LPCREATESTRUCT lpcs, CCreateContext*) override { return CreateClient(lpcs, nullptr); }
@@ -783,18 +727,18 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void LoadOpts() {
         CWinApp* a = AfxGetApp();
-        m_defOpts.host = a->GetProfileString(L"Conn", L"Host", m_defOpts.host); m_defOpts.port = a->GetProfileInt(L"Conn", L"Port", m_defOpts.port);
-        m_defOpts.nick = a->GetProfileString(L"Conn", L"Nick", m_defOpts.nick); m_defOpts.user = a->GetProfileString(L"Conn", L"User", m_defOpts.user);
-        m_defOpts.real = a->GetProfileString(L"Conn", L"Real", m_defOpts.real); m_defOpts.autojoin = a->GetProfileString(L"Conn", L"Join", m_defOpts.autojoin);
-        m_defOpts.tls = a->GetProfileInt(L"Conn", L"TLS", 0); m_defOpts.lax = a->GetProfileInt(L"Conn", L"Lax", 0);
+        m_o.host = a->GetProfileString(L"Conn", L"Host", m_o.host); m_o.port = a->GetProfileInt(L"Conn", L"Port", m_o.port);
+        m_o.nick = a->GetProfileString(L"Conn", L"Nick", m_o.nick); m_o.user = a->GetProfileString(L"Conn", L"User", m_o.user);
+        m_o.real = a->GetProfileString(L"Conn", L"Real", m_o.real); m_o.autojoin = a->GetProfileString(L"Conn", L"Join", m_o.autojoin);
+        m_o.tls = a->GetProfileInt(L"Conn", L"TLS", 0); m_o.lax = a->GetProfileInt(L"Conn", L"Lax", 0);
         m_swTop = a->GetProfileInt(L"Conn", L"SwTop", 1) != 0;
     }
-    void SaveOpts() {   // password is deliberately not saved; this is just the template that pre-fills the next Connect dialog
+    void SaveOpts() {   // password is deliberately not saved
         CWinApp* a = AfxGetApp();
-        a->WriteProfileString(L"Conn", L"Host", m_defOpts.host); a->WriteProfileInt(L"Conn", L"Port", m_defOpts.port);
-        a->WriteProfileString(L"Conn", L"Nick", m_defOpts.nick); a->WriteProfileString(L"Conn", L"User", m_defOpts.user);
-        a->WriteProfileString(L"Conn", L"Real", m_defOpts.real); a->WriteProfileString(L"Conn", L"Join", m_defOpts.autojoin);
-        a->WriteProfileInt(L"Conn", L"TLS", m_defOpts.tls); a->WriteProfileInt(L"Conn", L"Lax", m_defOpts.lax);
+        a->WriteProfileString(L"Conn", L"Host", m_o.host); a->WriteProfileInt(L"Conn", L"Port", m_o.port);
+        a->WriteProfileString(L"Conn", L"Nick", m_o.nick); a->WriteProfileString(L"Conn", L"User", m_o.user);
+        a->WriteProfileString(L"Conn", L"Real", m_o.real); a->WriteProfileString(L"Conn", L"Join", m_o.autojoin);
+        a->WriteProfileInt(L"Conn", L"TLS", m_o.tls); a->WriteProfileInt(L"Conn", L"Lax", m_o.lax);
     }
     void BuildToolbar() {   // 16x16 glyphs of our own design: green=connect, red=disconnect, blue squares=window layout
         const int W = 16, H = 16, N = 4;
@@ -824,15 +768,9 @@ class CMainFrame : public CMDIFrameWnd {
         m_tb.GetToolBarCtrl().AddButtons(6, b);
         m_tb.GetToolBarCtrl().SetButtonSize(CSize(28, 26));
     }
-    afx_msg void OnConnectDlg() {   // always starts a brand-new, independent network (like /server -m)
-        Net* net = NewNet();
-        CConnDlg d(net->o, this);
-        if (d.DoModal() == IDOK) {
-            net->nick = net->o.nick; net->tag = net->o.host; m_defOpts = net->o; SaveOpts();
-            Status(net);
-            Note(net, L"IRC ready. /server -m host connects a second, independent network. Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
-            Connect(net, net->o.host, net->o.port);
-        } else m_nets.pop_back();   // cancelled: discard the unused network (nothing else references it yet)
+    afx_msg void OnConnectDlg() {
+        CConnDlg d(m_o, this);
+        if (d.DoModal() == IDOK) { SaveOpts(); m_nick = m_o.nick; Connect(m_o.host, m_o.port); }
     }
     afx_msg void OnFont() {
         LOGFONT lf = m_chatFont;
@@ -841,10 +779,7 @@ class CMainFrame : public CMDIFrameWnd {
         dlg.GetCurrentFont(&lf); m_chatFont = lf; SaveFont();
         for (auto& kv : m_w) kv.second->ApplyFont(m_chatFont);   // applies to every open window; new text in each uses it too
     }
-    afx_msg void OnDisconnect() {   // disconnects whichever network the active window belongs to
-        auto* a = static_cast<CChatWnd*>(MDIGetActive());
-        if (a && a->net) OnInput(Status(a->net), L"/quit");
-    }
+    afx_msg void OnDisconnect() { OnInput(Status(), L"/quit"); }
     afx_msg void OnCascade() { MDICascade(); }
     afx_msg void OnTile() { MDITile(MDITILE_HORIZONTAL); }
     afx_msg void OnExit() { PostMessage(WM_CLOSE); }
@@ -852,53 +787,41 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnSwBottom() { SetSwPos(false); }
     afx_msg void OnUpdateSwTop(CCmdUI* u) { u->SetCheck(m_swTop); }
     afx_msg void OnUpdateSwBottom(CCmdUI* u) { u->SetCheck(!m_swTop); }
-    bool m_menuOpen = false;   // true while a TrackPopupMenu is showing; our timer must not touch layout/bars during that
-    afx_msg void OnTimer(UINT_PTR) { if (m_menuOpen) return; RefreshBars(); CheckLayout(); }
-    afx_msg void OnInitMenuPopup(CMenu* pMenu, UINT nIndex, BOOL bSysMenu) {
-        // CFrameWnd's default handling here auto-disables any item whose command ID has no ON_COMMAND
-        // handler in the message map — and it does this for ANY popup shown while we're the owner, not
-        // just our own menu bar. Our switchbar context menus use raw ids read via TPM_RETURNCMD, with no
-        // ON_COMMAND registered for them on purpose, so the default handling was silently greying every
-        // item out (invisible-looking since we never called EnableMenuItem ourselves) right before display.
-        // Only let the real menu bar's popups (File / Window) go through the default auto-update, since
-        // the Window menu's checkmarks (Switchbar at Top/Bottom) genuinely rely on it.
-        if (!bSysMenu) {
-            HMENU h = pMenu->GetSafeHmenu();
-            CMenu* f = m_menu.GetSubMenu(0); CMenu* w = m_menu.GetSubMenu(1);
-            bool ours = (f && f->GetSafeHmenu() == h) || (w && w->GetSafeHmenu() == h);
-            if (!ours) return;   // one of our ad-hoc popups: skip the base class, leave items as we set them
-        }
-        CMDIFrameWnd::OnInitMenuPopup(pMenu, nIndex, bSysMenu);
-    }
+    afx_msg void OnTimer(UINT_PTR) { RefreshBars(); }
     afx_msg void OnSize(UINT nType, int cx, int cy) {
         CMDIFrameWnd::OnSize(nType, cx, cy);   // this positions the menu/status bar and gives the rest to the MDI client
         LayoutBars();
     }
-    CRect m_lastSw, m_lastCli;   // the rects we last placed things at, so CheckLayout() can tell if something else moved them
-    void LayoutBars() {   // full recompute + carve: only call this for a real resize/explicit change, never blindly on a timer
-        RecalcLayout();   // resets the MDI client to its full size first, with no knowledge of our switchbar, so this is the expensive path
+    void LayoutBars() {   // then we carve the switchbar's strip off the top OR bottom of that MDI-client area
+        RecalcLayout();   // reset the MDI client to its full size first, or repeated calls (e.g. switching top/bottom) compound
         if (!m_sw.m_hWnd || !m_hWndMDIClient) return;
         CRect r; ::GetWindowRect(m_hWndMDIClient, &r); ScreenToClient(&r);
         int h = CSwitchBar::HEIGHT;
         int swY = m_swTop ? r.top : r.bottom - h;
-        CRect want(r.left, swY, r.left + r.Width(), swY + h);
-        m_sw.SetWindowPos(nullptr, want.left, want.top, want.Width(), want.Height(), SWP_NOZORDER | SWP_NOACTIVATE);
+        m_sw.SetWindowPos(nullptr, r.left, swY, r.Width(), h, SWP_NOZORDER | SWP_NOACTIVATE);
         int cliY = m_swTop ? r.top + h : r.top;
-        CRect wantCli(r.left, cliY, r.left + r.Width(), cliY + (std::max)(0L, (long)r.Height() - h));
-        ::SetWindowPos(m_hWndMDIClient, nullptr, wantCli.left, wantCli.top, wantCli.Width(), wantCli.Height(), SWP_NOZORDER | SWP_NOACTIVATE);
-        m_lastSw = want; m_lastCli = wantCli;   // remember what we just set, so the cheap check below has a baseline
-    }
-    void CheckLayout() {   // cheap: safe to call every timer tick. Only calls the expensive LayoutBars() if something
-        if (!m_sw.m_hWnd || !m_hWndMDIClient) return;              // actually disturbed the switchbar/MDI client since we last set them
-        CRect sw; m_sw.GetWindowRect(&sw); ScreenToClient(&sw);
-        CRect cli; ::GetWindowRect(m_hWndMDIClient, &cli); ScreenToClient(&cli);
-        if (sw != m_lastSw || cli != m_lastCli) LayoutBars();
+        ::SetWindowPos(m_hWndMDIClient, nullptr, r.left, cliY, r.Width(), (std::max)(0L, (long)r.Height() - h), SWP_NOZORDER | SWP_NOACTIVATE);
     }
     void SetSwPos(bool top) { m_swTop = top; AfxGetApp()->WriteProfileInt(L"Conn", L"SwTop", top); LayoutBars(); }
     DECLARE_MESSAGE_MAP()
 public:
     void Start() {
-        LoadOpts(); LoadFont();
+        m_sock.onConn = [this](int err) {
+            if (err) {
+                CString hex; hex.Format(L"0x%08X", (unsigned)err);
+                SetState(L"Connection failed");
+                Note(L"Connection/TLS failed (status " + hex + L"). If TLS is on, the most common cause is connecting to a plaintext port; "
+                     L"try the server's TLS port (often 6697) instead.", cPart);
+                return;
+            }
+            m_conn = true; Note(L"Connected. Registering...");
+            SetState(L"Connected to " + m_o.host + (m_o.tls ? L" (TLS)" : L"") + L", registering...");
+            if (!m_o.pass.IsEmpty()) Send(L"PASS " + m_o.pass);
+            Send(L"NICK " + m_nick); Send(L"USER " + m_o.user + L" 0 * :" + m_o.real);
+        };
+        m_sock.onLine = [this](const CString& s) { OnLine(s); };
+        m_sock.onDrop = [this]() { m_conn = false; SetState(L"Disconnected"); Note(L"Disconnected.", cPart); };
+        LoadOpts(); LoadFont(); m_nick = m_o.nick;
         CMenu f, w;
         f.CreatePopupMenu(); f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
         f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
@@ -918,48 +841,37 @@ public:
             CMenu m; m.CreatePopupMenu();
             m.AppendMenu(MF_STRING | (m_swTop ? MF_CHECKED : 0), 1, L"Switchbar at Top");
             m.AppendMenu(MF_STRING | (!m_swTop ? MF_CHECKED : 0), 2, L"Switchbar at Bottom");
-            SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
-            m_menuOpen = true;
-            int r = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
-            m_menuOpen = false;
-            PostMessage(WM_NULL, 0, 0);   // MSDN-documented pairing for the above; without it the window can be left in a bad activation state
+            int r = m.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, this);
             if (r == 1) SetSwPos(true); else if (r == 2) SetSwPos(false);
         };
-        m_bar.onChan = [this](CString c) {   // clicking a channel name in the status bar's "Channels:" pane
-            auto* a = static_cast<CChatWnd*>(MDIGetActive());
-            if (a && a->net) Goto(a->net, c);
-        };
+        m_bar.onChan = [this](CString c) { Goto(c); };
         m_sw.onSel = [this](int i) {   // click a switchbar button -> activate that window
-            if (i >= 0 && i < (int)m_tabWnds.size()) Activate(m_tabWnds[i]);
+            if (i < 0 || i >= (int)m_tabKeys.size()) return;
+            if (CChatWnd* w = Find(m_tabKeys[i])) Activate(w);
         };
         m_sw.onMenu = [this](int i, CPoint pt) {   // right-click a switchbar button
-            if (i < 0 || i >= (int)m_tabWnds.size()) return;
-            CChatWnd* w = m_tabWnds[i];
-            bool st = w->m_name == L"*status*";
+            if (i < 0 || i >= (int)m_tabKeys.size()) return;
+            CChatWnd* w = Find(m_tabKeys[i]); if (!w) return;
+            bool st = m_tabKeys[i] == L"*status*";
             CMenu m; m.CreatePopupMenu();
             if (st) { m.AppendMenu(MF_STRING, 1, L"Connect..."); m.AppendMenu(MF_STRING, 2, L"Disconnect"); }
             else m.AppendMenu(MF_STRING, 3, w->m_chan ? L"Part / Close" : L"Close");
             m.AppendMenu(MF_STRING, 4, L"Clear");
-            SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
-            m_menuOpen = true;
-            int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
-            m_menuOpen = false;
-            PostMessage(WM_NULL, 0, 0);   // MSDN-documented pairing for the above; without it the window can be left in a bad activation state
-            Activate(w);   // moved to after the menu closes: doing this beforehand shifted keyboard focus right as
-                            // TrackPopupMenu started tracking, which could disrupt its mouse capture mid-click
-            switch (cmd) {
-                case 1: PostMessage(WM_COMMAND, IDM_CONNECT); break;   // always starts a brand-new network
-                case 2: OnInput(w, L"/quit"); break;
+            Activate(w);
+            switch (m.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, this)) {
+                case 1: PostMessage(WM_COMMAND, IDM_CONNECT); break;
+                case 2: OnInput(Status(), L"/quit"); break;
                 case 3: w->PostMessage(WM_CLOSE); break;
                 case 4: w->Clear(); break;
             }
         };
         m_sw.onClose = [this](int i) {   // middle-click a button -> close that window
-            if (i < 0 || i >= (int)m_tabWnds.size() || m_tabWnds[i]->m_name == L"*status*") return;
-            m_tabWnds[i]->PostMessage(WM_CLOSE);
+            if (i < 0 || i >= (int)m_tabKeys.size() || m_tabKeys[i] == L"*status*") return;
+            if (CChatWnd* w = Find(m_tabKeys[i])) w->PostMessage(WM_CLOSE);
         };
         if (!m_sw.m_hWnd) AfxMessageBox(L"Switchbar creation failed");
         RecalcLayout(); LayoutBars(); SetTimer(1, 500, nullptr);
+        Note(L"IRC Client ready. Use File > Connect, or /server host [+port for TLS]. Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
         PostMessage(WM_COMMAND, IDM_CONNECT);
     }
 };
@@ -968,7 +880,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_WM_TIMER() ON_WM_SIZE()
     ON_COMMAND(IDM_SWTOP, OnSwTop) ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
-    ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom) ON_WM_INITMENUPOPUP()
+    ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom)
 END_MESSAGE_MAP()
 
 class CIRCClientApp : public CWinApp {
