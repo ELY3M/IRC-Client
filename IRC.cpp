@@ -133,7 +133,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -158,7 +158,7 @@ public:
     CConnDlg(Opts& op, CWnd* parent) : o(op) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(232); t.push_back(184);   // cdit, x, y, cx, cy
-        t.push_back(0); t.push_back(0); S(L"Connect to IRC server"); t.push_back(9); S(L"Segoe UI");
+        t.push_back(0); t.push_back(0); S(L"Connect to IRC server"); t.push_back(9); S(DEFAULT_FONT); //was Segoe UI
         Row(6, L"Server", IDC_HOST); Row(22, L"Port", IDC_PORT, ES_NUMBER); Row(38, L"Nickname", IDC_NICK);
         Row(54, L"User name", IDC_USER); Row(70, L"Real name", IDC_REAL); Row(86, L"Password", IDC_PASS, ES_PASSWORD);
         Row(102, L"Auto-join", IDC_JOIN);
@@ -213,7 +213,7 @@ public:
     CPromptDlg(CString& v, CString ttl, CString lbl, CWnd* parent) : val(v), title(ttl), label(lbl) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(220); t.push_back(66);
-        t.push_back(0); t.push_back(0); S(title); t.push_back(9); S(L"Segoe UI");
+        t.push_back(0); t.push_back(0); S(title); t.push_back(9); S(DEFAULT_FONT); //was Segoe UI
         Item(SS_LEFT, 8, 8, 204, 10, 0xFFFF, 0x0082, label);
         Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 20, 204, 12, 101, 0x0081, L"");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 100, 40, 50, 14, IDOK, 0x0080, L"OK");
@@ -246,7 +246,7 @@ public:
     CServerListDlg(std::vector<Bookmark>& b, CWnd* parent) : bm(b) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(254); t.push_back(156);
-        t.push_back(0); t.push_back(0); S(L"Server List"); t.push_back(9); S(L"Segoe UI");
+        t.push_back(0); t.push_back(0); S(L"Server List"); t.push_back(9); S(DEFAULT_FONT); //was Segoe UI
         Item(LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 6, 8, 242, 118, IDC_SLIST, 0x0083, L"");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 6, 132, 48, 16, IDC_SL_CONNECT, 0x0080, L"Connect");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 58, 132, 44, 16, IDC_SL_NEW, 0x0080, L"New...");
@@ -280,6 +280,68 @@ public:
 BEGIN_MESSAGE_MAP(CServerListDlg, CDialog)
     ON_BN_CLICKED(IDC_SL_CONNECT, OnConnectBtn) ON_BN_CLICKED(IDC_SL_NEW, OnNewBtn)
     ON_BN_CLICKED(IDC_SL_EDIT, OnEditBtn) ON_BN_CLICKED(IDC_SL_DELETE, OnDeleteBtn)
+END_MESSAGE_MAP()
+
+// ---------------- Channel Favorites: bookmarked channels, stored in channels.ini ----------------
+struct ChanFav { CString chan, key, net; };   // net is just a display hint (where it was added from); joining always uses the active connection
+enum { IDC_FLIST = 301, IDC_FL_JOIN = 310, IDC_FL_NEW, IDC_FL_DELETE };
+class CFavDlg : public CDialog {
+    std::vector<ChanFav>& fv; std::vector<WORD> t; int cnt = 0; CListBox m_list;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    void Refill() {
+        m_list.ResetContent();
+        //for (auto& e : fv) m_list.AddString(e.chan + (e.key.IsEmpty() ? CString() : L"  (key set)") + (e.net.IsEmpty() ? CString() : L"  — " + e.net));
+        for (auto& e : fv)
+        {
+            m_list.AddString(e.chan +
+                (e.key.IsEmpty() ? CString() : CString(L"  (key set)")) +
+                (e.net.IsEmpty() ? CString() : L"  — " + e.net));
+        }
+    }
+public:
+    int joinIdx = -1;
+    CFavDlg(std::vector<ChanFav>& f, CWnd* parent) : fv(f) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(220); t.push_back(150);
+        t.push_back(0); t.push_back(0); S(L"Channel Favorites"); t.push_back(9); S(L"Segoe UI");
+        Item(LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 6, 8, 208, 112, IDC_FLIST, 0x0083, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 6, 126, 48, 16, IDC_FL_JOIN, 0x0080, L"Join");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 58, 126, 44, 16, IDC_FL_NEW, 0x0080, L"New...");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 106, 126, 50, 16, IDC_FL_DELETE, 0x0080, L"Delete");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 164, 126, 50, 16, IDCANCEL, 0x0080, L"Close");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override { CDialog::OnInitDialog(); m_list.SubclassDlgItem(IDC_FLIST, this); Refill(); return TRUE; }
+    afx_msg void OnJoinBtn() { int i = m_list.GetCurSel(); if (i >= 0) { joinIdx = i; CDialog::OnOK(); } }
+    afx_msg void OnDblClick() { OnJoinBtn(); }
+    afx_msg void OnNewBtn() {
+        CString chan = L"#";
+        CPromptDlg d(chan, L"Channel Favorites", L"Channel name:", this);
+        if (d.DoModal() != IDOK || chan.IsEmpty()) return;
+        chan.Trim(); if (chan[0] != L'#' && chan[0] != L'&') chan = L"#" + chan;
+        CString key;
+        CPromptDlg kd(key, L"Channel Favorites", L"Key (leave blank if none):", this);
+        kd.DoModal();   // optional; proceed either way
+        ChanFav e; e.chan = chan; e.key = key; fv.push_back(e); Refill();
+    }
+    afx_msg void OnDeleteBtn() {
+        int i = m_list.GetCurSel(); if (i < 0) return;
+        if (AfxMessageBox(L"Remove this channel from favorites?", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        fv.erase(fv.begin() + i); Refill();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CFavDlg, CDialog)
+    ON_BN_CLICKED(IDC_FL_JOIN, OnJoinBtn) ON_BN_CLICKED(IDC_FL_NEW, OnNewBtn) ON_BN_CLICKED(IDC_FL_DELETE, OnDeleteBtn)
+    ON_LBN_DBLCLK(IDC_FLIST, OnDblClick)
 END_MESSAGE_MAP()
 
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
@@ -641,6 +703,7 @@ struct Net {
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
     std::vector<Bookmark> m_bookmarks;   // saved server list (servers.ini)
+    std::vector<ChanFav> m_favs;         // saved channel favorites (channels.ini)
     CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
     CString m_bt[4]; int m_seqn = 0; std::vector<CChatWnd*> m_tabWnds;
     std::map<CString, CChatWnd*> m_w;
@@ -996,6 +1059,44 @@ class CMainFrame : public CMDIFrameWnd {
         Connect(net, e.o.host, e.o.port);
     }
 
+    void LoadFavs() {
+        m_favs.clear();
+        CString path = IniPath(L"channels.ini");
+        int n = GetPrivateProfileIntW(L"Channels", L"Count", 0, path);
+        wchar_t buf[256];
+        for (int i = 0; i < n; i++) {
+            CString sec; sec.Format(L"Chan%d", i);
+            ChanFav e;
+            GetPrivateProfileStringW(sec, L"Name", L"", buf, 256, path); e.chan = buf;
+            GetPrivateProfileStringW(sec, L"Key", L"", buf, 256, path); e.key = buf;
+            GetPrivateProfileStringW(sec, L"Net", L"", buf, 256, path); e.net = buf;
+            if (!e.chan.IsEmpty()) m_favs.push_back(e);
+        }
+    }
+    void SaveFavs() {
+        CString path = IniPath(L"channels.ini");
+        ::DeleteFileW(path);
+        CString cs; cs.Format(L"%d", (int)m_favs.size());
+        WritePrivateProfileStringW(L"Channels", L"Count", cs, path);
+        for (size_t i = 0; i < m_favs.size(); i++) {
+            CString sec; sec.Format(L"Chan%d", (int)i); auto& e = m_favs[i];
+            WritePrivateProfileStringW(sec, L"Name", e.chan, path);
+            WritePrivateProfileStringW(sec, L"Key", e.key, path);
+            WritePrivateProfileStringW(sec, L"Net", e.net, path);
+        }
+    }
+    afx_msg void OnChanFavs() {
+        CFavDlg d(m_favs, this);
+        d.DoModal();
+        SaveFavs();   // persist any add/delete regardless of how the dialog was closed
+        if (d.joinIdx < 0 || d.joinIdx >= (int)m_favs.size()) return;
+        ChanFav& e = m_favs[d.joinIdx];
+        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        Net* net = a ? a->net : nullptr;
+        if (!net || !net->conn) { AfxMessageBox(L"Connect to a server first, then use Channel Favorites to join."); return; }
+        Send(net, L"JOIN " + e.chan + (e.key.IsEmpty() ? CString() : L" " + e.key));
+    }
+
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
         const int N = 5;
         CBitmap resBmp;
@@ -1112,11 +1213,12 @@ class CMainFrame : public CMDIFrameWnd {
     DECLARE_MESSAGE_MAP()
 public:
     void Start() {
-        LoadOpts(); LoadFont(); LoadBookmarks();
+        LoadOpts(); LoadFont(); LoadBookmarks(); LoadFavs();
         CMenu f, w;
         f.CreatePopupMenu(); f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
         f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
         f.AppendMenu(MF_STRING, IDM_SERVERS, L"&Server List...");
+        f.AppendMenu(MF_STRING, IDM_CHANFAVS, L"Channel F&avorites...");
         f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_EXIT, L"E&xit");
         w.CreatePopupMenu(); w.AppendMenu(MF_STRING, IDM_CASCADE, L"&Cascade"); w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
         w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
@@ -1153,7 +1255,10 @@ public:
             bool st = w->m_name == L"*status*";
             CMenu m; m.CreatePopupMenu();
             if (st) { m.AppendMenu(MF_STRING, 1, L"Connect..."); m.AppendMenu(MF_STRING, 2, L"Disconnect"); }
-            else m.AppendMenu(MF_STRING, 3, w->m_chan ? L"Part / Close" : L"Close");
+            else {
+                m.AppendMenu(MF_STRING, 3, w->m_chan ? L"Part / Close" : L"Close");
+                if (w->m_chan) m.AppendMenu(MF_STRING, 5, L"Add to Favorites");
+            }
             m.AppendMenu(MF_STRING, 4, L"Clear");
             SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
             m_menuOpen = true;
@@ -1167,6 +1272,13 @@ public:
                 case 2: OnInput(w, L"/quit"); break;
                 case 3: w->PostMessage(WM_CLOSE); break;
                 case 4: w->Clear(); break;
+                case 5: {
+                    bool dup = false;
+                    for (auto& e : m_favs) if (e.chan.CompareNoCase(w->m_name) == 0) { dup = true; break; }
+                    if (!dup) { ChanFav e; e.chan = w->m_name; e.net = w->net ? w->net->tag : CString(); m_favs.push_back(e); SaveFavs(); }
+                    AfxMessageBox(dup ? L"Already in Channel Favorites." : L"Added to Channel Favorites.");
+                    break;
+                }
             }
         };
         m_sw.onClose = [this](int i) {   // middle-click a button -> close that window
@@ -1185,7 +1297,7 @@ public:
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
-    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SERVERS, OnServerList) ON_WM_TIMER() ON_WM_SIZE()
+    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SERVERS, OnServerList) ON_COMMAND(IDM_CHANFAVS, OnChanFavs) ON_WM_TIMER() ON_WM_SIZE()
     ON_COMMAND(IDM_SWTOP, OnSwTop) ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
     ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom) ON_WM_INITMENUPOPUP()
 END_MESSAGE_MAP()
