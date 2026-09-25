@@ -1,3 +1,4 @@
 // MiniIRC.rc - embeds the app icon. Optional: only needed if you want the taskbar/title-bar icon.
 #include <windows.h>
 101 ICON "IRC.ico"
+102 BITMAP "toolbar.bmp"
