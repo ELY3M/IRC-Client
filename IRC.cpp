@@ -475,7 +475,8 @@ public:
     bool DelNick(const CString& n) { int i = FindNick(n); if (i < 0) return false; m_nicks.DeleteString(i); return true; }
 
 protected:
-    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = DEFAULT_FONT; bool m_baseBold = false, m_baseItalic = false;
+    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = L"Consolas"; bool m_baseBold = false, m_baseItalic = false;
+    std::vector<CString> m_hist; int m_histPos = -1;   // per-window input history; -1 = not currently browsing it
     CLogEdit m_out; CEdit m_in, m_topic; CNickList m_nicks; CFont m_font;
 
     afx_msg int OnCreate(LPCREATESTRUCT cs) {
@@ -514,11 +515,29 @@ protected:
             wchar_t c = p->wParam == 'B' ? 2 : p->wParam == 'K' ? 3 : p->wParam == 'U' ? 31 : p->wParam == 'O' ? 15 : p->wParam == 'I' ? 29 : 0;
             if (c) { m_in.ReplaceSel(CString(c)); return TRUE; }
         }
+        if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && (p->wParam == VK_UP || p->wParam == VK_DOWN)) {   // command history
+            if (!m_hist.empty()) {
+                if (p->wParam == VK_UP) {
+                    if (m_histPos < 0) m_histPos = (int)m_hist.size() - 1;
+                    else if (m_histPos > 0) m_histPos--;
+                } else {   // VK_DOWN
+                    if (m_histPos >= 0) m_histPos = (m_histPos + 1 < (int)m_hist.size()) ? m_histPos + 1 : -1;
+                }
+                CString s = m_histPos < 0 ? CString() : m_hist[m_histPos];
+                m_in.SetWindowText(s);
+                int len = m_in.GetWindowTextLength(); m_in.SetSel(len, len);   // caret to end, so typing continues from there
+            }
+            return TRUE;
+        }
         if (p->hwnd == m_in.m_hWnd && p->wParam == VK_RETURN &&
             (p->message == WM_KEYDOWN || p->message == WM_CHAR)) {
             if (p->message == WM_KEYDOWN) {
                 CString s; m_in.GetWindowText(s); m_in.SetWindowText(L"");
-                if (!s.IsEmpty() && onInput) onInput(this, s);
+                if (!s.IsEmpty()) {
+                    if (m_hist.empty() || m_hist.back() != s) m_hist.push_back(s);   // skip exact repeats of the last entry
+                    m_histPos = -1;
+                    if (onInput) onInput(this, s);
+                }
             }
             return TRUE;
         }
@@ -809,6 +828,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
+        else if (cmd == L"echo") { Note(net, arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
@@ -901,11 +921,11 @@ class CMainFrame : public CMDIFrameWnd {
         lf.lfWeight = bold ? FW_BOLD : FW_NORMAL; lf.lfItalic = italic;
         lf.lfCharSet = DEFAULT_CHARSET; lf.lfOutPrecision = OUT_DEFAULT_PRECIS; lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
         lf.lfQuality = DEFAULT_QUALITY; lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
-        wcsncpy_s(lf.lfFaceName, face.IsEmpty() ? CString(L"Consolas") : face, LF_FACESIZE - 1);
+        wcsncpy_s(lf.lfFaceName, face.IsEmpty() ? CString(DEFAULT_FONT) : face, LF_FACESIZE - 1);
     }
     void LoadFont() {
         CWinApp* a = AfxGetApp();
-        CString face = a->GetProfileString(L"Font", L"Face", L"Consolas");
+        CString face = a->GetProfileString(L"Font", L"Face", CString(DEFAULT_FONT));
         int pt = a->GetProfileInt(L"Font", L"Size", 10);
         MakeFont(m_chatFont, face, pt, a->GetProfileInt(L"Font", L"Bold", 0) != 0, a->GetProfileInt(L"Font", L"Italic", 0) != 0);
     }
@@ -969,7 +989,9 @@ class CMainFrame : public CMDIFrameWnd {
         SaveBookmarks();   // persist any add/edit/delete the user made, regardless of how the dialog was closed
         if (d.connectIdx < 0 || d.connectIdx >= (int)m_bookmarks.size()) return;
         Bookmark& e = m_bookmarks[d.connectIdx];
-        Net* net = NewNet(); net->o = e.o; net->nick = e.o.nick; net->tag = e.o.host;
+        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        Net* net = (a && a->net && !a->net->conn) ? a->net : NewNet();   // reuse an idle network rather than always adding one
+        net->o = e.o; net->nick = e.o.nick; net->tag = e.o.host;
         Status(net);
         Connect(net, e.o.host, e.o.port);
     }
@@ -1007,15 +1029,16 @@ class CMainFrame : public CMDIFrameWnd {
         m_tb.GetToolBarCtrl().AddButtons(8, b);
         m_tb.GetToolBarCtrl().SetButtonSize(CSize(28, 26));
     }
-    afx_msg void OnConnectDlg() {   // always starts a brand-new, independent network (like /server -m)
-        Net* net = NewNet();
+    afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
+        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        bool reuse = a && a->net && !a->net->conn;
+        Net* net = reuse ? a->net : NewNet();
         CConnDlg d(net->o, this);
         if (d.DoModal() == IDOK) {
             net->nick = net->o.nick; net->tag = net->o.host; m_defOpts = net->o; SaveOpts();
             Status(net);
-            Note(net, L"IRC ready. /server -m host connects a second, independent network. Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
             Connect(net, net->o.host, net->o.port);
-        } else m_nets.pop_back();   // cancelled: discard the unused network (nothing else references it yet)
+        } else if (!reuse) m_nets.pop_back();   // cancelled: discard the unused network we just created (nothing else references it yet)
     }
     afx_msg void OnFont() {
         LOGFONT lf = m_chatFont;
@@ -1145,6 +1168,10 @@ public:
         if (!m_sw.m_hWnd) AfxMessageBox(L"Switchbar creation failed");
         RecalcLayout(); LayoutBars(); SetTimer(1, 500, nullptr);
         PostMessage(WM_COMMAND, IDM_CONNECT);
+        Net* net = NewNet();   // an idle, disconnected network with just a Status window — lets local commands
+        Status(net);           // (/clear, testing the UI, etc.) be tried without ever connecting anywhere
+        Note(net, L"IRC ready. Not connected use File > Connect, the toolbar, or /server [-m] host [+port] to connect. "
+             L"Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
     }
 };
 
