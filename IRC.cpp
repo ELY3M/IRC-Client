@@ -278,8 +278,10 @@ public:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CServerListDlg, CDialog)
-    ON_BN_CLICKED(IDC_SL_CONNECT, OnConnectBtn) ON_BN_CLICKED(IDC_SL_NEW, OnNewBtn)
-    ON_BN_CLICKED(IDC_SL_EDIT, OnEditBtn) ON_BN_CLICKED(IDC_SL_DELETE, OnDeleteBtn)
+    ON_BN_CLICKED(IDC_SL_CONNECT, OnConnectBtn) 
+    ON_BN_CLICKED(IDC_SL_NEW, OnNewBtn)
+    ON_BN_CLICKED(IDC_SL_EDIT, OnEditBtn) 
+    ON_BN_CLICKED(IDC_SL_DELETE, OnDeleteBtn)
 END_MESSAGE_MAP()
 
 // ---------------- Channel Favorites: bookmarked channels, stored in channels.ini ----------------
@@ -310,7 +312,7 @@ public:
     CFavDlg(std::vector<ChanFav>& f, CWnd* parent) : fv(f) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(220); t.push_back(150);
-        t.push_back(0); t.push_back(0); S(L"Channel Favorites"); t.push_back(9); S(L"Segoe UI");
+        t.push_back(0); t.push_back(0); S(L"Channel Favorites"); t.push_back(9); S(DEFAULT_FONT);  //was Segue UI
         Item(LBS_NOTIFY | LBS_HASSTRINGS | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 6, 8, 208, 112, IDC_FLIST, 0x0083, L"");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 6, 126, 48, 16, IDC_FL_JOIN, 0x0080, L"Join");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 58, 126, 44, 16, IDC_FL_NEW, 0x0080, L"New...");
@@ -340,7 +342,9 @@ public:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CFavDlg, CDialog)
-    ON_BN_CLICKED(IDC_FL_JOIN, OnJoinBtn) ON_BN_CLICKED(IDC_FL_NEW, OnNewBtn) ON_BN_CLICKED(IDC_FL_DELETE, OnDeleteBtn)
+    ON_BN_CLICKED(IDC_FL_JOIN, OnJoinBtn) 
+    ON_BN_CLICKED(IDC_FL_NEW, OnNewBtn) 
+    ON_BN_CLICKED(IDC_FL_DELETE, OnDeleteBtn)
     ON_LBN_DBLCLK(IDC_FLIST, OnDblClick)
 END_MESSAGE_MAP()
 
@@ -608,7 +612,10 @@ protected:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CChatWnd, CMDIChildWnd)
-    ON_WM_CREATE() ON_WM_SIZE() ON_WM_SETFOCUS() ON_WM_DESTROY()
+    ON_WM_CREATE() 
+    ON_WM_SIZE() 
+    ON_WM_SETFOCUS() 
+    ON_WM_DESTROY()
     ON_LBN_DBLCLK(4, OnNickDbl)
 END_MESSAGE_MAP()
 
@@ -685,7 +692,10 @@ protected:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CSwitchBar, CWnd)
-    ON_WM_PAINT() ON_WM_LBUTTONDOWN() ON_WM_RBUTTONUP() ON_WM_MBUTTONUP()
+    ON_WM_PAINT() 
+    ON_WM_LBUTTONDOWN() 
+    ON_WM_RBUTTONUP() 
+    ON_WM_MBUTTONUP()
 END_MESSAGE_MAP()
 
 // ---------------- Net: one IRC connection (its own socket, nick, options and status text) ----------------
@@ -1209,21 +1219,40 @@ class CMainFrame : public CMDIFrameWnd {
         CRect cli; ::GetWindowRect(m_hWndMDIClient, &cli); ScreenToClient(&cli);
         if (sw != m_lastSw || cli != m_lastCli) LayoutBars();
     }
-    void SetSwPos(bool top) { m_swTop = top; AfxGetApp()->WriteProfileInt(L"Conn", L"SwTop", top); LayoutBars(); }
+    void SetSwPos(bool top) { 
+        m_swTop = top; 
+        AfxGetApp()->WriteProfileInt(L"Conn", L"SwTop", top); 
+        LayoutBars(); 
+    }
     DECLARE_MESSAGE_MAP()
 public:
     void Start() {
-        LoadOpts(); LoadFont(); LoadBookmarks(); LoadFavs();
-        CMenu f, w;
-        f.CreatePopupMenu(); f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
-        f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
+        LoadOpts(); 
+        LoadFont(); 
+        LoadBookmarks(); 
+        LoadFavs();
+        CMenu f, s, c, w;
+        f.CreatePopupMenu(); 
+        f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); 
+        f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
+        f.AppendMenu(MF_SEPARATOR); 
+        f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
         f.AppendMenu(MF_STRING, IDM_SERVERS, L"&Server List...");
         f.AppendMenu(MF_STRING, IDM_CHANFAVS, L"Channel F&avorites...");
-        f.AppendMenu(MF_SEPARATOR); f.AppendMenu(MF_STRING, IDM_EXIT, L"E&xit");
-        w.CreatePopupMenu(); w.AppendMenu(MF_STRING, IDM_CASCADE, L"&Cascade"); w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
-        w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
+        f.AppendMenu(MF_SEPARATOR); 
+        f.AppendMenu(MF_STRING, IDM_EXIT, L"E&xit");
+        s.CreatePopupMenu();
+        c.CreatePopupMenu();
+        w.CreatePopupMenu(); w.AppendMenu(MF_STRING, IDM_CASCADE, L"&Cascade"); 
+        w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
+        w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); 
+        w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
         m_menu.CreateMenu();
-        m_menu.AppendMenu(MF_POPUP, (UINT_PTR)f.Detach(), L"&File"); m_menu.AppendMenu(MF_POPUP, (UINT_PTR)w.Detach(), L"&Window");
+        m_menu.AppendMenu(MF_POPUP, (UINT_PTR)f.Detach(), L"&File");
+        //m_menu.AppendMenu(MF_POPUP, (UINT_PTR)s.Detach(), L"&Servers");
+        m_menu.AppendMenu(MF_STRING, IDM_SERVERS, L"&Servers");
+        m_menu.AppendMenu(MF_STRING, IDM_CHANFAVS, L"&Favorites");
+        m_menu.AppendMenu(MF_POPUP, (UINT_PTR)w.Detach(), L"&Window");        
         SetMenu(&m_menu); DrawMenuBar();
         static UINT ind[4] = { 0, 0, 0, 0 };
         m_bar.Create(this); m_bar.SetIndicators(ind, 4);
@@ -1254,7 +1283,10 @@ public:
             CChatWnd* w = m_tabWnds[i];
             bool st = w->m_name == L"*status*";
             CMenu m; m.CreatePopupMenu();
-            if (st) { m.AppendMenu(MF_STRING, 1, L"Connect..."); m.AppendMenu(MF_STRING, 2, L"Disconnect"); }
+            if (st) { 
+            m.AppendMenu(MF_STRING, 1, L"Connect..."); 
+            m.AppendMenu(MF_STRING, 2, L"Disconnect"); 
+            }
             else {
                 m.AppendMenu(MF_STRING, 3, w->m_chan ? L"Part / Close" : L"Close");
                 if (w->m_chan) m.AppendMenu(MF_STRING, 5, L"Add to Favorites");
@@ -1296,9 +1328,18 @@ public:
 };
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
-    ON_COMMAND(IDM_CONNECT, OnConnectDlg) ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
-    ON_COMMAND(IDM_CASCADE, OnCascade) ON_COMMAND(IDM_TILE, OnTile) ON_COMMAND(IDM_EXIT, OnExit) ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SERVERS, OnServerList) ON_COMMAND(IDM_CHANFAVS, OnChanFavs) ON_WM_TIMER() ON_WM_SIZE()
-    ON_COMMAND(IDM_SWTOP, OnSwTop) ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
+    ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
+    ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
+    ON_COMMAND(IDM_CASCADE, OnCascade) 
+    ON_COMMAND(IDM_TILE, OnTile) 
+    ON_COMMAND(IDM_EXIT, OnExit) 
+    ON_COMMAND(IDM_FONT, OnFont) 
+    ON_COMMAND(IDM_SERVERS, OnServerList) 
+    ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
+    ON_WM_TIMER() 
+    ON_WM_SIZE()
+    ON_COMMAND(IDM_SWTOP, OnSwTop) 
+    ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
     ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom) ON_WM_INITMENUPOPUP()
 END_MESSAGE_MAP()
 
