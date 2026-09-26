@@ -2,3 +2,4 @@
 #include <windows.h>
 101 ICON "IRC.ico"
 102 BITMAP "toolbar.bmp"
+103 BITMAP "about.bmp"

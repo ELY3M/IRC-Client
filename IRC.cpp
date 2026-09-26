@@ -133,7 +133,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -347,6 +347,49 @@ BEGIN_MESSAGE_MAP(CFavDlg, CDialog)
     ON_BN_CLICKED(IDC_FL_DELETE, OnDeleteBtn)
     ON_LBN_DBLCLK(IDC_FLIST, OnDblClick)
 END_MESSAGE_MAP()
+
+// ---------------- About dialog: app icon + banner image ----------------
+class CAboutDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    // A STATIC control whose picture is an icon/bitmap RESOURCE, referenced by numeric id rather than a string —
+    // the DLGITEMTEMPLATE "text" field can be the 0xFFFF-ordinal form here too, same trick used for control classes.
+    void ItemRes(DWORD st, int x, int y, int cx, int cy, WORD id, WORD resId) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(0x0082);   // class = STATIC
+        t.push_back(0xFFFF); t.push_back(resId);    // "text" = ordinal resource id, not a string
+        t.push_back(0); ++cnt;
+    }
+public:
+    CAboutDlg(CWnd* parent) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); 
+        t.push_back(0); 
+        t.push_back(0); 
+        t.push_back(210); 
+        t.push_back(210);
+        t.push_back(0); 
+        t.push_back(0); 
+        S(L"About IRC"); 
+        t.push_back(9); 
+        S(DEFAULT_FONT);
+        ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon (MiniIRC.ico) — blank if the optional .rc wasn't linked
+        ItemRes(SS_BITMAP, 10, 40, 180, 180, 501, 103);       // the banner image (about.bmp) — likewise blank if not linked
+        Item(SS_LEFT, 10, 150, 190, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 80, 180, 48, 16, IDOK, 0x0080, L"OK");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+};
 
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
 class CIrcSock : public CAsyncSocket {
@@ -1056,6 +1099,7 @@ class CMainFrame : public CMDIFrameWnd {
             WritePrivateProfileStringW(sec, L"TLS", e.o.tls ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Lax", e.o.lax ? L"1" : L"0", path);
         }
     }
+    afx_msg void OnAbout() { CAboutDlg d(this); d.DoModal(); }
     afx_msg void OnServerList() {
         CServerListDlg d(m_bookmarks, this);
         d.DoModal();   // Close returns IDCANCEL either way; connectIdx tells us whether "Connect" was used
@@ -1185,12 +1229,12 @@ class CMainFrame : public CMDIFrameWnd {
         // just our own menu bar. Our switchbar context menus use raw ids read via TPM_RETURNCMD, with no
         // ON_COMMAND registered for them on purpose, so the default handling was silently greying every
         // item out (invisible-looking since we never called EnableMenuItem ourselves) right before display.
-        // Only let the real menu bar's popups (File / Window) go through the default auto-update, since
-        // the Window menu's checkmarks (Switchbar at Top/Bottom) genuinely rely on it.
+        // Only let the real menu bar's popups (File / Window / Help) go through the default auto-update,
+        // since the Window menu's checkmarks (Switchbar at Top/Bottom) genuinely rely on it.
         if (!bSysMenu) {
             HMENU h = pMenu->GetSafeHmenu();
-            CMenu* f = m_menu.GetSubMenu(0); CMenu* w = m_menu.GetSubMenu(1);
-            bool ours = (f && f->GetSafeHmenu() == h) || (w && w->GetSafeHmenu() == h);
+            CMenu* f = m_menu.GetSubMenu(0); CMenu* w = m_menu.GetSubMenu(1); CMenu* hp = m_menu.GetSubMenu(2);
+            bool ours = (f && f->GetSafeHmenu() == h) || (w && w->GetSafeHmenu() == h) || (hp && hp->GetSafeHmenu() == h);
             if (!ours) return;   // one of our ad-hoc popups: skip the base class, leave items as we set them
         }
         CMDIFrameWnd::OnInitMenuPopup(pMenu, nIndex, bSysMenu);
@@ -1231,7 +1275,7 @@ public:
         LoadFont(); 
         LoadBookmarks(); 
         LoadFavs();
-        CMenu f, s, c, w;
+        CMenu f, s, c, w, h;
         f.CreatePopupMenu(); 
         f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); 
         f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
@@ -1247,12 +1291,14 @@ public:
         w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
         w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); 
         w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
+        h.CreatePopupMenu(); 
+        h.AppendMenu(MF_STRING, IDM_ABOUT, L"&About");
         m_menu.CreateMenu();
         m_menu.AppendMenu(MF_POPUP, (UINT_PTR)f.Detach(), L"&File");
-        //m_menu.AppendMenu(MF_POPUP, (UINT_PTR)s.Detach(), L"&Servers");
         m_menu.AppendMenu(MF_STRING, IDM_SERVERS, L"&Servers");
         m_menu.AppendMenu(MF_STRING, IDM_CHANFAVS, L"&Favorites");
-        m_menu.AppendMenu(MF_POPUP, (UINT_PTR)w.Detach(), L"&Window");        
+        m_menu.AppendMenu(MF_POPUP, (UINT_PTR)w.Detach(), L"&Window");
+		m_menu.AppendMenu(MF_POPUP, (UINT_PTR)h.Detach(), L"&Help");   
         SetMenu(&m_menu); DrawMenuBar();
         static UINT ind[4] = { 0, 0, 0, 0 };
         m_bar.Create(this); m_bar.SetIndicators(ind, 4);
@@ -1336,6 +1382,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_FONT, OnFont) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
+	ON_COMMAND(IDM_ABOUT, OnAbout)
     ON_WM_TIMER() 
     ON_WM_SIZE()
     ON_COMMAND(IDM_SWTOP, OnSwTop) 
