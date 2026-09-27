@@ -57,6 +57,43 @@ static CString Strip(const CString& s) {
     }
     return o;
 }
+// Draws mIRC color-coded text into a plain GDI device context (used by the /list window's Topic
+// column, since a CListCtrl can't render per-character colors on its own the way the chat log can).
+// Only foreground color changes are rendered; bold/underline/italic/reverse are ignored here for simplicity.
+static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
+    static const COLORREF pal[16] = { RGB(255,255,255), RGB(0,0,0), RGB(0,0,127), RGB(0,147,0), RGB(255,0,0), RGB(127,0,0),
+        RGB(156,0,156), RGB(252,127,0), RGB(255,255,0), RGB(0,252,0), RGB(0,147,147), RGB(0,255,255), RGB(0,0,252),
+        RGB(255,0,255), RGB(127,127,127), RGB(210,210,210) };
+    COLORREF fg = base, bg = CLR_NONE; int x = r.left; CString seg; int n = s.GetLength();
+    int saved = dc->SaveDC();
+    dc->IntersectClipRect(r);   // keeps per-segment background fills from bleeding past this cell
+    auto flush = [&]() {
+        if (seg.IsEmpty()) return;
+        SIZE sz = dc->GetTextExtent(seg);
+        CRect tr(x, r.top, x + sz.cx, r.bottom);
+        if (bg != CLR_NONE) dc->FillSolidRect(tr, bg);
+        dc->SetBkMode(TRANSPARENT);
+        dc->SetTextColor(fg);
+        dc->DrawText(seg, tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        x += sz.cx;
+        seg.Empty();
+    };
+    auto num = [&](int& i) { int v = -1; for (int k = 0; k < 2 && i + 1 < n && iswdigit(s[i + 1]); k++) v = (v < 0 ? 0 : v * 10) + s[++i] - L'0'; return v; };
+    for (int i = 0; i < n; i++) {
+        wchar_t c = s[i];
+        if (c == 3) {
+            flush(); int f = num(i);
+            if (f < 0) { fg = base; bg = CLR_NONE; continue; }
+            fg = pal[f % 16];
+            if (i + 2 < n && s[i + 1] == L',' && iswdigit(s[i + 2])) { i++; bg = pal[num(i) % 16]; }   // background spec, now rendered
+        }
+        else if (c == 15) { flush(); fg = base; bg = CLR_NONE; }   // reset
+        else if (c == 2 || c == 22 || c == 29 || c == 31) {}       // bold/reverse/italic/underline: not rendered here
+        else seg += c;
+    }
+    flush();
+    dc->RestoreDC(saved);
+}
 static CString Word(CString& s) {
     s.TrimLeft(); int i = s.Find(L' '); CString w;
     if (i < 0) { w = s; s.Empty(); } else { w = s.Left(i); s = s.Mid(i + 1); }
@@ -524,6 +561,7 @@ END_MESSAGE_MAP()
 
 // ---------------- MDI child: status / channel / query window ----------------
 struct Net;   // forward decl: each chat window belongs to one network (see the Net struct, defined near CMainFrame)
+class CListWnd;   // forward decl: the /list results window, defined further down
 
 // ---------------- Nick list: right-click a nick for Whois / Query / Notice ----------------
 class CNickList : public CListBox {
@@ -811,7 +849,116 @@ struct Net {
     CString state = L"Not connected";
     CString tag;      // short label prefixed onto this network's windows in the switchbar, once there's more than one
     int id = 0;
+    CListWnd* listWnd = nullptr;   // this network's open /list results window, if any (one at a time, reused on repeat /list)
 };
+
+// ---------------- Channel List: /list results, sortable, right-click/double-click to join ----------------
+class CListWnd : public CMDIChildWnd {
+public:
+    Net* net = nullptr;
+    int m_seq = 0;   // creation order, same counter as CChatWnd, so the switchbar can interleave both correctly
+    struct Row { CString chan; int users; CString topic; };
+    std::vector<Row> rows;
+    int sortCol = 1; bool sortAsc = false;   // default: most users first, like mIRC's list window
+    std::function<void(Net*, CString)> onJoin;
+    std::function<void(CListWnd*)> onClosed;
+
+    void Clear() { rows.clear(); m_list.DeleteAllItems(); }
+    void AddRow(const CString& chan, int users, const CString& topic) { rows.push_back({ chan, users, topic }); }
+    void Resort() {
+        std::sort(rows.begin(), rows.end(), [this](const Row& a, const Row& b) {
+            int r = (sortCol == 0) ? a.chan.CompareNoCase(b.chan) : (sortCol == 1) ? (a.users - b.users) : a.topic.CompareNoCase(b.topic);
+            return sortAsc ? (r < 0) : (r > 0);
+        });
+        Populate();
+    }
+    void Populate() {
+        m_list.DeleteAllItems();
+        for (size_t i = 0; i < rows.size(); i++) {
+            int idx = m_list.InsertItem((int)i, rows[i].chan);
+            CString u; u.Format(L"%d", rows[i].users);
+            m_list.SetItemText(idx, 1, u);
+            m_list.SetItemText(idx, 2, Strip(rows[i].topic));   // plain fallback text; OnCustomDraw renders the real colors
+        }
+        CString t; t.Format(L"Channel List (%d)", (int)rows.size());
+        SetWindowText(t);
+    }
+protected:
+    CListCtrl m_list;
+    afx_msg void OnCustomDraw(NMHDR* pNMHDR, LRESULT* pResult) {
+        NMLVCUSTOMDRAW* cd = (NMLVCUSTOMDRAW*)pNMHDR;
+        switch (cd->nmcd.dwDrawStage) {
+        case CDDS_PREPAINT: *pResult = CDRF_NOTIFYITEMDRAW; return;
+        case CDDS_ITEMPREPAINT: *pResult = CDRF_NOTIFYSUBITEMDRAW; return;
+        case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+            int row = (int)cd->nmcd.dwItemSpec;
+            if (cd->iSubItem == 2 && row >= 0 && row < (int)rows.size()) {   // Topic column: render mIRC colors ourselves
+                CDC* dc = CDC::FromHandle(cd->nmcd.hdc);
+                CRect r; m_list.GetSubItemRect(row, 2, LVIR_LABEL, r);
+                bool sel = (cd->nmcd.uItemState & CDIS_SELECTED) != 0;
+                COLORREF bg = sel ? ::GetSysColor(COLOR_HIGHLIGHT) : ::GetSysColor(COLOR_WINDOW);
+                COLORREF fg = sel ? ::GetSysColor(COLOR_HIGHLIGHTTEXT) : ::GetSysColor(COLOR_WINDOWTEXT);
+                dc->FillSolidRect(r, bg); dc->SetBkMode(TRANSPARENT);
+                CRect tr = r; tr.left += 4;
+                DrawMircText(dc, tr, rows[row].topic, fg);
+                *pResult = CDRF_SKIPDEFAULT;
+                return;
+            }
+            *pResult = CDRF_DODEFAULT;
+            return;
+        }
+        default: *pResult = CDRF_DODEFAULT; return;
+        }
+    }
+    afx_msg int OnCreate(LPCREATESTRUCT cs) {
+        if (CMDIChildWnd::OnCreate(cs) == -1) return -1;
+        CRect z(0, 0, 0, 0);
+        m_list.Create(WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_BORDER, z, this, 1);
+        m_list.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        m_list.InsertColumn(0, L"Channel", LVCFMT_LEFT, 160);
+        m_list.InsertColumn(1, L"Users", LVCFMT_RIGHT, 60);
+        m_list.InsertColumn(2, L"Topic", LVCFMT_LEFT, 420);
+        return 0;
+    }
+    afx_msg void OnSize(UINT t, int cx, int cy) { CMDIChildWnd::OnSize(t, cx, cy); if (m_list.m_hWnd) m_list.MoveWindow(0, 0, cx, cy); }
+    afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClosed) onClosed(this); }
+    afx_msg void OnInitMenuPopup(CMenu*, UINT, BOOL) {
+        // Deliberately skip the base class: CFrameWnd's default handling here auto-disables any menu item
+        // whose command ID has no ON_COMMAND handler in the message map -- which would grey out (and make
+        // unclickable) our ad-hoc "Join" popup, since its result is read directly via TPM_RETURNCMD instead.
+        // This window has no real menu bar of its own, so there's nothing that legitimately needs the default.
+    }
+    afx_msg void OnColumnClick(NMHDR* h, LRESULT* r) {
+        NMLISTVIEW* nv = (NMLISTVIEW*)h;
+        if (nv->iSubItem == sortCol) sortAsc = !sortAsc; else { sortCol = nv->iSubItem; sortAsc = true; }
+        Resort(); *r = 0;
+    }
+    afx_msg void OnDblClick(NMHDR*, LRESULT* r) {
+        *r = 0;
+        int i = m_list.GetNextItem(-1, LVNI_SELECTED); if (i < 0) return;
+        if (onJoin) onJoin(net, m_list.GetItemText(i, 0));
+    }
+    afx_msg void OnRClick(NMHDR* h, LRESULT* r) {
+        *r = 0;
+        NMITEMACTIVATE* ia = (NMITEMACTIVATE*)h;
+        int i = ia->iItem; if (i < 0) return;
+        m_list.SetItemState(i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        CString chan = m_list.GetItemText(i, 0);
+        CMenu m; m.CreatePopupMenu();
+        m.AppendMenu(MF_STRING, 1, L"Join " + chan);
+        CPoint pt; GetCursorPos(&pt);
+        SetForegroundWindow();
+        int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        PostMessage(WM_NULL, 0, 0);
+        if (cmd == 1 && onJoin) onJoin(net, chan);
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CListWnd, CMDIChildWnd)
+    ON_WM_CREATE() ON_WM_SIZE() ON_WM_DESTROY() ON_WM_INITMENUPOPUP()
+    ON_NOTIFY(LVN_COLUMNCLICK, 1, OnColumnClick) ON_NOTIFY(NM_DBLCLK, 1, OnDblClick) ON_NOTIFY(NM_RCLICK, 1, OnRClick)
+    ON_NOTIFY(NM_CUSTOMDRAW, 1, OnCustomDraw)
+END_MESSAGE_MAP()
 
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
@@ -821,7 +968,7 @@ class CMainFrame : public CMDIFrameWnd {
     CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
     CString m_swSkinPath, m_tbSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp;
-    CString m_bt[4]; int m_seqn = 0; std::vector<CChatWnd*> m_tabWnds;
+    CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
@@ -855,9 +1002,9 @@ class CMainFrame : public CMDIFrameWnd {
     void Show(CChatWnd* w, const CString& t, COLORREF c = cText) {
         if (!w) return;
         w->AddLine(t, c);
-        if (w != static_cast<CChatWnd*>(MDIGetActive())) w->m_act = (std::max)(w->m_act, (c == cText || c == cAct) ? 2 : 1);
+        if (w != dynamic_cast<CChatWnd*>(MDIGetActive())) w->m_act = (std::max)(w->m_act, (c == cText || c == cAct) ? 2 : 1);
     }
-    void Activate(CChatWnd* w) { if (w->IsIconic()) MDIRestore(w); MDIActivate(w); }
+    void Activate(CMDIChildWnd* w) { if (w->IsIconic()) MDIRestore(w); MDIActivate(w); }   // CMDIChildWnd base: works for both CChatWnd and CListWnd
     void Goto(Net* net, const CString& t) {   // switchbar / double-click target: existing window is activated, unknown #chan is joined
         if (IsChan(t)) { if (CChatWnd* w = Find(net, t)) Activate(w); else Send(net, L"JOIN " + t); }
         else Activate(Open(net, t, false));
@@ -872,21 +1019,43 @@ class CMainFrame : public CMDIFrameWnd {
     void SetState(Net* net, const CString& t) { net->state = t; RefreshBars(); }
     void RefreshBars() {   // switchbar buttons + status bar panes: [server state] [nick] [active window] [channels]
         if (!m_bar.m_hWnd || !m_sw.m_hWnd) return;
-        std::vector<CChatWnd*> ws;
+        std::vector<CMDIChildWnd*> ws;   // CChatWnd and CListWnd together, so /list windows also get a switchbar button
         for (auto& kv : m_w) ws.push_back(kv.second);
-        std::sort(ws.begin(), ws.end(), [](CChatWnd* x, CChatWnd* y) {   // group by network first, then creation order within it
-            int nx = x->net ? x->net->id : 0, ny = y->net ? y->net->id : 0;
-            return nx != ny ? nx < ny : x->m_seq < y->m_seq;
+        for (auto& np : m_nets) if (np->listWnd) ws.push_back(np->listWnd);
+        auto getNet = [](CMDIChildWnd* w) -> Net* {
+            if (auto* c = dynamic_cast<CChatWnd*>(w)) return c->net;
+            if (auto* l = dynamic_cast<CListWnd*>(w)) return l->net;
+            return nullptr;
+        };
+        auto getSeq = [](CMDIChildWnd* w) -> int {
+            if (auto* c = dynamic_cast<CChatWnd*>(w)) return c->m_seq;
+            if (auto* l = dynamic_cast<CListWnd*>(w)) return l->m_seq;
+            return 0;
+        };
+        std::sort(ws.begin(), ws.end(), [&](CMDIChildWnd* x, CMDIChildWnd* y) {   // group by network first, then creation order within it
+            Net* nx = getNet(x); Net* ny = getNet(y);
+            int nxid = nx ? nx->id : 0, nyid = ny ? ny->id : 0;
+            return nxid != nyid ? nxid < nyid : getSeq(x) < getSeq(y);
         });
-        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        CMDIChildWnd* activeAny = MDIGetActive();
+        auto* a = dynamic_cast<CChatWnd*>(activeAny);
         if (a) a->m_act = 0;                                   // activity clears once the window is active
         bool multi = m_nets.size() > 1;                        // more than one network: prefix window labels with its tag
         std::vector<CSwitchBar::Btn> bs; CString chans; m_tabWnds = ws;
-        for (auto* w : ws) {
-            CSwitchBar::Btn b; CString lbl = w->m_name == L"*status*" ? CString(L"Status") : w->m_name;
-            b.text = (multi && w->net) ? (w->net->tag + L": " + lbl) : lbl;
-            b.act = w->m_act; b.sel = (w == a); bs.push_back(b);
-            if (w->m_chan && (!a || w->net == a->net)) chans += w->m_name + L" ";   // only the active window's network
+        for (auto* mw : ws) {
+            CSwitchBar::Btn b;
+            if (auto* w = dynamic_cast<CChatWnd*>(mw)) {
+                CString lbl = w->m_name == L"*status*" ? CString(L"Status") : w->m_name;
+                b.text = (multi && w->net) ? (w->net->tag + L": " + lbl) : lbl;
+                b.act = w->m_act;
+                if (w->m_chan && (!a || w->net == a->net)) chans += w->m_name + L" ";   // only the active window's network
+            } else if (auto* lw = dynamic_cast<CListWnd*>(mw)) {
+                CString lbl; mw->GetWindowText(lbl);
+                b.text = (multi && lw->net) ? (lw->net->tag + L": " + lbl) : lbl;
+                b.act = 0;
+            }
+            b.sel = (mw == activeAny);
+            bs.push_back(b);
         }
         m_sw.Set(bs);
         CString act, state, nick;
@@ -900,6 +1069,16 @@ class CMainFrame : public CMDIFrameWnd {
         set(3, chans.IsEmpty() ? CString(L"No channels") : L"Channels: " + chans);
     }
 
+    CListWnd* OpenListWnd(Net* net) {   // one /list window per network; a repeat /list reuses and refreshes it
+        if (net->listWnd) { Activate(net->listWnd); return net->listWnd; }
+        auto* w = new CListWnd(); w->net = net; w->m_seq = ++m_seqn;
+        w->onJoin = [this](Net* n, CString chan) { Send(n, L"JOIN " + chan); };
+        w->onClosed = [this](CListWnd* c) { for (auto& np : m_nets) if (np->listWnd == c) np->listWnd = nullptr; };
+        CString title = (m_nets.size() > 1) ? net->tag + L": Channel List" : CString(L"Channel List");
+        w->Create(nullptr, title, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        net->listWnd = w;
+        return w;
+    }
     CChatWnd* Open(Net* net, const CString& name, bool chan) {
         if (auto* e = Find(net, name)) return e;
         auto* w = new CChatWnd(name, chan);
@@ -972,28 +1151,6 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
     }
-
-    CString GetTime() {
-    
-        CTime currentTime = CTime::GetCurrentTime();
-        int year = currentTime.GetYear();
-        int month = currentTime.GetMonth();
-        int day = currentTime.GetDay();
-        int dayofweek = currentTime.GetDayOfWeek();
-        int hour = currentTime.GetHour();
-        int minute = currentTime.GetMinute();
-        int second = currentTime.GetSecond();
-        LPCTSTR days[] = { _T("Sun"), _T("Mon"), _T("Tue"), _T("Wed"), _T("Thur"), _T("Fri"), _T("Sat") };
-        CString getdayofweek = days[dayofweek - 1];
-        // Format it into a CString (e.g., "2026-09-27 15:30:22")
-        //CString strTime = currentTime.Format(_T("%Y-%m-%d %H:%M:%S"));
-        //TIME reply]: Sun Sep 27 05:23:04 2026
-        CString strTime = currentTime.Format(_T("%m-%d-%Y %H:%M:%S %p"));        
-        CString ctcpTime = getdayofweek + " " + strTime;
-        return ctcpTime;
-    
-    }
-
     void AddtoClipboard(CString clipboard) {
         if (AfxGetMainWnd()->OpenClipboard())
         {
@@ -1042,6 +1199,24 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"nick") { if (net->conn) Send(net, L"NICK " + arg); else net->nick = arg; }
         else if (cmd == L"join" || cmd == L"j") Send(net, L"JOIN " + arg);
+        else if (cmd == L"list") {
+            CString a2 = arg; bool minimize = false; CString minS, maxS, pattern;
+            for (;;) {
+                CString tok = Word(a2); if (tok.IsEmpty()) break;
+                CString up = tok; up.MakeUpper();
+                if (up == L"-N") minimize = true;
+                else if (up == L"-MIN") minS = Word(a2);
+                else if (up == L"-MAX") maxS = Word(a2);
+                else pattern = tok;
+            }
+            CString param;
+            if (!minS.IsEmpty() || !maxS.IsEmpty()) { if (!minS.IsEmpty()) param += L">" + minS; if (!maxS.IsEmpty()) param += L"<" + maxS; }
+            else if (!pattern.IsEmpty()) param = pattern;
+            CListWnd* lw = OpenListWnd(net);
+            lw->Clear();
+            Send(net, L"LIST" + (param.IsEmpty() ? CString() : L" " + param));
+            if (minimize) lw->ShowWindow(SW_SHOWMINIMIZED);
+        }
         else if (cmd == L"part" || cmd == L"leave") Send(net, L"PART " + (arg.IsEmpty() && w->m_chan ? w->m_name : arg));
         else if (cmd == L"msg" || cmd == L"m") { CString t = Word(arg); Say(net, t, arg); }
         else if (cmd == L"query" || cmd == L"q") { CString t = Word(arg); Open(net, t, false); if (!arg.IsEmpty()) Say(net, t, arg); }
@@ -1062,7 +1237,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"echo") { Note(net, arg); }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /ctcp /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /ctcp /quit /clear /raw; other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -1092,8 +1267,18 @@ class CMainFrame : public CMDIFrameWnd {
                 // not a conversation: goes to the Status window only, in red, and never opens a query window
                 // for the sender  which is what was happening before (every version-scanning bot on a
                 // network would silently spawn an empty background window for itself).
-                if (txt == L"VERSION" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
-                if (txt == L"TIME" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"TIME My cuurent time is " + GetTime() + CString(wchar_t(1)));
+                if (notice && txt.Left(5) == L"PING ") {   // reply to a PING we sent via /ctcp: show round-trip time
+                    unsigned long sent = wcstoul(txt.Mid(5), nullptr, 10);
+                    unsigned long rtt = ::GetTickCount() - sent;
+                    CString ms; ms.Format(L"%lu", rtt);
+                    Show(Status(net), L"[CTCP PING reply from " + nick + L": " + ms + L"ms]", cPart);
+                    return;
+                }
+                if (!notice) {
+                    if (txt == L"VERSION") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
+                    else if (txt.Left(4) == L"PING") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + txt + CString(wchar_t(1)));   // echo the payload back, standard CTCP PING reply
+                    else if (txt == L"TIME") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"TIME " + CTime::GetCurrentTime().Format(L"%a %b %d %H:%M:%S %Y") + CString(wchar_t(1)));
+                }
                 Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cPart);
                 return;
             }
@@ -1140,6 +1325,9 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cInfo); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
             if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
         else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic: " + P(2), cInfo); } }
+        else if (cmd == L"321") { /* RPL_LISTSTART header ("Channel Users Name"): nothing to do, our list window has its own column headers */ }
+        else if (cmd == L"322") { if (net->listWnd) net->listWnd->AddRow(P(1), _wtoi(P(2)), P(3)); }   // RPL_LIST: <chan> <#users> :<topic>
+        else if (cmd == L"323") { if (net->listWnd) net->listWnd->Resort(); }   // RPL_LISTEND: results complete, sort and display
         else if (cmd == L"353") {
             if (CChatWnd* w = Find(net, P(2))) {
                 if (w->m_refresh) { w->ClearNicks(); w->m_refresh = false; }
@@ -1274,7 +1462,7 @@ class CMainFrame : public CMDIFrameWnd {
         SaveBookmarks();   // persist any add/edit/delete the user made, regardless of how the dialog was closed
         if (d.connectIdx < 0 || d.connectIdx >= (int)m_bookmarks.size()) return;
         Bookmark& e = m_bookmarks[d.connectIdx];
-        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
         Net* net = (a && a->net && !a->net->conn) ? a->net : NewNet();   // reuse an idle network rather than always adding one
         net->o = e.o; net->nick = e.o.nick; net->tag = e.o.host;
         Status(net);
@@ -1313,7 +1501,7 @@ class CMainFrame : public CMDIFrameWnd {
         SaveFavs();   // persist any add/delete regardless of how the dialog was closed
         if (d.joinIdx < 0 || d.joinIdx >= (int)m_favs.size()) return;
         ChanFav& e = m_favs[d.joinIdx];
-        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
         Net* net = a ? a->net : nullptr;
         if (!net || !net->conn) { AfxMessageBox(L"Connect to a server first, then use Channel Favorites to join."); return; }
         Send(net, L"JOIN " + e.chan + (e.key.IsEmpty() ? CString() : L" " + e.key));
@@ -1368,7 +1556,7 @@ class CMainFrame : public CMDIFrameWnd {
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
-        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
         bool reuse = a && a->net && !a->net->conn;
         Net* net = reuse ? a->net : NewNet();
         CConnDlg d(net->o, this);
@@ -1386,7 +1574,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& kv : m_w) kv.second->ApplyFont(m_chatFont);   // applies to every open window; new text in each uses it too
     }
     afx_msg void OnDisconnect() {   // disconnects whichever network the active window belongs to
-        auto* a = static_cast<CChatWnd*>(MDIGetActive());
+        auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
         if (a && a->net) OnInput(Status(a->net), L"/quit");
     }
     afx_msg void OnCascade() { MDICascade(); }
@@ -1524,7 +1712,7 @@ public:
             else if (r == 4) SetSkin(false, CString());
         };
         m_bar.onChan = [this](CString c) {   // clicking a channel name in the status bar's "Channels:" pane
-            auto* a = static_cast<CChatWnd*>(MDIGetActive());
+            auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
             if (a && a->net) Goto(a->net, c);
         };
         m_sw.onSel = [this](int i) {   // click a switchbar button -> activate that window
@@ -1532,7 +1720,18 @@ public:
         };
         m_sw.onMenu = [this](int i, CPoint pt) {   // right-click a switchbar button
             if (i < 0 || i >= (int)m_tabWnds.size()) return;
-            CChatWnd* w = m_tabWnds[i];
+            CMDIChildWnd* mw = m_tabWnds[i];
+            if (auto* lw = dynamic_cast<CListWnd*>(mw)) {   // a /list window: just offer Close
+                CMenu lm; lm.CreatePopupMenu();
+                lm.AppendMenu(MF_STRING, 1, L"Close");
+                SetForegroundWindow(); m_menuOpen = true;
+                int lcmd = lm.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+                m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
+                Activate(lw);
+                if (lcmd == 1) lw->PostMessage(WM_CLOSE);
+                return;
+            }
+            CChatWnd* w = (CChatWnd*)mw;
             bool st = w->m_name == L"*status*";
             CMenu m; m.CreatePopupMenu();
             if (st) { 
@@ -1566,8 +1765,10 @@ public:
             }
         };
         m_sw.onClose = [this](int i) {   // middle-click a button -> close that window
-            if (i < 0 || i >= (int)m_tabWnds.size() || m_tabWnds[i]->m_name == L"*status*") return;
-            m_tabWnds[i]->PostMessage(WM_CLOSE);
+            if (i < 0 || i >= (int)m_tabWnds.size()) return;
+            CMDIChildWnd* mw = m_tabWnds[i];
+            if (auto* c = dynamic_cast<CChatWnd*>(mw)) { if (c->m_name == L"*status*") return; }   // never middle-click-close Status
+            mw->PostMessage(WM_CLOSE);
         };
         if (!m_sw.m_hWnd) AfxMessageBox(L"Switchbar creation failed");
         RecalcLayout(); LayoutBars(); SetTimer(1, 500, nullptr);
