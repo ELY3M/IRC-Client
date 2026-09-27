@@ -60,6 +60,25 @@ static CString Strip(const CString& s) {
 // Draws mIRC color-coded text into a plain GDI device context (used by the /list window's Topic
 // column, since a CListCtrl can't render per-character colors on its own the way the chat log can).
 // Only foreground color changes are rendered; bold/underline/italic/reverse are ignored here for simplicity.
+// Many ircds (UnrealIRCd and others, including Rizon) embed a channel's modes directly in the topic
+// field of the LIST reply, as a leading bracketed prefix like "[+ntr]" or "[+lk 50]". This pulls that
+// out so it can go in its own column, the same way mIRC's channel list window does -- no extra
+// per-channel MODE query needed (which wouldn't scale to a list of thousands of channels anyway).
+static bool ParseListModes(const CString& topicIn, CString& modesOut, CString& topicOut) {
+    if (topicIn.Left(1) == L"[") {
+        int end = topicIn.Find(L']');
+        if (end > 0) {
+            CString inside = topicIn.Mid(1, end - 1);
+            if (!inside.IsEmpty() && inside[0] == L'+') {
+                modesOut = inside;
+                topicOut = topicIn.Mid(end + 1); topicOut.TrimLeft();
+                return true;
+            }
+        }
+    }
+    modesOut.Empty(); topicOut = topicIn;
+    return false;
+}
 static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
     static const COLORREF pal[16] = { RGB(255,255,255), RGB(0,0,0), RGB(0,0,127), RGB(0,147,0), RGB(255,0,0), RGB(127,0,0),
         RGB(156,0,156), RGB(252,127,0), RGB(255,255,0), RGB(0,252,0), RGB(0,147,147), RGB(0,255,255), RGB(0,0,252),
@@ -857,17 +876,18 @@ class CListWnd : public CMDIChildWnd {
 public:
     Net* net = nullptr;
     int m_seq = 0;   // creation order, same counter as CChatWnd, so the switchbar can interleave both correctly
-    struct Row { CString chan; int users; CString topic; };
+    struct Row { CString chan; int users; CString modes; CString topic; };
     std::vector<Row> rows;
     int sortCol = 1; bool sortAsc = false;   // default: most users first, like mIRC's list window
     std::function<void(Net*, CString)> onJoin;
     std::function<void(CListWnd*)> onClosed;
 
     void Clear() { rows.clear(); m_list.DeleteAllItems(); }
-    void AddRow(const CString& chan, int users, const CString& topic) { rows.push_back({ chan, users, topic }); }
+    void AddRow(const CString& chan, int users, const CString& modes, const CString& topic) { rows.push_back({ chan, users, modes, topic }); }
     void Resort() {
         std::sort(rows.begin(), rows.end(), [this](const Row& a, const Row& b) {
-            int r = (sortCol == 0) ? a.chan.CompareNoCase(b.chan) : (sortCol == 1) ? (a.users - b.users) : a.topic.CompareNoCase(b.topic);
+            int r = (sortCol == 0) ? a.chan.CompareNoCase(b.chan) : (sortCol == 1) ? (a.users - b.users)
+                  : (sortCol == 2) ? a.modes.CompareNoCase(b.modes) : a.topic.CompareNoCase(b.topic);
             return sortAsc ? (r < 0) : (r > 0);
         });
         Populate();
@@ -878,7 +898,8 @@ public:
             int idx = m_list.InsertItem((int)i, rows[i].chan);
             CString u; u.Format(L"%d", rows[i].users);
             m_list.SetItemText(idx, 1, u);
-            m_list.SetItemText(idx, 2, Strip(rows[i].topic));   // plain fallback text; OnCustomDraw renders the real colors
+            m_list.SetItemText(idx, 2, rows[i].modes);
+            m_list.SetItemText(idx, 3, Strip(rows[i].topic));   // plain fallback text; OnCustomDraw renders the real colors
         }
         CString t; t.Format(L"Channel List (%d)", (int)rows.size());
         SetWindowText(t);
@@ -892,9 +913,9 @@ protected:
         case CDDS_ITEMPREPAINT: *pResult = CDRF_NOTIFYSUBITEMDRAW; return;
         case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
             int row = (int)cd->nmcd.dwItemSpec;
-            if (cd->iSubItem == 2 && row >= 0 && row < (int)rows.size()) {   // Topic column: render mIRC colors ourselves
+            if (cd->iSubItem == 3 && row >= 0 && row < (int)rows.size()) {   // Topic column: render mIRC colors ourselves
                 CDC* dc = CDC::FromHandle(cd->nmcd.hdc);
-                CRect r; m_list.GetSubItemRect(row, 2, LVIR_LABEL, r);
+                CRect r; m_list.GetSubItemRect(row, 3, LVIR_LABEL, r);
                 bool sel = (cd->nmcd.uItemState & CDIS_SELECTED) != 0;
                 COLORREF bg = sel ? ::GetSysColor(COLOR_HIGHLIGHT) : ::GetSysColor(COLOR_WINDOW);
                 COLORREF fg = sel ? ::GetSysColor(COLOR_HIGHLIGHTTEXT) : ::GetSysColor(COLOR_WINDOWTEXT);
@@ -915,9 +936,10 @@ protected:
         CRect z(0, 0, 0, 0);
         m_list.Create(WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_BORDER, z, this, 1);
         m_list.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-        m_list.InsertColumn(0, L"Channel", LVCFMT_LEFT, 160);
+        m_list.InsertColumn(0, L"Channel", LVCFMT_LEFT, 190);
         m_list.InsertColumn(1, L"Users", LVCFMT_RIGHT, 60);
-        m_list.InsertColumn(2, L"Topic", LVCFMT_LEFT, 420);
+        m_list.InsertColumn(2, L"Modes", LVCFMT_LEFT, 70);
+        m_list.InsertColumn(3, L"Topic", LVCFMT_LEFT, 1800);
         return 0;
     }
     afx_msg void OnSize(UINT t, int cx, int cy) { CMDIChildWnd::OnSize(t, cx, cy); if (m_list.m_hWnd) m_list.MoveWindow(0, 0, cx, cy); }
@@ -1326,7 +1348,9 @@ class CMainFrame : public CMDIFrameWnd {
             if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
         else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic: " + P(2), cInfo); } }
         else if (cmd == L"321") { /* RPL_LISTSTART header ("Channel Users Name"): nothing to do, our list window has its own column headers */ }
-        else if (cmd == L"322") { if (net->listWnd) net->listWnd->AddRow(P(1), _wtoi(P(2)), P(3)); }   // RPL_LIST: <chan> <#users> :<topic>
+        else if (cmd == L"322") {   // RPL_LIST: <chan> <#users> :<topic> (topic may have a leading "[+modes]" prefix)
+            if (net->listWnd) { CString modes, topic; ParseListModes(P(3), modes, topic); net->listWnd->AddRow(P(1), _wtoi(P(2)), modes, topic); }
+        }
         else if (cmd == L"323") { if (net->listWnd) net->listWnd->Resort(); }   // RPL_LISTEND: results complete, sort and display
         else if (cmd == L"353") {
             if (CChatWnd* w = Find(net, P(2))) {
