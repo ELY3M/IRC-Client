@@ -36,7 +36,8 @@ along with this program.  If not, see <https://gnu.org>.
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
-#define VERSION L"IRC Client 1.0 - https://github.com/ELY3M/IRC-Client"
+
+#define VERSION L"IRC Client - https://github.com/ELY3M/IRC-Client"
 #define DEFAULT_FONT L"Fixedsys"
 
 static const COLORREF cText = RGB(0,0,0), cJoin = RGB(0,140,0), cPart = RGB(150,0,0),
@@ -407,17 +408,17 @@ public:
         t.push_back(0); 
         t.push_back(0); 
         t.push_back(0); 
-        t.push_back(210); 
-        t.push_back(210);
+        t.push_back(320);
+        t.push_back(400);
         t.push_back(0); 
         t.push_back(0); 
         S(L"About IRC"); 
         t.push_back(9); 
         S(DEFAULT_FONT);
-        ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon (MiniIRC.ico) — blank if the optional .rc wasn't linked
-        ItemRes(SS_BITMAP | SS_NOTIFY, 30, 15, 300, 300, 501, 103);  // the banner image (about.bmp) — likewise blank if not linked
-        Item(SS_LEFT, 10, 150, 190, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
-        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 80, 180, 48, 16, IDOK, 0x0080, L"OK");
+        ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon
+        ItemRes(SS_BITMAP | SS_NOTIFY, 10, 40, 300, 300, 501, 103);  // banner image, moved/resized to fit inside the enlarged dialog
+        Item(SS_LEFT, 10, 350, 300, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 136, 374, 48, 16, IDOK, 0x0080, L"OK");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
@@ -428,7 +429,7 @@ public:
             //AfxMessageBox(L"Test.....");
             CMenu m; m.CreatePopupMenu();
             m.AppendMenu(MF_STRING, 1, L"Change Image...");
-            //SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
+            SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
             int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
             PostMessage(WM_NULL, 0, 0);   // MSDN-documented pairing for the above
             if (cmd == 1) ChangeImage();
@@ -798,6 +799,7 @@ BEGIN_MESSAGE_MAP(CSwitchBar, CWnd)
     ON_WM_LBUTTONDOWN() 
     ON_WM_RBUTTONUP() 
     ON_WM_MBUTTONUP()
+    ON_WM_ERASEBKGND()
 END_MESSAGE_MAP()
 
 // ---------------- Net: one IRC connection (its own socket, nick, options and status text) ----------------
@@ -916,7 +918,7 @@ class CMainFrame : public CMDIFrameWnd {
         Net* net = c->net;
         for (auto i = m_w.begin(); i != m_w.end(); ++i)
             if (i->second == c) { if (c->m_chan && net && net->conn) Send(net, L"PART " + c->m_name); m_w.erase(i); break; }
-        if (net && c->m_name == L"*status*" && net->conn) { Send(net, CString(VERSION)); net->sock.Close(); net->conn = false; }
+        if (net && c->m_name == L"*status*" && net->conn) { Send(net, L"QUIT :" + CString(VERSION)); net->sock.Close(); net->conn = false; }
     }
     void Drop(Net* net, const CString& n) {  // server-driven close (no PART echo)
         auto i = m_w.find(Key(net, n)); if (i == m_w.end()) return;
@@ -970,6 +972,28 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
     }
+
+    CString GetTime() {
+    
+        CTime currentTime = CTime::GetCurrentTime();
+        int year = currentTime.GetYear();
+        int month = currentTime.GetMonth();
+        int day = currentTime.GetDay();
+        int dayofweek = currentTime.GetDayOfWeek();
+        int hour = currentTime.GetHour();
+        int minute = currentTime.GetMinute();
+        int second = currentTime.GetSecond();
+        LPCTSTR days[] = { _T("Sun"), _T("Mon"), _T("Tue"), _T("Wed"), _T("Thur"), _T("Fri"), _T("Sat") };
+        CString getdayofweek = days[dayofweek - 1];
+        // Format it into a CString (e.g., "2026-09-27 15:30:22")
+        //CString strTime = currentTime.Format(_T("%Y-%m-%d %H:%M:%S"));
+        //TIME reply]: Sun Sep 27 05:23:04 2026
+        CString strTime = currentTime.Format(_T("%m-%d-%Y %H:%M:%S %p"));        
+        CString ctcpTime = getdayofweek + " " + strTime;
+        return ctcpTime;
+    
+    }
+
     void AddtoClipboard(CString clipboard) {
         if (AfxGetMainWnd()->OpenClipboard())
         {
@@ -1023,13 +1047,22 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"query" || cmd == L"q") { CString t = Word(arg); Open(net, t, false); if (!arg.IsEmpty()) Say(net, t, arg); }
         else if (cmd == L"me" && inChat) Say(net, w->m_name, arg, true);
         else if (cmd == L"notice") { CString t = Word(arg); Send(net, L"NOTICE " + t + L" :" + arg); Note(net, L"-> -" + t + L"- " + arg, cNote); }
+        else if (cmd == L"ctcp") {
+            CString t = Word(arg); CString type = Word(arg); type.MakeUpper();
+            if (t.IsEmpty() || type.IsEmpty()) { Note(net, L"Usage: /ctcp <nick> <version|time|ping> [args]", cPart); return; }
+            CString payload = type;
+            if (type == L"PING" && arg.IsEmpty()) { CString ts; ts.Format(L"%lu", ::GetTickCount()); payload += L" " + ts; }
+            else if (!arg.IsEmpty()) payload += L" " + arg;
+            Send(net, L"PRIVMSG " + t + L" :" + CString(wchar_t(1)) + payload + CString(wchar_t(1)));
+            Note(net, L"[CTCP " + type + L" to " + t + L"]", cNote);
+        }
         else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
         else if (cmd == L"echo") { Note(net, arg); }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /ctcp /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -1052,13 +1085,20 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"PRIVMSG" || cmd == L"NOTICE") {
             CString tgt = P(0), txt = P(1); bool notice = cmd == L"NOTICE";
             bool priv = tgt.CompareNoCase(net->nick) == 0;
-            CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
-            if (!txt.IsEmpty() && txt[0] == 1) {
-                txt.Trim(CString(wchar_t(1)));
-                if (txt.Left(6) == L"ACTION") Show(w, L"* " + nick + txt.Mid(6), cAct);
-                else if (txt == L"VERSION" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
-                else Show(w, L"[CTCP " + txt + L" from " + nick + L"]", cNote);
+            bool ctcp = !txt.IsEmpty() && txt[0] == 1;
+            if (ctcp) txt.Trim(CString(wchar_t(1)));
+            if (ctcp && txt.Left(6) != L"ACTION") {
+                // Any CTCP other than ACTION (VERSION, PING, TIME, and replies to them) is protocol noise,
+                // not a conversation: goes to the Status window only, in red, and never opens a query window
+                // for the sender  which is what was happening before (every version-scanning bot on a
+                // network would silently spawn an empty background window for itself).
+                if (txt == L"VERSION" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
+                if (txt == L"TIME" && !notice) Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"TIME My cuurent time is " + GetTime() + CString(wchar_t(1)));
+                Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cPart);
+                return;
             }
+            CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
+            if (ctcp) Show(w, L"* " + nick + txt.Mid(6), cAct);   // ACTION (/me): a real chat message, so it still uses the normal window
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNote);
             else Show(w, L"<" + nick + L"> " + txt);
         }
@@ -1388,8 +1428,12 @@ class CMainFrame : public CMDIFrameWnd {
         // since the Window menu's checkmarks (Switchbar at Top/Bottom) genuinely rely on it.
         if (!bSysMenu) {
             HMENU h = pMenu->GetSafeHmenu();
-            CMenu* f = m_menu.GetSubMenu(0); CMenu* w = m_menu.GetSubMenu(1); CMenu* hp = m_menu.GetSubMenu(2);
-            bool ours = (f && f->GetSafeHmenu() == h) || (w && w->GetSafeHmenu() == h) || (hp && hp->GetSafeHmenu() == h);
+            bool ours = false;   // scan every top-level item's submenu, since plain string items (Servers/Favorites
+            int n = m_menu.GetMenuItemCount();   // shortcuts) shift the real File/Window/Help positions around
+            for (int i = 0; i < n && !ours; i++) {
+                CMenu* sub = m_menu.GetSubMenu(i);
+                if (sub && sub->GetSafeHmenu() == h) ours = true;
+            }
             if (!ours) return;   // one of our ad-hoc popups: skip the base class, leave items as we set them
         }
         CMDIFrameWnd::OnInitMenuPopup(pMenu, nIndex, bSysMenu);
