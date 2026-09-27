@@ -970,6 +970,27 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
     }
+    void AddtoClipboard(CString clipboard) {
+        if (AfxGetMainWnd()->OpenClipboard())
+        {
+            ::EmptyClipboard();
+
+            CString strText = clipboard;
+            HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, (strText.GetLength() + 1) * sizeof(TCHAR));
+
+            if (hGlobal)
+            {
+                TCHAR* pDest = (TCHAR*)GlobalLock(hGlobal);
+                _tcscpy_s(pDest, strText.GetLength() + 1, strText);
+                GlobalUnlock(hGlobal);
+
+                // Use CF_UNICODETEXT for Unicode builds, CF_TEXT for ANSI
+                SetClipboardData(CF_UNICODETEXT, hGlobal);
+            }
+
+            CloseClipboard();
+        }
+    }
 
     // ---- user input ----
     void OnInput(CChatWnd* w, CString s) {
@@ -1006,6 +1027,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
         else if (cmd == L"echo") { Note(net, arg); }
+        else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /msg /query /me /notice /topic /quit /clear /raw; other /cmds (mode, kick, whois, list...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
