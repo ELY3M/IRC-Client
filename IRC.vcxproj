@@ -144,7 +144,9 @@
     <ClCompile Include="IRC.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="about.bmp" />
     <Image Include="IRC.ico" />
+    <Image Include="toolbar.bmp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="IRC.rc" />

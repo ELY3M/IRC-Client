@@ -31,6 +31,8 @@ along with this program.  If not, see <https://gnu.org>.
 #include <schannel.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
@@ -63,6 +65,22 @@ static CString Bare(CString s) { s.TrimLeft(L"@+%&~"); return s; }
 static CString IniPath(LPCWSTR name) {   // e.g. IniPath(L"servers.ini") -> full path next to the .exe
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     CString p = exe; return p.Left(p.ReverseFind(L'\\') + 1) + name;
+}
+// Loads any GDI+-supported image file (bmp/jpg/png/gif/...), scales it to fit w x h while preserving
+// aspect ratio, and returns a plain GDI HBITMAP the caller owns. Returns nullptr if the file can't be read.
+static HBITMAP LoadImageFileScaled(const CString& path, int w, int h) {
+    Gdiplus::Bitmap src(path);
+    if (src.GetLastStatus() != Gdiplus::Ok || src.GetWidth() == 0 || src.GetHeight() == 0) return nullptr;
+    Gdiplus::Bitmap canvas(w, h, PixelFormat24bppRGB);
+    Gdiplus::Graphics g(&canvas);
+    g.Clear(Gdiplus::Color(255, 235, 240, 245));
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    double s = (std::min)((double)w / src.GetWidth(), (double)h / src.GetHeight());
+    int dw = (int)(src.GetWidth() * s), dh = (int)(src.GetHeight() * s);
+    g.DrawImage(&src, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    HBITMAP hb = nullptr;
+    canvas.GetHBITMAP(Gdiplus::Color(255, 255, 255), &hb);
+    return hb;
 }
 
 // ---------------- TLS client layer (Windows SChannel, no external libs) ----------------
@@ -349,8 +367,22 @@ BEGIN_MESSAGE_MAP(CFavDlg, CDialog)
 END_MESSAGE_MAP()
 
 // ---------------- About dialog: app icon + banner image ----------------
+// ---------------- A CStatic that reports right-clicks (used for the About banner's "change image") ----------------
+class CClickableStatic : public CStatic {
+public:
+    std::function<void(CPoint)> onRClick;
+protected:
+    afx_msg void OnRButtonUp(UINT, CPoint p) { CPoint sp = p; ClientToScreen(&sp); if (onRClick) onRClick(sp); }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CClickableStatic, CStatic)
+    ON_WM_RBUTTONUP()
+END_MESSAGE_MAP()
+
 class CAboutDlg : public CDialog {
     std::vector<WORD> t; int cnt = 0;
+    CClickableStatic m_banner; 
+    CBitmap m_aboutBmp;
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
     void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
     void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
@@ -383,11 +415,34 @@ public:
         t.push_back(9); 
         S(DEFAULT_FONT);
         ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon (MiniIRC.ico) — blank if the optional .rc wasn't linked
-        ItemRes(SS_BITMAP, 10, 40, 180, 180, 501, 103);       // the banner image (about.bmp) — likewise blank if not linked
+        ItemRes(SS_BITMAP | SS_NOTIFY, 30, 15, 300, 300, 501, 103);  // the banner image (about.bmp) — likewise blank if not linked
         Item(SS_LEFT, 10, 150, 190, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 80, 180, 48, 16, IDOK, 0x0080, L"OK");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        m_banner.SubclassDlgItem(501, this);
+        m_banner.onRClick = [this](CPoint pt) {
+            //AfxMessageBox(L"Test.....");
+            CMenu m; m.CreatePopupMenu();
+            m.AppendMenu(MF_STRING, 1, L"Change Image...");
+            //SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
+            int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+            PostMessage(WM_NULL, 0, 0);   // MSDN-documented pairing for the above
+            if (cmd == 1) ChangeImage();
+        };
+        return TRUE;
+    }
+    void ChangeImage() {
+        CFileDialog fd(TRUE, L"png", nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+            L"Image Files (*.bmp;*.jpg;*.jpeg;*.png;*.gif)|*.bmp;*.jpg;*.jpeg;*.png;*.gif|All Files (*.*)|*.*||", this);
+        if (fd.DoModal() != IDOK) return;
+        HBITMAP hb = LoadImageFileScaled(fd.GetPathName(), 300, 300);
+        if (!hb) { AfxMessageBox(L"Couldn't load that image."); return; }
+        m_aboutBmp.DeleteObject(); m_aboutBmp.Attach(hb);
+        m_banner.SetBitmap((HBITMAP)m_aboutBmp);
     }
 };
 
@@ -696,6 +751,7 @@ public:
     std::function<void(int)> onSel, onClose;
     std::function<void(int, CPoint)> onMenu;
     std::function<void(CPoint)> onBarMenu;   // right-click on empty space (not a button)
+    Gdiplus::Bitmap* skin = nullptr;   // background skin image, owned by the frame; nullptr = plain color
     BOOL Create(CWnd* parent) {
         return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_BTNFACE + 1)), nullptr,
                             WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, CRect(0, 0, 0, 0), parent, 1401);
@@ -712,10 +768,12 @@ protected:
     }
     afx_msg void OnPaint() {   // grey dot = idle, blue = events, red = new messages (like mIRC's window list)
         CPaintDC dc(this); CRect c; GetClientRect(c);
+        if (skin) { Gdiplus::Graphics g(dc.m_hDC); g.DrawImage(skin, 0, 0, c.Width(), c.Height()); }
+        else dc.FillSolidRect(c, ::GetSysColor(COLOR_BTNFACE));
         dc.SelectObject(CFont::FromHandle((HFONT)::GetStockObject(DEFAULT_GUI_FONT))); dc.SetBkMode(TRANSPARENT);
         for (int i = 0; i < (int)btns.size(); i++) {
             const Btn& b = btns[i]; CRect r = BtnRect(i, c.Height());
-            dc.FillSolidRect(r, ::GetSysColor(b.sel ? COLOR_WINDOW : COLOR_BTNFACE));
+            if (!skin || b.sel) dc.FillSolidRect(r, ::GetSysColor(b.sel ? COLOR_WINDOW : COLOR_BTNFACE));   // skinned: let idle buttons show the image through
             dc.Draw3dRect(r, ::GetSysColor(b.sel ? COLOR_BTNSHADOW : COLOR_BTNHIGHLIGHT), ::GetSysColor(b.sel ? COLOR_BTNHIGHLIGHT : COLOR_BTNSHADOW));
             COLORREF dotc = b.act == 2 ? RGB(220, 0, 0) : b.act == 1 ? RGB(0, 0, 220) : RGB(150, 150, 150);
             CRect dot(r.left + 6, r.top + r.Height() / 2 - 4, r.left + 14, r.top + r.Height() / 2 + 4);
@@ -732,6 +790,7 @@ protected:
         if (i >= 0) { if (onMenu) onMenu(i, sp); } else if (onBarMenu) onBarMenu(sp);
     }
     afx_msg void OnMButtonUp(UINT, CPoint p) { int i = Hit(p); if (i >= 0 && onClose) onClose(i); }   // middle-click closes
+    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }   // OnPaint always fully repaints the background itself (skin or solid)
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CSwitchBar, CWnd)
@@ -758,6 +817,8 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<Bookmark> m_bookmarks;   // saved server list (servers.ini)
     std::vector<ChanFav> m_favs;         // saved channel favorites (channels.ini)
     CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
+    CString m_swSkinPath, m_tbSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
+    std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp;
     CString m_bt[4]; int m_seqn = 0; std::vector<CChatWnd*> m_tabWnds;
     std::map<CString, CChatWnd*> m_w;
 
@@ -1051,6 +1112,51 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileString(L"Font", L"Face", m_chatFont.lfFaceName); a->WriteProfileInt(L"Font", L"Size", pt);
         a->WriteProfileInt(L"Font", L"Bold", m_chatFont.lfWeight >= FW_BOLD); a->WriteProfileInt(L"Font", L"Italic", m_chatFont.lfItalic);
     }
+    static CString ResolveSkinPath(const CString& p) {   // a relative path (e.g. "images\skin.png") is resolved against the exe's own folder
+        if (p.IsEmpty() || (p.GetLength() >= 2 && p[1] == L':') || p.Left(2) == L"\\\\") return p;   // already absolute or UNC
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        CString dir = exe; dir = dir.Left(dir.ReverseFind(L'\\') + 1);
+        return dir + p;
+    }
+    static CString RelativizeSkinPath(const CString& abs) {   // stores paths under the exe's folder as relative, matching irc.ini's format
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        CString dir = exe; dir = dir.Left(dir.ReverseFind(L'\\') + 1);
+        CString a = abs, d = dir; a.MakeLower(); d.MakeLower();
+        return (a.Left(d.GetLength()) == d) ? abs.Mid(dir.GetLength()) : abs;
+    }
+    void LoadSkinPaths() {
+        CWinApp* a = AfxGetApp();
+        m_swSkinPath = a->GetProfileString(L"background", L"switchbar", L"");
+        m_tbSkinPath = a->GetProfileString(L"background", L"toolbar", L"");
+    }
+    void SaveSkinPaths() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileString(L"background", L"switchbar", m_swSkinPath);
+        a->WriteProfileString(L"background", L"toolbar", m_tbSkinPath);
+    }
+    void LoadSkinImages() {   // (re)loads the actual pictures from whatever paths are currently set
+        m_swSkinBmp.reset(); m_tbSkinBmp.reset();
+        if (!m_swSkinPath.IsEmpty()) {
+            auto bmp = std::make_unique<Gdiplus::Bitmap>(ResolveSkinPath(m_swSkinPath));
+            if (bmp->GetLastStatus() == Gdiplus::Ok) m_swSkinBmp = std::move(bmp);
+        }
+        if (!m_tbSkinPath.IsEmpty()) {
+            auto bmp = std::make_unique<Gdiplus::Bitmap>(ResolveSkinPath(m_tbSkinPath));
+            if (bmp->GetLastStatus() == Gdiplus::Ok) m_tbSkinBmp = std::move(bmp);
+        }
+        m_sw.skin = m_swSkinBmp.get();
+    }
+    CString PickSkinFile() {
+        CFileDialog fd(TRUE, L"png", nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+            L"Image Files (*.bmp;*.jpg;*.jpeg;*.png;*.gif)|*.bmp;*.jpg;*.jpeg;*.png;*.gif|All Files (*.*)|*.*||", this);
+        return fd.DoModal() == IDOK ? fd.GetPathName() : CString();
+    }
+    void SetSkin(bool toolbar, const CString& absPathOrEmpty) {   // empty = clear that skin back to plain color
+        CString stored = absPathOrEmpty.IsEmpty() ? CString() : RelativizeSkinPath(absPathOrEmpty);
+        (toolbar ? m_tbSkinPath : m_swSkinPath) = stored;
+        SaveSkinPaths(); LoadSkinImages();
+        if (toolbar) m_tb.Invalidate(); else m_sw.Invalidate();
+    }
     void LoadOpts() {
         CWinApp* a = AfxGetApp();
         m_defOpts.host = a->GetProfileString(L"Conn", L"Host", m_defOpts.host); m_defOpts.port = a->GetProfileInt(L"Conn", L"Port", m_defOpts.port);
@@ -1230,6 +1336,26 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnUpdateSwBottom(CCmdUI* u) { u->SetCheck(!m_swTop); }
     bool m_menuOpen = false;   // true while a TrackPopupMenu is showing; our timer must not touch layout/bars during that
     afx_msg void OnTimer(UINT_PTR) { if (m_menuOpen) return; RefreshBars(); CheckLayout(); }
+    afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
+        *pResult = 0;
+        CPoint pt; GetCursorPos(&pt);
+        CMenu m; m.CreatePopupMenu();
+        m.AppendMenu(MF_STRING, 1, L"Set Background Image...");
+        if (!m_tbSkinPath.IsEmpty()) m.AppendMenu(MF_STRING, 2, L"Clear Background Image");
+        SetForegroundWindow(); m_menuOpen = true;
+        int r = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
+        if (r == 1) { CString f = PickSkinFile(); if (!f.IsEmpty()) SetSkin(true, f); }
+        else if (r == 2) SetSkin(true, CString());
+    }
+    afx_msg void OnTbCustomDraw(NMHDR* pNMHDR, LRESULT* pResult) {
+        NMTBCUSTOMDRAW* cd = (NMTBCUSTOMDRAW*)pNMHDR;
+        if (cd->nmcd.dwDrawStage == CDDS_PREPAINT && m_tbSkinBmp) {
+            CRect r; m_tb.GetClientRect(r);
+            Gdiplus::Graphics g(cd->nmcd.hdc); g.DrawImage(m_tbSkinBmp.get(), 0, 0, r.Width(), r.Height());
+            *pResult = CDRF_NOTIFYITEMDRAW;   // let the toolbar still draw its (mostly transparent, flat-style) buttons on top
+        } else *pResult = CDRF_DODEFAULT;
+    }
     afx_msg void OnInitMenuPopup(CMenu* pMenu, UINT nIndex, BOOL bSysMenu) {
         // CFrameWnd's default handling here auto-disables any item whose command ID has no ON_COMMAND
         // handler in the message map — and it does this for ANY popup shown while we're the owner, not
@@ -1282,6 +1408,8 @@ public:
         LoadFont(); 
         LoadBookmarks(); 
         LoadFavs();
+		LoadSkinPaths();
+		LoadSkinImages();
         CMenu f, s, c, w, h;
         f.CreatePopupMenu(); 
         f.AppendMenu(MF_STRING, IDM_CONNECT, L"&Connect..."); 
@@ -1299,7 +1427,7 @@ public:
         w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); 
         w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
         h.CreatePopupMenu(); 
-        h.AppendMenu(MF_STRING, IDM_ABOUT, L"&About");
+        h.AppendMenu(MF_STRING, IDM_ABOUT, L"&About IRC...");
         m_menu.CreateMenu();
         m_menu.AppendMenu(MF_POPUP, (UINT_PTR)f.Detach(), L"&File");
         m_menu.AppendMenu(MF_STRING, IDM_SERVERS, L"&Servers");
@@ -1317,12 +1445,17 @@ public:
             CMenu m; m.CreatePopupMenu();
             m.AppendMenu(MF_STRING | (m_swTop ? MF_CHECKED : 0), 1, L"Switchbar at Top");
             m.AppendMenu(MF_STRING | (!m_swTop ? MF_CHECKED : 0), 2, L"Switchbar at Bottom");
+            m.AppendMenu(MF_SEPARATOR); m.AppendMenu(MF_STRING, 3, L"Set Background Image...");
+            if (!m_swSkinPath.IsEmpty()) m.AppendMenu(MF_STRING, 4, L"Clear Background Image");
             SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
             m_menuOpen = true;
             int r = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
             m_menuOpen = false;
             PostMessage(WM_NULL, 0, 0);   // MSDN-documented pairing for the above; without it the window can be left in a bad activation state
-            if (r == 1) SetSwPos(true); else if (r == 2) SetSwPos(false);
+            if (r == 1) SetSwPos(true);
+            else if (r == 2) SetSwPos(false);
+            else if (r == 3) { CString f = PickSkinFile(); if (!f.IsEmpty()) SetSkin(false, f); }
+            else if (r == 4) SetSkin(false, CString());
         };
         m_bar.onChan = [this](CString c) {   // clicking a channel name in the status bar's "Channels:" pane
             auto* a = static_cast<CChatWnd*>(MDIGetActive());
@@ -1392,18 +1525,22 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
 	ON_COMMAND(IDM_ABOUT, OnAbout)
     ON_WM_TIMER() 
     ON_WM_SIZE()
+	ON_NOTIFY(NM_RCLICK, AFX_IDW_TOOLBAR, OnTbRClick)
+	ON_NOTIFY(NM_CUSTOMDRAW, AFX_IDW_TOOLBAR, OnTbCustomDraw)
     ON_COMMAND(IDM_SWTOP, OnSwTop) 
     ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
     ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom) ON_WM_INITMENUPOPUP()
 END_MESSAGE_MAP()
 
 class CIRCClientApp : public CWinApp {
+    ULONG_PTR m_gdiplusToken = 0;
 public:
     BOOL InitInstance() override {
         CWinApp::InitInstance();
         
         AfxSocketInit(); 
         AfxInitRichEdit2();
+		Gdiplus::GdiplusStartupInput gdiInput; Gdiplus::GdiplusStartup(&m_gdiplusToken, &gdiInput, nullptr);
         wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         CString ini = exe; ini = ini.Left(ini.ReverseFind(L'\\') + 1) + L"IRC.ini";
         free((void*)m_pszProfileName); m_pszProfileName = _wcsdup(ini);
@@ -1414,5 +1551,9 @@ public:
         f->ShowWindow(SW_SHOW); f->UpdateWindow();
         f->Start();
         return TRUE;
+    }
+    int ExitInstance() override {
+        if (m_gdiplusToken) Gdiplus::GdiplusShutdown(m_gdiplusToken);
+        return CWinApp::ExitInstance();
     }
 } theApp;
