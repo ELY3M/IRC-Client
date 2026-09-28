@@ -1011,6 +1011,7 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<Bookmark> m_bookmarks;   // saved server list (servers.ini)
     std::vector<ChanFav> m_favs;         // saved channel favorites (channels.ini)
     CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
+    int m_tbIcon = 16;   // toolbar icon edge in pixels (24 with the resource strip, 16 for the drawn fallback)
     CString m_swSkinPath, m_tbSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp;
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
@@ -1672,13 +1673,13 @@ class CMainFrame : public CMDIFrameWnd {
     }
 
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
-        const int N = 6;
+        const int N = 7;
         CBitmap resBmp;
         bool haveRes = resBmp.LoadBitmap(102) != 0;   // id 102 in MiniIRC.rc ("toolbar.bmp"); absent in the plain one-file build
-        int W = haveRes ? 24 : 16, H = W;
+        int W = haveRes ? 24 : 16, H = W; m_tbIcon = W;
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0);
         if (haveRes) {
-            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help
+            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites
         } else {
             CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
             CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
@@ -1700,23 +1701,30 @@ class CMainFrame : public CMDIFrameWnd {
               mem.SetTextColor(RGB(10, 130, 140)); mem.SetBkMode(TRANSPARENT);
               mem.DrawText(L"?", 1, CRect(5 * W + 3, 2, 5 * W + 13, 13), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
               mem.SelectObject(op); mem.SelectObject(ob); }   // "?" = help glyph
+            { CBrush br(RGB(230, 160, 0)); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(140, 90, 0)); CPen* op = mem.SelectObject(&pn);
+              int cx = 6 * W + 8, cy = 8;   // 5-point star, outer radius ~6, inner ~2.5, centred in the 7th cell
+              static const int off[10][2] = { {0,-6},{1,-2},{6,-2},{2,1},{4,5},{0,3},{-4,5},{-2,1},{-6,-2},{-1,-2} };
+              CPoint pts[10]; for (int k = 0; k < 10; k++) pts[k] = CPoint(cx + off[k][0], cy + off[k][1]);
+              mem.Polygon(pts, 10);
+              mem.SelectObject(ob); mem.SelectObject(op); }   // star = favorites glyph
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
         m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        TBBUTTON b[10] = {};
+        TBBUTTON b[11] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
         b[3].iBitmap = 2; b[3].idCommand = IDM_SERVERS; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
-        b[4].fsStyle = TBSTYLE_SEP;
-        b[5].iBitmap = 3; b[5].idCommand = IDM_CASCADE; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;
-        b[6].iBitmap = 4; b[6].idCommand = IDM_TILE; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;
-        b[7].fsStyle = TBSTYLE_SEP;
-        b[8].iBitmap = 5; b[8].idCommand = IDM_ABOUT; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;
-        b[9].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(10, b);
+        b[4].iBitmap = 6; b[4].idCommand = IDM_CHANFAVS; b[4].fsState = TBSTATE_ENABLED; b[4].fsStyle = TBSTYLE_BUTTON;   // channel favorites
+        b[5].fsStyle = TBSTYLE_SEP;
+        b[6].iBitmap = 3; b[6].idCommand = IDM_CASCADE; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;
+        b[7].iBitmap = 4; b[7].idCommand = IDM_TILE; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;
+        b[8].fsStyle = TBSTYLE_SEP;
+        b[9].iBitmap = 5; b[9].idCommand = IDM_ABOUT; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;
+        b[10].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(11, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
@@ -1764,11 +1772,27 @@ class CMainFrame : public CMDIFrameWnd {
     }
     afx_msg void OnTbCustomDraw(NMHDR* pNMHDR, LRESULT* pResult) {
         NMTBCUSTOMDRAW* cd = (NMTBCUSTOMDRAW*)pNMHDR;
-        if (cd->nmcd.dwDrawStage == CDDS_PREPAINT && m_tbSkinBmp) {
+        *pResult = CDRF_DODEFAULT;
+        if (!m_tbSkinBmp) return;   // no skin set: the toolbar draws itself exactly as it always did
+        if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) {
             CRect r; m_tb.GetClientRect(r);
             Gdiplus::Graphics g(cd->nmcd.hdc); g.DrawImage(m_tbSkinBmp.get(), 0, 0, r.Width(), r.Height());
-            *pResult = CDRF_NOTIFYITEMDRAW;   // let the toolbar still draw its (mostly transparent, flat-style) buttons on top
-        } else *pResult = CDRF_DODEFAULT;
+            *pResult = CDRF_NOTIFYITEMDRAW;
+        } else if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+            // The toolbar's own button drawing fills every button with the system button-face color (a near-white
+            // on Windows 10/11), which shows up as white boxes around each icon on top of the skin. So with a skin
+            // active, draw the buttons ourselves: just the icon (masked), plus a hot/pressed frame.
+            TBBUTTONINFO bi = {}; bi.cbSize = sizeof bi; bi.dwMask = TBIF_IMAGE;
+            if (m_tb.GetToolBarCtrl().GetButtonInfo((int)cd->nmcd.dwItemSpec, &bi) < 0) return;   // separator: leave it to the default
+            CDC* dc = CDC::FromHandle(cd->nmcd.hdc);
+            CRect r = cd->nmcd.rc;
+            bool down = (cd->nmcd.uItemState & (CDIS_SELECTED | CDIS_CHECKED)) != 0, hot = (cd->nmcd.uItemState & CDIS_HOT) != 0;
+            if (down) dc->Draw3dRect(r, ::GetSysColor(COLOR_BTNSHADOW), ::GetSysColor(COLOR_BTNHIGHLIGHT));
+            else if (hot) dc->Draw3dRect(r, ::GetSysColor(COLOR_BTNHIGHLIGHT), ::GetSysColor(COLOR_BTNSHADOW));
+            CPoint p(r.left + (r.Width() - m_tbIcon) / 2 + (down ? 1 : 0), r.top + (r.Height() - m_tbIcon) / 2 + (down ? 1 : 0));
+            m_tbImg.Draw(dc, bi.iImage, p, ILD_TRANSPARENT);
+            *pResult = CDRF_SKIPDEFAULT;
+        }
     }
     afx_msg void OnInitMenuPopup(CMenu* pMenu, UINT nIndex, BOOL bSysMenu) {
         // CFrameWnd's default handling here auto-disables any item whose command ID has no ON_COMMAND
