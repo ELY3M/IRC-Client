@@ -26,6 +26,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <functional>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #define SECURITY_WIN32
 #include <sspi.h>
 #include <schannel.h>
@@ -1005,6 +1006,94 @@ BEGIN_MESSAGE_MAP(CListWnd, CMDIChildWnd)
     ON_NOTIFY(NM_CUSTOMDRAW, 1, OnCustomDraw)
 END_MESSAGE_MAP()
 
+// ---------------- Variables: numbers, single-operation math, $calc, wildcard matching ----------------
+static bool ScanNum(const wchar_t*& p, double& v) {   // digits[.digits] only: no sign, exponent, hex, inf or nan
+    const wchar_t* st = p; bool any = false;
+    while (iswdigit(*p)) { p++; any = true; }
+    if (*p == L'.') { p++; while (iswdigit(*p)) { p++; any = true; } }
+    if (!any) return false;
+    CString t(st, (int)(p - st)); v = wcstod(t, nullptr);
+    return true;
+}
+static bool ParseNum(const CString& in, double& out) {
+    CString t = in; t.Trim(); const wchar_t* p = t; bool neg = false;
+    if (*p == L'-') { neg = true; p++; } else if (*p == L'+') p++;
+    if (!ScanNum(p, out) || *p != 0) return false;
+    if (neg) out = -out;
+    return true;
+}
+static CString FmtNum(double v) {   // whole numbers plain, otherwise up to 5 decimals with trailing zeros dropped
+    if (v != v || v > 1e300 || v < -1e300) return CString();
+    CString s;
+    if (v == floor(v) && fabs(v) < 1e15) s.Format(L"%.0f", v == 0 ? 0.0 : v);
+    else { s.Format(L"%.5f", v); s.TrimRight(L'0'); s.TrimRight(L'.'); }
+    return s;
+}
+// Exactly "number op number" with op one of + - * / % ^  ->  1 and the result in out; 0 = not such an expression;
+// -1 = division by zero.
+static int TryMath(const CString& in, CString& out) {
+    std::vector<CString> t; int pos = 0;
+    for (CString tok = in.Tokenize(L" ", pos); !tok.IsEmpty(); tok = in.Tokenize(L" ", pos)) t.push_back(tok);
+    if (t.size() != 3 || t[1].GetLength() != 1 || !wcschr(L"+-*/%^", t[1][0])) return 0;
+    double x, y; if (!ParseNum(t[0], x) || !ParseNum(t[2], y)) return 0;
+    double r = 0;
+    switch (t[1][0]) {
+    case L'+': r = x + y; break;
+    case L'-': r = x - y; break;
+    case L'*': r = x * y; break;
+    case L'/': if (y == 0) return -1; r = x / y; break;
+    case L'%': if (y == 0) return -1; r = fmod(x, y); break;
+    case L'^': r = pow(x, y); break;
+    }
+    out = FmtNum(r);
+    return 1;
+}
+struct CalcParser {   // $calc(): + - * / % ^ , unary minus and parentheses, with the usual precedence
+    const wchar_t* p = nullptr; bool ok = true;
+    void ws() { while (*p == L' ') p++; }
+    double expr() { double v = term(); for (;;) { ws(); if (*p == L'+') { p++; v += term(); } else if (*p == L'-') { p++; v -= term(); } else return v; } }
+    double term() {
+        double v = unary();
+        for (;;) {
+            ws();
+            if (*p == L'*') { p++; v *= unary(); }
+            else if (*p == L'/') { p++; double q = unary(); if (q == 0) ok = false; else v /= q; }
+            else if (*p == L'%') { p++; double q = unary(); if (q == 0) ok = false; else v = fmod(v, q); }
+            else return v;
+        }
+    }
+    double unary() { ws(); if (*p == L'-') { p++; return -unary(); } if (*p == L'+') { p++; return unary(); } return power(); }
+    double power() { double b = primary(); ws(); if (*p == L'^') { p++; double e = unary(); return pow(b, e); } return b; }
+    double primary() {
+        ws();
+        if (*p == L'(') { p++; double v = expr(); ws(); if (*p == L')') p++; else ok = false; return v; }
+        double v = 0; if (!ScanNum(p, v)) { ok = false; return 0; }
+        return v;
+    }
+};
+static bool CalcExpr(const CString& s, double& out) {
+    CString t = s; CalcParser cp; cp.p = t; out = cp.expr(); cp.ws();
+    return cp.ok && *cp.p == 0;
+}
+static bool GlobMatch(const wchar_t* pat, const wchar_t* s) {   // * and ?, case-insensitive
+    const wchar_t* star = nullptr; const wchar_t* ss = s;
+    while (*s) {
+        if (*pat == L'*') { star = pat++; ss = s; }
+        else if (*pat == L'?' || towlower(*pat) == towlower(*s)) { pat++; s++; }
+        else if (star) { pat = star + 1; s = ++ss; }
+        else return false;
+    }
+    while (*pat == L'*') pat++;
+    return *pat == 0;
+}
+struct VarEntry {
+    CString name, value;            // name keeps the case it was first set with
+    ULONGLONG expire = 0, nextStep = 0;   // -uN deadline / next once-a-second step (GetTickCount64 ms), 0 = none
+    double step = 0; bool zeroUnset = false, noSave = false;   // -c/-z stepping; -z drops it at zero; -e keeps it out of vars.ini
+};
+typedef std::map<CString, VarEntry> VarMap;   // key: lowercase name including the leading '%'
+struct VarScope { VarMap locals; std::vector<CString> unsetAtEnd; };   // one per script run
+
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
@@ -1017,6 +1106,7 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
     std::map<CString, CString> m_alias; int m_aliasDepth = 0;   // /alias definitions (lowercase name -> command line), saved in the [aliases] ini section
+    VarMap m_vars; std::vector<VarScope> m_scopes; bool m_varsDirty = false;   // global variables (vars.ini) and the stack of per-script local scopes
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
     static CString Key(Net* net, CString s) { s.MakeLower(); CString k; k.Format(L"%d:", net ? net->id : 0); return k + s; }
@@ -1226,6 +1316,10 @@ class CMainFrame : public CMDIFrameWnd {
         Net* net = w ? w->net : nullptr;
         CTime now = CTime::GetCurrentTime();
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
+        if (name == L"null") { val.Empty(); return true; }
+        if (name == L"true") { val = L"1"; return true; }
+        if (name == L"false") { val = L"0"; return true; }
+        if (name == L"ticks") { val.Format(L"%I64u", (unsigned __int64)GetTickCount64()); return true; }
         if (name == L"chan") { val = (w && w->m_chan) ? w->m_name : CString(); return true; }
         if (name == L"network") { val = net ? net->network : CString(); return true; }
         if (name == L"os") { val = OsName(); return true; }
@@ -1242,8 +1336,233 @@ class CMainFrame : public CMDIFrameWnd {
         }
         return false;
     }
+    // ---- variables ----
+    static CString VKey(CString s) { s.MakeLower(); return s; }
+    struct VarSw { bool g = false, l = false, n = false, e = false, i = false, k = false, p = false, z = false, c = false; long u = -1; };
+    struct ScopeGuard {   // one variable scope per script run, so /var locals vanish when it ends
+        CMainFrame* f; bool on;
+        ScopeGuard(CMainFrame* p, bool push) : f(p), on(push) { if (on) f->m_scopes.emplace_back(); }
+        ~ScopeGuard() { if (on) f->PopScope(); }
+    };
+    void PopScope() {
+        VarScope sc = std::move(m_scopes.back()); m_scopes.pop_back();
+        for (auto& k : sc.unsetAtEnd) if (m_vars.erase(k)) m_varsDirty = true;   // /set -u0 globals go away when the script ends
+        FlushVars();
+    }
+    void FlushVars() { if (m_varsDirty) { m_varsDirty = false; SaveVars(); } }
+    void LoadVars() {   // vars.ini:  [variables]  n0=%name value
+        m_vars.clear();
+        CString path = IniPath(L"vars.ini");
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(L"variables", buf.data(), (DWORD)buf.size(), path);
+        if (!n) return;
+        for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+            CString line = p; int eq = line.Find(L'=');
+            if (eq <= 0) continue;
+            CString v = line.Mid(eq + 1); int sp = v.Find(L' ');
+            CString name = sp < 0 ? v : v.Left(sp), val = sp < 0 ? CString() : v.Mid(sp + 1);
+            if (name.Left(1) != L"%") continue;
+            VarEntry e; e.name = name; e.value = val; m_vars[VKey(name)] = e;
+        }
+    }
+    void SaveVars() {
+        CString path = IniPath(L"vars.ini");
+        WritePrivateProfileStringW(L"variables", nullptr, nullptr, path);   // drop the section, then rewrite it in order
+        int i = 0;
+        for (auto& kv : m_vars) {
+            if (kv.second.noSave) continue;   // -e: lives only until the program exits
+            CString key; key.Format(L"n%d", i++);
+            WritePrivateProfileStringW(L"variables", key, kv.second.name + L" " + kv.second.value, path);
+        }
+    }
+    VarEntry* FindVar(const CString& name, bool loc = true, bool glob = true) {
+        CString k = VKey(name);
+        if (loc && !m_scopes.empty()) { auto it = m_scopes.back().locals.find(k); if (it != m_scopes.back().locals.end()) return &it->second; }
+        if (glob) { auto it = m_vars.find(k); if (it != m_vars.end()) return &it->second; }
+        return nullptr;
+    }
+    CString GetVar(const CString& name) { VarEntry* v = FindVar(name); return v ? v->value : CString(); }   // a variable that isn't set is $null (empty)
+    void TickVars() {   // off the frame timer: -uN expiry, and the once-a-second stepping of -c / -z
+        if (m_vars.empty()) return;
+        ULONGLONG now = GetTickCount64(); bool changed = false;
+        for (auto it = m_vars.begin(); it != m_vars.end();) {
+            VarEntry& e = it->second; bool gone = false;
+            if (e.step != 0) {
+                for (int guard = 0; now >= e.nextStep && guard < 3600; guard++) {
+                    double cur = 0; ParseNum(e.value, cur); cur += e.step; e.value = FmtNum(cur); e.nextStep += 1000;
+                    if (e.zeroUnset && cur <= 0) { gone = true; break; }
+                }
+            }
+            if (!gone && e.expire && now >= e.expire) gone = true;
+            if (gone) { it = m_vars.erase(it); changed = true; } else ++it;
+        }
+        if (changed) SaveVars();
+    }
+    // Creates or updates a variable. forceLocal (/var) goes into the current script scope; otherwise it updates a same-named
+    // local if there is one, else the global. -g forces global, -l forces local.
+    VarEntry* StoreVar(const CString& name, const CString& value, const VarSw& sw, bool forceLocal) {
+        CString k = VKey(name);
+        VarMap* target = &m_vars; bool isLocal = false;
+        if (!m_scopes.empty()) {
+            if (forceLocal || sw.l) { target = &m_scopes.back().locals; isLocal = true; }
+            else if (!sw.g && m_scopes.back().locals.count(k)) { target = &m_scopes.back().locals; isLocal = true; }
+        }
+        auto it = target->find(k); bool existed = it != target->end();
+        if (existed && sw.i) return &it->second;   // -i: only initialise when it doesn't exist yet
+        VarEntry& e = (*target)[k];
+        if (!existed) e.name = name;
+        else if (!sw.k) { e.expire = 0; e.step = 0; e.zeroUnset = false; }   // setting it again cancels a pending -uN / countdown, unless -k
+        e.value = value;
+        if (sw.e) e.noSave = true; else if (!sw.k) e.noSave = false;
+        ULONGLONG now = GetTickCount64();
+        if (sw.u > 0) e.expire = now + (ULONGLONG)sw.u * 1000ULL;
+        else if (sw.u == 0 && !isLocal && !m_scopes.empty()) m_scopes.back().unsetAtEnd.push_back(k);   // -u0: when the script finishes
+        if (sw.z) { e.step = -1; e.zeroUnset = true; e.nextStep = now + 1000; }
+        if (!isLocal) m_varsDirty = true;
+        return &e;
+    }
+    int UnsetMatching(const CString& pat, bool g, bool l) {   // an exact %name or a wildcard pattern; returns how many were removed
+        int n = 0; bool wild = pat.FindOneOf(L"*?") >= 0; CString pk = VKey(pat);
+        auto sweep = [&](VarMap& m, bool isGlobal) {
+            for (auto it = m.begin(); it != m.end();) {
+                if (wild ? GlobMatch(pk, it->first) : it->first == pk) { it = m.erase(it); n++; if (isGlobal) m_varsDirty = true; }
+                else ++it;
+            }
+        };
+        if (l && !m_scopes.empty()) sweep(m_scopes.back().locals, false);
+        if (g) sweep(m_vars, true);
+        return n;
+    }
+    // Leading "-xyz" switch tokens; 'allowed' lists the letters this command accepts. Returns false (after reporting) on a bad one.
+    bool ParseVarSw(CChatWnd* w, const CString& cmd, CString& a, VarSw& sw, const wchar_t* allowed) {
+        for (;;) {
+            CString t = a; t.TrimLeft();
+            if (t.Left(1) != L"-" || t.GetLength() < 2) break;
+            CString tok = Word(a);
+            for (int i = 1; i < tok.GetLength(); i++) {
+                wchar_t c = (wchar_t)towlower(tok[i]);
+                if (!wcschr(allowed, c)) { Show(w, L"* /" + cmd + L": unknown switch -" + CString(c), cPart); return false; }
+                switch (c) {
+                case L'g': sw.g = true; break;
+                case L'l': sw.l = true; break;
+                case L'n': sw.n = true; break;
+                case L'e': sw.e = true; break;
+                case L'i': sw.i = true; break;
+                case L'k': sw.k = true; break;
+                case L'p': sw.p = true; break;
+                case L'z': sw.z = true; break;
+                case L'c': sw.c = true; break;
+                case L'u': { long v = 0; bool any = false; while (i + 1 < tok.GetLength() && iswdigit(tok[i + 1]) && v < 100000000) { v = v * 10 + (tok[++i] - L'0'); any = true; } sw.u = any ? v : 0; break; }
+                default: break;   // -s is accepted and ignored
+                }
+            }
+        }
+        return true;
+    }
+    // The value given to /set, /var and "%x = ...": trimmed (unless -p), and a single "5 + 1" style operation is worked out (unless -n).
+    bool FinalValue(CChatWnd* w, const CString& cmd, CString v, const VarSw& sw, CString& out) {
+        if (!sw.p) v.Trim();
+        out = v;
+        if (!sw.n) {
+            CString r; int m = TryMath(v, r);
+            if (m < 0) { Show(w, L"* /" + cmd + L": division by zero", cPart); return false; }
+            if (m > 0) out = r;
+        }
+        return true;
+    }
+    void ListVars(CChatWnd* w) {
+        if (m_vars.empty()) { Show(w, L"* No variables set. Usage: /set %name value", cInfo); return; }
+        for (auto& kv : m_vars) Show(w, L"* " + kv.second.name + L" = " + kv.second.value, cInfo);
+    }
+    void CmdSet(CChatWnd* w, CString arg) {
+        VarSw sw; if (!ParseVarSw(w, L"set", arg, sw, L"snzeglkipu")) return;
+        CString name = Word(arg);
+        if (name.IsEmpty()) { ListVars(w); return; }
+        if (name[0] != L'%') { Show(w, L"* /set: variable names start with %  (e.g. /set %test 1)", cPart); return; }
+        CString v; if (!FinalValue(w, L"set", arg, sw, v)) return;
+        StoreVar(name, v, sw, false); FlushVars();
+    }
+    void CmdVar(CChatWnd* w, CString arg) {   // /var %x = hello, %y, %z = $me   (local to this script run)
+        VarSw sw; if (!ParseVarSw(w, L"var", arg, sw, L"snzeglkipu")) return;
+        int pos = 0;
+        for (CString item = arg.Tokenize(L",", pos); !item.IsEmpty(); item = arg.Tokenize(L",", pos)) {
+            item.Trim(); if (item.IsEmpty()) continue;
+            int k = 0; while (k < item.GetLength() && item[k] != L' ' && item[k] != L'=') k++;
+            CString name = item.Left(k), tail = item.Mid(k), val; tail.TrimLeft();
+            if (name.Left(1) != L"%") { Show(w, L"* /var: variable names start with %", cPart); return; }
+            if (tail.Left(1) == L"=") { if (!FinalValue(w, L"var", tail.Mid(1), sw, val)) return; }
+            StoreVar(name, val, sw, true);
+        }
+        FlushVars();
+    }
+    void CmdUnset(CChatWnd* w, CString arg) {
+        VarSw sw; if (!ParseVarSw(w, L"unset", arg, sw, L"sgl")) return;
+        bool g = sw.g || !sw.l, l = sw.l || !sw.g;   // neither switch: both scopes; -g: global only; -l: local only
+        int pos = 0;
+        for (CString n = arg.Tokenize(L" ", pos); !n.IsEmpty(); n = arg.Tokenize(L" ", pos)) UnsetMatching(n, g, l);
+        FlushVars();
+    }
+    void CmdIncDec(CChatWnd* w, const CString& cmd, CString arg, int sign) {
+        VarSw sw; if (!ParseVarSw(w, cmd, arg, sw, L"cszeu")) return;
+        CString name = Word(arg);
+        if (name.Left(1) != L"%") { Show(w, L"* /" + cmd + L": expected a %variable", cPart); return; }
+        double amt = 1; arg.Trim();
+        if (!arg.IsEmpty() && !ParseNum(arg, amt)) { Show(w, L"* /" + cmd + L": the amount must be a number", cPart); return; }
+        double cur = 0; if (VarEntry* ex = FindVar(name)) ParseNum(ex->value, cur);
+        VarSw st = sw; st.k = true;   // an existing -uN timer keeps running through /inc and /dec unless a new -uN replaces it
+        VarEntry* e = StoreVar(name, FmtNum(cur + sign * amt), st, false);
+        if (e && sw.c) { e->step = sign * amt; e->nextStep = GetTickCount64() + 1000; }   // -c: keep stepping once a second
+        FlushVars();
+    }
+    void CmdAssign(CChatWnd* w, const CString& name, CString arg) {   // "%x = 5 + 1"  (arg starts at the '=')
+        arg.TrimLeft();
+        if (arg.Left(1) != L"=") { Show(w, L"* Expected:  " + name + L" = value", cPart); return; }
+        VarSw sw; CString v; if (!FinalValue(w, L"set", arg.Mid(1), sw, v)) return;
+        StoreVar(name, v, sw, false); FlushVars();
+    }
+
+    // ---- $functions(...) : $calc $round $int $chr $var ----
+    // Returns false if 'name' isn't one (or its arguments are unusable), so the text is left exactly as typed.
+    bool FuncValue(CChatWnd* w, const CString& name, const CString& rawArgs, const CString& prop, const CString& params, CString& val) {
+        if (name == L"calc") { double r; if (!CalcExpr(EvalIds(w, rawArgs, params), r)) return false; val = FmtNum(r); return true; }
+        if (name == L"int") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false; val = FmtNum(x < 0 ? ceil(x) : floor(x)); return true; }
+        if (name == L"round") {
+            CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L','); double x = 0, dg = 0;
+            if (c < 0) { if (!ParseNum(a, x)) return false; }
+            else if (!ParseNum(a.Left(c), x) || !ParseNum(a.Mid(c + 1), dg)) return false;
+            int ddig = (int)dg; if (ddig < 0) ddig = 0; if (ddig > 5) ddig = 5;   // 5 decimals is the limit
+            double pw = pow(10.0, ddig);
+            val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
+        }
+        if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
+        if (name == L"var") {   // $var(%pattern,N)  N=0 -> how many match;  .value  .local  .secs
+            int c = rawArgs.ReverseFind(L',');
+            CString pat = c < 0 ? rawArgs : rawArgs.Left(c); pat.Trim();
+            double nn = 1; if (c >= 0 && !ParseNum(EvalIds(w, rawArgs.Mid(c + 1), params), nn)) return false;
+            CString pk = VKey(pat); bool wild = pk.FindOneOf(L"*?") >= 0;
+            std::vector<std::pair<VarEntry*, bool>> hits;
+            if (!m_scopes.empty()) for (auto& kv : m_scopes.back().locals) if (wild ? GlobMatch(pk, kv.first) : kv.first == pk) hits.push_back({ &kv.second, true });
+            for (auto& kv : m_vars) {
+                if (!(wild ? GlobMatch(pk, kv.first) : kv.first == pk)) continue;
+                if (!m_scopes.empty() && m_scopes.back().locals.count(kv.first)) continue;   // shadowed by a local of the same name
+                hits.push_back({ &kv.second, false });
+            }
+            int idx = (int)nn;
+            if (idx == 0) { val.Format(L"%d", (int)hits.size()); return true; }
+            if (idx < 1 || idx > (int)hits.size()) { val.Empty(); return true; }
+            VarEntry* e = hits[idx - 1].first; bool loc = hits[idx - 1].second;
+            if (prop == L"value") val = e->value;
+            else if (prop == L"local") val = loc ? L"1" : L"0";
+            else if (prop == L"secs") { ULONGLONG now = GetTickCount64(); val.Format(L"%I64u", e->expire > now ? (e->expire - now) / 1000 : 0ULL); }
+            else val = e->name;
+            return true;
+        }
+        return false;
+    }
+
     // 'params' is the "$1-" line: empty for a hand-typed //command, the alias arguments when an alias runs.
-    CString EvalIds(CChatWnd* w, const CString& in, const CString& params) {
+    // Replaces $identifiers, $func(...), $N/$N-/$N-M/$0 and (unless evalVars is false) %variables.
+    CString EvalIds(CChatWnd* w, const CString& in, const CString& params, bool evalVars = true) {
         std::vector<int> ts, te;   // start/end offsets of each space-delimited token of params
         int pn = params.GetLength();
         for (int i = 0; i < pn;) {
@@ -1261,6 +1580,10 @@ class CMainFrame : public CMDIFrameWnd {
         CString out; int L = in.GetLength();
         for (int i = 0; i < L; i++) {
             wchar_t c = in[i];
+            if (c == L'%' && evalVars && i + 1 < L && (iswalnum(in[i + 1]) || in[i + 1] == L'_')) {   // %variable (an unset one is empty)
+                int k = i + 1; while (k < L && (iswalnum(in[k]) || in[k] == L'_')) k++;
+                out += GetVar(in.Mid(i, k - i)); i = k - 1; continue;
+            }
             if (c != L'$' || i + 1 >= L) { out += c; continue; }
             int j = i + 1;
             if (iswdigit(in[j])) {   // $0  $N  $N-  $N-M
@@ -1274,14 +1597,69 @@ class CMainFrame : public CMDIFrameWnd {
                 else out += slice(a, a);
                 i = j - 1; continue;
             }
-            if (iswalpha(in[j])) {   // named identifier; matching is case-insensitive ($ME == $me)
+            if (iswalpha(in[j])) {   // named identifier or function; matching is case-insensitive ($ME == $me)
                 int k = j; while (k < L && iswalnum(in[k])) k++;
                 CString name = in.Mid(j, k - j); name.MakeLower();
+                if (k < L && in[k] == L'(') {   // $func(args)  and, for $var, an optional .property
+                    int depth = 0, m = k;
+                    for (; m < L; m++) { if (in[m] == L'(') depth++; else if (in[m] == L')' && --depth == 0) break; }
+                    if (m < L) {
+                        CString args = in.Mid(k + 1, m - k - 1), prop; int end = m + 1;
+                        if (name == L"var" && end + 1 < L && in[end] == L'.' && iswalpha(in[end + 1])) {
+                            int pe = end + 1; while (pe < L && iswalnum(in[pe])) pe++;
+                            prop = in.Mid(end + 1, pe - end - 1); prop.MakeLower(); end = pe;
+                        }
+                        CString fv;
+                        if (FuncValue(w, name, args, prop, params, fv)) { out += fv; i = end - 1; continue; }
+                    }
+                }
                 CString val;
                 if (IdentValue(w, name, val)) { out += val; i = k - 1; continue; }
             }
             out += c;   // unknown identifier or a lone '$': left exactly as typed, so typos are visible
         }
+        return out;
+    }
+    // Like EvalIds, but for a whole command line: the operands that are variable NAMES (of /set /inc /dec /unset /var and of
+    // "%x = ...") stay literal, because evaluating them would swap the name for its current value.
+    CString EvalCmdLine(CChatWnd* w, const CString& line, const CString& params) {
+        CString rest = line, cmd = Word(rest), lc = cmd; lc.MakeLower();
+        auto switches = [&](CString& head) {
+            for (;;) { CString t = rest; t.TrimLeft(); if (t.Left(1) != L"-" || t.GetLength() < 2) break; head += L" " + Word(rest); }
+        };
+        if (lc == L"set" || lc == L"inc" || lc == L"dec") {
+            CString head = cmd; switches(head);
+            CString name = Word(rest);
+            return head + (name.IsEmpty() ? CString() : L" " + name) + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params));
+        }
+        if (lc == L"unset") return cmd + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params, false));
+        if (lc == L"var") {
+            CString res = cmd; switches(res);
+            bool first = true; int pos = 0;
+            for (CString item = rest.Tokenize(L",", pos); !item.IsEmpty(); item = rest.Tokenize(L",", pos)) {
+                item.TrimLeft();
+                int k = 0; while (k < item.GetLength() && item[k] != L' ' && item[k] != L'=') k++;
+                res += (first ? L" " : L", ") + item.Left(k) + EvalIds(w, item.Mid(k), params);
+                first = false;
+            }
+            return res;
+        }
+        if (!lc.IsEmpty() && lc[0] == L'%') {   // "%x = 5 + 1": the name stays as typed, the value is evaluated
+            int eq = cmd.Find(L'=');
+            CString name = eq > 0 ? cmd.Left(eq) : cmd;
+            CString tail = eq > 0 ? cmd.Mid(eq) + (rest.IsEmpty() ? CString() : L" " + rest) : rest;
+            return name + (tail.IsEmpty() ? CString() : L" " + EvalIds(w, tail, params));
+        }
+        return EvalIds(w, line, params);
+    }
+    static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> commands; a '|' inside parentheses is left alone
+        std::vector<CString> out; CString cur; int depth = 0;
+        for (int i = 0; i < s.GetLength(); i++) {
+            wchar_t c = s[i];
+            if (c == L'(') depth++; else if (c == L')' && depth > 0) depth--;
+            if (c == L'|' && depth == 0) { out.push_back(cur); cur.Empty(); } else cur += c;
+        }
+        out.push_back(cur);
         return out;
     }
     void LoadAliases() {
@@ -1301,26 +1679,41 @@ class CMainFrame : public CMDIFrameWnd {
     }
 
     // ---- user input ----
-    void OnInput(CChatWnd* w, CString s, const CString* aliasParams = nullptr) {
+    void OnInput(CChatWnd* w, CString s, const CString* aliasParams = nullptr, bool sameScope = false) {
         Net* net = w->net;
+        ScopeGuard scope(this, !sameScope);                      // one variable scope per script run; /var locals vanish with it
         bool eval = aliasParams != nullptr;                      // an alias body always evaluates identifiers
         if (s.Left(2) == L"//") { eval = true; s = s.Mid(1); }   // "//echo $me": run the command with $identifiers evaluated (mIRC style)
-        if (eval && s.Left(1) == L"/") s = L"/" + EvalIds(w, s.Mid(1), aliasParams ? *aliasParams : CString());
+        CString noParams; const CString& params = aliasParams ? *aliasParams : noParams;
+        if (eval && !sameScope && s.Left(1) == L"/") {           // script line "cmd1 | cmd2": run in order, each evaluated just before it runs
+            std::vector<CString> parts = SplitPipes(s.Mid(1));
+            if (parts.size() > 1) {
+                for (auto& part : parts) { CString c = part; c.Trim(); if (!c.IsEmpty()) OnInput(w, L"/" + c, &params, true); }
+                return;
+            }
+        }
+        if (eval && s.Left(1) == L"/") s = L"/" + EvalCmdLine(w, s.Mid(1), params);
         if (s.IsEmpty()) return;
         if (s[0] != L'/') {
             if (w->m_name == L"*status*") Note(net, L"You're not in a channel or query.", cPart);
             else Say(net, w->m_name, s);
             return;
         }
-        CString arg = s.Mid(1), cmd = Word(arg); cmd.MakeLower();
+        CString arg = s.Mid(1), cmdRaw = Word(arg), cmd = cmdRaw; cmd.MakeLower();
         if (cmd.IsEmpty()) return;
+        if (cmd[0] == L'%') {   // "%x = value" (also "%x=value"): assignment
+            int eq = cmdRaw.Find(L'=');
+            if (eq > 0) { arg = cmdRaw.Mid(eq) + (arg.IsEmpty() ? CString() : L" " + arg); cmdRaw = cmdRaw.Left(eq); }
+            CmdAssign(w, cmdRaw, arg);
+            return;
+        }
         bool inChat = w->m_name != L"*status*";
         auto al = m_alias.find(cmd);
         if (al != m_alias.end()) {                               // user alias: run its body with the typed arguments as $1-
             if (m_aliasDepth >= 8) { Show(w, L"* Alias recursion limit reached (/" + cmd + L")", cPart); return; }
-            CString body = al->second, params = arg; body.Trim();
+            CString body = al->second, aliasArgs = arg; body.Trim();
             if (body.Left(1) == L"/") body = body.Mid(1);
-            m_aliasDepth++; OnInput(w, L"/" + body, &params); m_aliasDepth--;
+            m_aliasDepth++; OnInput(w, L"/" + body, &aliasArgs); m_aliasDepth--;
             return;
         }
         if (cmd == L"server" || cmd == L"connect") {
@@ -1389,6 +1782,12 @@ class CMainFrame : public CMDIFrameWnd {
                 Show(w, L"* Alias /" + name + L" defined", cInfo);
             }
         }
+        else if (cmd == L"set") CmdSet(w, arg);
+        else if (cmd == L"unset") CmdUnset(w, arg);
+        else if (cmd == L"unsetall") { m_vars.clear(); m_varsDirty = true; if (!m_scopes.empty()) m_scopes.back().locals.clear(); FlushVars(); }
+        else if (cmd == L"var") CmdVar(w, arg);
+        else if (cmd == L"inc") CmdIncDec(w, cmd, arg, 1);
+        else if (cmd == L"dec") CmdIncDec(w, cmd, arg, -1);
         else if (cmd == L"unalias") {
             CString name = Word(arg); name.MakeLower();
             if (m_alias.erase(name)) { SaveAliases(); Show(w, L"* Alias /" + name + L" removed", cInfo); }
@@ -1396,7 +1795,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /ctcp /quit /clear /echo /say /alias /unalias /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -1757,7 +2156,7 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnUpdateSwTop(CCmdUI* u) { u->SetCheck(m_swTop); }
     afx_msg void OnUpdateSwBottom(CCmdUI* u) { u->SetCheck(!m_swTop); }
     bool m_menuOpen = false;   // true while a TrackPopupMenu is showing; our timer must not touch layout/bars during that
-    afx_msg void OnTimer(UINT_PTR) { if (m_menuOpen) return; RefreshBars(); CheckLayout(); }
+    afx_msg void OnTimer(UINT_PTR) { if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
         *pResult = 0;
         CPoint pt; GetCursorPos(&pt);
@@ -1851,6 +2250,7 @@ public:
         LoadBookmarks(); 
         LoadFavs();
 		LoadAliases();
+		LoadVars();
 		LoadSkinPaths();
 		LoadSkinImages();
         CMenu f, s, c, w, h;
