@@ -16,7 +16,9 @@ sadly, this is windows only irc client.
 # TO DO    
 ~~multi server~~
 change background of mdi windows like I did with toolbar and switchbar   
-alias support  
+~~aliases system~~  
+~~variables system~~
+script editor to let you to edit aliases/vars/scripts 
 scripting 
 DCC chat/file send/server    
 address book  

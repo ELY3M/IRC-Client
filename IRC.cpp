@@ -231,7 +231,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -1075,11 +1075,11 @@ static bool CalcExpr(const CString& s, double& out) {
     CString t = s; CalcParser cp; cp.p = t; out = cp.expr(); cp.ws();
     return cp.ok && *cp.p == 0;
 }
-static bool GlobMatch(const wchar_t* pat, const wchar_t* s) {   // * and ?, case-insensitive
+static bool GlobMatch(const wchar_t* pat, const wchar_t* s, bool cs = false) {   // * and ?; case-insensitive unless cs
     const wchar_t* star = nullptr; const wchar_t* ss = s;
     while (*s) {
         if (*pat == L'*') { star = pat++; ss = s; }
-        else if (*pat == L'?' || towlower(*pat) == towlower(*s)) { pat++; s++; }
+        else if (*pat == L'?' || (cs ? *pat == *s : towlower(*pat) == towlower(*s))) { pat++; s++; }
         else if (star) { pat = star + 1; s = ++ss; }
         else return false;
     }
@@ -1094,6 +1094,174 @@ struct VarEntry {
 typedef std::map<CString, VarEntry> VarMap;   // key: lowercase name including the leading '%'
 struct VarScope { VarMap locals; std::vector<CString> unsetAtEnd; };   // one per script run
 
+// ---------------- Aliases and scripts: file format, block parsing, syntax tree ----------------
+struct AliasDef { CString name; std::vector<CString> lines; };   // one alias: its name and the lines of its body
+struct SNode { int kind = 0; CString text; std::vector<SNode> a, b; };   // 0 command, 1 if (text = condition, a = then, b = else), 2 while, 3 label
+
+static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> commands; a '|' inside parentheses is left alone
+    std::vector<CString> out; CString cur; int depth = 0;
+    for (int i = 0; i < s.GetLength(); i++) {
+        wchar_t c = s[i];
+        if (c == L'(') depth++; else if (c == L')' && depth > 0) depth--;
+        if (c == L'|' && depth == 0) { out.push_back(cur); cur.Empty(); } else cur += c;
+    }
+    out.push_back(cur);
+    return out;
+}
+static int BraceDelta(const CString& s) { int d = 0; for (int i = 0; i < s.GetLength(); i++) { if (s[i] == L'{') d++; else if (s[i] == L'}') d--; } return d; }
+static int MatchParen(const CString& s, int open) {   // index of the ')' matching the '(' at s[open], or -1
+    int d = 0;
+    for (int i = open; i < s.GetLength(); i++) { if (s[i] == L'(') d++; else if (s[i] == L')' && --d == 0) return i; }
+    return -1;
+}
+static bool IsKw(const CString& s, const wchar_t* kw) {   // s starts with the keyword, then end / space / '(' / '{'
+    int n = (int)wcslen(kw);
+    if (s.GetLength() < n || s.Left(n).CompareNoCase(kw) != 0) return false;
+    return s.GetLength() == n || s[n] == L' ' || s[n] == L'(' || s[n] == L'{';
+}
+// The lines of aliases.ini (or the alias editor) -> aliases.   "/name body"   or   "/name {" ... "}"   ;comments and /* */ are skipped.
+static std::vector<AliasDef> ParseAliases(const std::vector<CString>& in) {
+    std::vector<AliasDef> out; bool comment = false;
+    for (size_t i = 0; i < in.size(); i++) {
+        CString t = in[i];
+        if (comment) { if (t.Find(L"*/") >= 0) comment = false; continue; }
+        t.Trim();
+        if (t.IsEmpty() || t[0] == L';') continue;
+        if (t.Left(2) == L"/*") { if (t.Find(L"*/", 2) < 0) comment = true; continue; }
+        if (t.Left(6).CompareNoCase(L"alias ") == 0) { t = t.Mid(6); t.TrimLeft(); if (t.Left(3).CompareNoCase(L"-l ") == 0) { t = t.Mid(3); t.TrimLeft(); } }   // remote-script style
+        if (t.Left(1) == L"/") t = t.Mid(1);
+        int k = 0; while (k < t.GetLength() && t[k] != L' ' && t[k] != L'{') k++;
+        CString name = t.Left(k), rest = t.Mid(k); rest.Trim();
+        if (name.IsEmpty()) continue;
+        AliasDef ad; ad.name = name;
+        int depth = BraceDelta(rest);
+        if (depth <= 0) {
+            if (rest.Left(1) == L"{" && rest.Right(1) == L"}") { rest = rest.Mid(1, rest.GetLength() - 2); rest.Trim(); }   // "{ cmd | cmd }" on one line
+            ad.lines.push_back(rest);
+        } else {   // a block: read lines until the braces balance
+            bool outer = rest.Left(1) == L"{";
+            if (outer) { rest = rest.Mid(1); rest.TrimLeft(); }
+            if (!rest.IsEmpty()) ad.lines.push_back(rest);
+            while (depth > 0 && i + 1 < in.size()) {
+                CString l = in[++i]; l.Trim();
+                depth += BraceDelta(l);
+                if (depth <= 0) {
+                    if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ad.lines.push_back(head); }
+                    else ad.lines.push_back(l);
+                    break;
+                }
+                ad.lines.push_back(l);
+            }
+        }
+        bool replaced = false;
+        for (auto& e : out) if (e.name.CompareNoCase(ad.name) == 0) { e = ad; replaced = true; break; }
+        if (!replaced) out.push_back(ad);
+    }
+    return out;
+}
+// Script lines -> a flat list of statements, with "{" and "}" as tokens of their own. Drops ; comments and /* */ blocks and
+// joins lines that end in $&.
+static std::vector<CString> ScriptTokens(const std::vector<CString>& lines) {
+    std::vector<CString> joined; bool inComment = false; CString pending;
+    for (size_t li = 0; li < lines.size(); li++) {
+        CString t = lines[li];
+        if (inComment) { int e = t.Find(L"*/"); if (e < 0) continue; t = t.Mid(e + 2); inComment = false; }
+        t.Trim();
+        if (t.Left(2) == L"/*") { int e = t.Find(L"*/", 2); if (e < 0) { inComment = true; continue; } t = t.Mid(e + 2); t.Trim(); }
+        if (pending.IsEmpty() && (t.IsEmpty() || t[0] == L';')) continue;
+        bool cont = t.GetLength() >= 2 && t.Right(2) == L"$&";
+        if (cont) t = t.Left(t.GetLength() - 2);
+        if (!pending.IsEmpty()) t.TrimLeft();
+        pending += t;
+        if (cont) continue;
+        joined.push_back(pending); pending.Empty();
+    }
+    if (!pending.IsEmpty()) joined.push_back(pending);
+    std::vector<CString> toks;
+    for (size_t li = 0; li < joined.size(); li++) {
+        CString t = joined[li]; t.Trim();
+        while (t.Left(1) == L"}") { toks.push_back(CString(L"}")); t = t.Mid(1); t.TrimLeft(); }
+        if (t.IsEmpty()) continue;
+        if (t == L"{") { toks.push_back(t); continue; }
+        if (t.Right(1) == L"{") { CString head = t.Left(t.GetLength() - 1); head.TrimRight(); if (!head.IsEmpty()) toks.push_back(head); toks.push_back(CString(L"{")); continue; }
+        toks.push_back(t);
+    }
+    return toks;
+}
+static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos, bool inBlock);
+static std::vector<SNode> ParseBody(const std::vector<CString>& t, size_t& pos, CString after) {   // what follows "if (...)": a { block } or a command on the same line
+    if (after.Left(1) == L"{" && after.Right(1) == L"}") { after = after.Mid(1, after.GetLength() - 2); after.Trim(); }
+    if (after.IsEmpty()) {
+        if (pos < t.size() && t[pos] == L"{") { pos++; return ParseNodes(t, pos, true); }
+        return std::vector<SNode>();
+    }
+    std::vector<CString> one; one.push_back(after); size_t p = 0;
+    return ParseNodes(one, p, false);
+}
+static SNode ParseCtrl(const std::vector<CString>& t, size_t& pos, CString kw, CString rest, int kind) {   // if / elseif / while
+    SNode n; rest.TrimLeft();
+    int cl = rest.Left(1) == L"(" ? MatchParen(rest, 0) : -1;
+    if (cl < 0) { n.kind = 0; n.text = kw + L" " + rest; return n; }   // malformed: leave it as a command so the user sees the error
+    n.kind = kind; n.text = rest.Mid(1, cl - 1);
+    CString after = rest.Mid(cl + 1); after.Trim();
+    n.a = ParseBody(t, pos, after);
+    if (kind == 1 && pos < t.size()) {
+        CString nx = t[pos];
+        if (IsKw(nx, L"elseif")) { pos++; n.b.push_back(ParseCtrl(t, pos, CString(L"elseif"), nx.Mid(6), 1)); }
+        else if (IsKw(nx, L"else")) { pos++; CString ea = nx.Mid(4); ea.Trim(); n.b = ParseBody(t, pos, ea); }
+    }
+    return n;
+}
+static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos, bool inBlock) {
+    std::vector<SNode> out;
+    while (pos < t.size()) {
+        CString s = t[pos];
+        if (s == L"}") { pos++; if (inBlock) return out; continue; }
+        if (s == L"{") { pos++; std::vector<SNode> inner = ParseNodes(t, pos, true); for (size_t i = 0; i < inner.size(); i++) out.push_back(inner[i]); continue; }
+        pos++;
+        if (IsKw(s, L"if")) { out.push_back(ParseCtrl(t, pos, CString(L"if"), s.Mid(2), 1)); continue; }
+        if (IsKw(s, L"while")) { out.push_back(ParseCtrl(t, pos, CString(L"while"), s.Mid(5), 2)); continue; }
+        if (s.GetLength() > 1 && s[0] == L':' && s.Find(L' ') < 0) { SNode n; n.kind = 3; n.text = s.Mid(1); out.push_back(n); continue; }   // :label
+        std::vector<CString> parts = SplitPipes(s);
+        for (size_t i = 0; i < parts.size(); i++) { CString c = parts[i]; c.Trim(); if (!c.IsEmpty()) { SNode n; n.text = c; out.push_back(n); } }
+    }
+    return out;
+}
+
+// ---------------- Alias editor: the whole alias list as text, like mIRC's alias editor ----------------
+class CAliasDlg : public CDialog {
+    CString& val; std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    CAliasDlg(CString& v, CWnd* parent) : val(v) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(340); t.push_back(230);
+        t.push_back(0); t.push_back(0); S(L"Aliases"); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 6, 6, 328, 10, 0xFFFF, 0x0082, L"One alias per line:  /name commands     (multi-line:  /name {   lines   } )");
+        Item(WS_BORDER | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN, 6, 20, 328, 184, 101, 0x0081, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 224, 210, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 280, 210, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        SetDlgItemText(101, val);
+        SendDlgItemMessage(101, EM_LIMITTEXT, 0, 0);
+        SendDlgItemMessage(101, EM_SETSEL, 0, 0);
+        GetDlgItem(101)->SetFocus();
+        return FALSE;   // focus is set by hand so the whole text isn't left selected
+    }
+    void OnOK() override { GetDlgItemText(101, val); CDialog::OnOK(); }
+};
+
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
@@ -1105,7 +1273,8 @@ class CMainFrame : public CMDIFrameWnd {
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp;
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
-    std::map<CString, CString> m_alias; int m_aliasDepth = 0;   // /alias definitions (lowercase name -> command line), saved in the [aliases] ini section
+    std::vector<AliasDef> m_aliases; std::vector<CString> m_runStack;   // aliases (aliases.ini) and the alias names currently running
+    int m_depth = 0, m_steps = 0; bool m_halt = false; CString m_result, m_prop, m_lastPrompt;   // state of the running script: $result, $prop, $!
     VarMap m_vars; std::vector<VarScope> m_scopes; bool m_varsDirty = false;   // global variables (vars.ini) and the stack of per-script local scopes
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
@@ -1317,6 +1486,9 @@ class CMainFrame : public CMDIFrameWnd {
         CTime now = CTime::GetCurrentTime();
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"null") { val.Empty(); return true; }
+        if (name == L"prop") { val = m_prop; return true; }         // the .property used to call a custom identifier: $add(1,2).negative
+        if (name == L"result") { val = m_result; return true; }     // what the last alias/identifier "return"ed
+        if (name == L"error") { val.Empty(); return true; }
         if (name == L"true") { val = L"1"; return true; }
         if (name == L"false") { val = L"0"; return true; }
         if (name == L"ticks") { val.Format(L"%I64u", (unsigned __int64)GetTickCount64()); return true; }
@@ -1557,11 +1729,22 @@ class CMainFrame : public CMDIFrameWnd {
             else val = e->name;
             return true;
         }
+        if (AliasDef* ad = FindAlias(name)) {   // a user alias used as an identifier: $add(1,2) runs /add with $1=1 $2=2 and gives its "return" value
+            if (OnRunStack(ad->name)) return false;
+            CString a = EvalIds(w, rawArgs, params), plist; int pos = 0;
+            for (CString piece = a.Tokenize(L",", pos); !piece.IsEmpty(); piece = a.Tokenize(L",", pos)) { piece.Trim(); plist += (plist.IsEmpty() ? CString() : CString(L" ")) + piece; }
+            m_result.Empty();
+            RunAlias(w, *ad, plist, prop);
+            val = m_result; return true;
+        }
         return false;
     }
 
     // 'params' is the "$1-" line: empty for a hand-typed //command, the alias arguments when an alias runs.
-    // Replaces $identifiers, $func(...), $N/$N-/$N-M/$0 and (unless evalVars is false) %variables.
+    // Replaces $identifiers, $func(...), $N/$N-/$N-M/$0, %variables (unless evalVars is false), and in scripts also:
+    //   #  on its own = the channel you're in;  #$1 = $1 with a # in front unless it already has one
+    //   $$x  like $x, but if it comes out empty the whole script halts        $?  $?="text"  $?1  ask for a value ($$? = required)
+    //   $!  the last value typed into a $? box                                  $+  glue the text on either side together
     CString EvalIds(CChatWnd* w, const CString& in, const CString& params, bool evalVars = true) {
         std::vector<int> ts, te;   // start/end offsets of each space-delimited token of params
         int pn = params.GetLength();
@@ -1577,47 +1760,81 @@ class CMainFrame : public CMDIFrameWnd {
             if (a < 1 || a > b) return CString();
             return params.Mid(ts[a - 1], te[b - 1] - ts[a - 1]);
         };
-        CString out; int L = in.GetLength();
+        CString out; int L = in.GetLength(); bool hashPending = false;
         for (int i = 0; i < L; i++) {
             wchar_t c = in[i];
+            if (c == L'#') {
+                bool startsWord = (i == 0 || in[i - 1] == L' '), endsWord = (i + 1 >= L || in[i + 1] == L' ');
+                if (startsWord && endsWord && w && w->m_chan) { out += w->m_name; continue; }
+                if (i + 1 < L && in[i + 1] == L'$') { hashPending = true; continue; }   // decided once we know the value that follows
+                out += c; continue;
+            }
             if (c == L'%' && evalVars && i + 1 < L && (iswalnum(in[i + 1]) || in[i + 1] == L'_')) {   // %variable (an unset one is empty)
                 int k = i + 1; while (k < L && (iswalnum(in[k]) || in[k] == L'_')) k++;
                 out += GetVar(in.Mid(i, k - i)); i = k - 1; continue;
             }
-            if (c != L'$' || i + 1 >= L) { out += c; continue; }
-            int j = i + 1;
-            if (iswdigit(in[j])) {   // $0  $N  $N-  $N-M
+            if (c != L'$' || i + 1 >= L) { if (hashPending) { out += L'#'; hashPending = false; } out += c; continue; }
+            int j = i + 1; bool dbl = false;
+            if (in[j] == L'$' && j + 1 < L) { dbl = true; j++; }
+            CString val; bool ok = false; int endIdx = j;
+            if (in[j] == L'+' && !dbl) {   // $+ : drop the spaces on both sides
+                if (hashPending) { out += L'#'; hashPending = false; }
+                while (out.GetLength() > 0 && out[out.GetLength() - 1] == L' ') out.Truncate(out.GetLength() - 1);
+                int e = j + 1; while (e < L && in[e] == L' ') e++;
+                i = e - 1; continue;
+            }
+            else if (in[j] == L'!' && !dbl) { val = m_lastPrompt; ok = true; endIdx = j + 1; }
+            else if (in[j] == L'?') {   // $?  $?="Prompt text"  $?1  (a number: use that parameter if it was given, otherwise ask)
+                int k = j + 1, pnum = 0; bool hasN = false;
+                while (k < L && iswdigit(in[k])) { if (pnum < 100000) pnum = pnum * 10 + (in[k] - L'0'); hasN = true; k++; }
+                CString label = L"Enter a value:";
+                if (k + 1 < L && in[k] == L'=' && in[k + 1] == L'"') { int q = in.Find(L'"', k + 2); if (q >= 0) { label = in.Mid(k + 2, q - k - 2); k = q + 1; } }
+                if (hasN && pnum >= 1 && pnum <= (int)ts.size()) val = slice(pnum, pnum);
+                else {
+                    CString typed; CPromptDlg dlg(typed, L"Input", label, this);
+                    if (dlg.DoModal() == IDOK) { val = typed; m_lastPrompt = typed; } else m_halt = true;   // Cancel stops the script
+                }
+                ok = true; endIdx = k;
+            }
+            else if (iswdigit(in[j])) {   // $0  $N  $N-  $N-M
                 int a = 0; while (j < L && iswdigit(in[j])) { if (a < 100000) a = a * 10 + (in[j] - L'0'); j++; }
-                if (a == 0) { CString cnt; cnt.Format(L"%d", (int)ts.size()); out += cnt; }
+                if (a == 0) val.Format(L"%d", (int)ts.size());
                 else if (j < L && in[j] == L'-') {
                     j++;
-                    if (j < L && iswdigit(in[j])) { int b = 0; while (j < L && iswdigit(in[j])) { if (b < 100000) b = b * 10 + (in[j] - L'0'); j++; } out += slice(a, b); }
-                    else out += slice(a, -1);
+                    if (j < L && iswdigit(in[j])) { int b = 0; while (j < L && iswdigit(in[j])) { if (b < 100000) b = b * 10 + (in[j] - L'0'); j++; } val = slice(a, b); }
+                    else val = slice(a, -1);
                 }
-                else out += slice(a, a);
-                i = j - 1; continue;
+                else val = slice(a, a);
+                ok = true; endIdx = j;
             }
-            if (iswalpha(in[j])) {   // named identifier or function; matching is case-insensitive ($ME == $me)
+            else if (iswalpha(in[j])) {   // named identifier or function; matching is case-insensitive ($ME == $me)
                 int k = j; while (k < L && iswalnum(in[k])) k++;
                 CString name = in.Mid(j, k - j); name.MakeLower();
-                if (k < L && in[k] == L'(') {   // $func(args)  and, for $var, an optional .property
+                bool done = false;
+                if (k < L && in[k] == L'(') {   // $func(args)  and, for $var and your own aliases, an optional .property
                     int depth = 0, m = k;
                     for (; m < L; m++) { if (in[m] == L'(') depth++; else if (in[m] == L')' && --depth == 0) break; }
                     if (m < L) {
                         CString args = in.Mid(k + 1, m - k - 1), prop; int end = m + 1;
-                        if (name == L"var" && end + 1 < L && in[end] == L'.' && iswalpha(in[end + 1])) {
+                        if ((name == L"var" || FindAlias(name)) && end + 1 < L && in[end] == L'.' && iswalpha(in[end + 1])) {
                             int pe = end + 1; while (pe < L && iswalnum(in[pe])) pe++;
                             prop = in.Mid(end + 1, pe - end - 1); prop.MakeLower(); end = pe;
                         }
-                        CString fv;
-                        if (FuncValue(w, name, args, prop, params, fv)) { out += fv; i = end - 1; continue; }
+                        if (FuncValue(w, name, args, prop, params, val)) { done = true; endIdx = end; }
                     }
                 }
-                CString val;
-                if (IdentValue(w, name, val)) { out += val; i = k - 1; continue; }
+                if (!done && IdentValue(w, name, val)) { done = true; endIdx = k; }
+                ok = done;
             }
+            if (ok) {
+                if (dbl && val.IsEmpty()) m_halt = true;   // $$1, $$?, $$name: no value means "don't run this command"
+                if (hashPending) { hashPending = false; if (val.IsEmpty() || !wcschr(L"#&+!", val[0])) out += L'#'; }
+                out += val; i = endIdx - 1; continue;
+            }
+            if (hashPending) { out += L'#'; hashPending = false; }
             out += c;   // unknown identifier or a lone '$': left exactly as typed, so typos are visible
         }
+        if (hashPending) out += L'#';
         return out;
     }
     // Like EvalIds, but for a whole command line: the operands that are variable NAMES (of /set /inc /dec /unset /var and of
@@ -1652,54 +1869,235 @@ class CMainFrame : public CMDIFrameWnd {
         }
         return EvalIds(w, line, params);
     }
-    static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> commands; a '|' inside parentheses is left alone
-        std::vector<CString> out; CString cur; int depth = 0;
-        for (int i = 0; i < s.GetLength(); i++) {
-            wchar_t c = s[i];
-            if (c == L'(') depth++; else if (c == L')' && depth > 0) depth--;
-            if (c == L'|' && depth == 0) { out.push_back(cur); cur.Empty(); } else cur += c;
+    // ---- aliases: aliases.ini  ([aliases]  n0=/name body ;  a multi-line alias is "/name {", its lines, "}") ----
+    AliasDef* FindAlias(const CString& name) { for (size_t i = 0; i < m_aliases.size(); i++) if (m_aliases[i].name.CompareNoCase(name) == 0) return &m_aliases[i]; return nullptr; }
+    bool OnRunStack(const CString& name) { for (size_t i = 0; i < m_runStack.size(); i++) if (m_runStack[i].CompareNoCase(name) == 0) return true; return false; }
+    void SetAlias(const CString& name, const std::vector<CString>& lines) {
+        if (AliasDef* a = FindAlias(name)) a->lines = lines;
+        else { AliasDef n; n.name = name; n.lines = lines; m_aliases.push_back(n); }
+    }
+    std::vector<CString> AliasLines() {   // the file / editor text
+        std::vector<CString> out;
+        for (size_t i = 0; i < m_aliases.size(); i++) {
+            const AliasDef& a = m_aliases[i];
+            if (a.lines.size() <= 1) out.push_back(L"/" + a.name + L" " + (a.lines.empty() ? CString() : a.lines[0]));
+            else { out.push_back(L"/" + a.name + L" {"); for (size_t k = 0; k < a.lines.size(); k++) out.push_back(L" " + a.lines[k]); out.push_back(CString(L"}")); }
         }
-        out.push_back(cur);
         return out;
     }
-    void LoadAliases() {
-        m_alias.clear();
-        std::vector<wchar_t> buf(32768, 0);
-        DWORD n = GetPrivateProfileSectionW(L"aliases", buf.data(), (DWORD)buf.size(), AfxGetApp()->m_pszProfileName);
-        if (!n) return;
-        for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
-            CString line = p; int eq = line.Find(L'=');
-            if (eq > 0) { CString k = line.Left(eq); k.MakeLower(); m_alias[k] = line.Mid(eq + 1); }
-        }
-    }
     void SaveAliases() {
-        CWinApp* a = AfxGetApp();
-        WritePrivateProfileStringW(L"aliases", nullptr, nullptr, a->m_pszProfileName);   // drop the whole section, then rewrite it
-        for (auto& kv : m_alias) a->WriteProfileString(L"aliases", kv.first, kv.second);
+        CString path = IniPath(L"aliases.ini");
+        WritePrivateProfileStringW(L"aliases", nullptr, nullptr, path);   // drop the section, then rewrite it in order
+        std::vector<CString> lines = AliasLines();
+        for (size_t i = 0; i < lines.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"aliases", key, lines[i], path); }
+    }
+    void LoadAliases() {
+        CString path = IniPath(L"aliases.ini");
+        m_aliases.clear();
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            std::vector<wchar_t> buf(262144, 0);
+            DWORD n = GetPrivateProfileSectionW(L"aliases", buf.data(), (DWORD)buf.size(), path);
+            std::vector<CString> lines;
+            if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) lines.push_back(line.Mid(eq + 1)); }
+            m_aliases = ParseAliases(lines);
+            return;
+        }
+        // first run with aliases.ini: carry over aliases from the old [aliases] section of the main ini, or start with a small default set
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(L"aliases", buf.data(), (DWORD)buf.size(), AfxGetApp()->m_pszProfileName);
+        if (n) {
+            for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+                CString line = p; int eq = line.Find(L'='); if (eq <= 0) continue;
+                std::vector<CString> body; body.push_back(line.Mid(eq + 1)); SetAlias(line.Left(eq), body);
+            }
+            WritePrivateProfileStringW(L"aliases", nullptr, nullptr, AfxGetApp()->m_pszProfileName);   // moved: drop the old section
+        } else {
+            static const wchar_t* defs[] = { L"/op /mode # +ooo $$1 $2 $3", L"/dop /mode # -ooo $$1 $2 $3", L"/j /join #$$1 $2-", L"/p /part #",
+                L"/n /names #$$1", L"/w /whois $$1", L"/k /kick # $$1 $2-", L"/q /query $$1", L"/send /dcc send $1 $2", L"/chat /dcc chat $1",
+                L"/ping /ctcp $$1 ping", L"/s /server $$1-" };
+            std::vector<CString> lines; for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) lines.push_back(defs[i]);
+            m_aliases = ParseAliases(lines);
+        }
+        SaveAliases();
+    }
+    afx_msg void OnAliasEditor() {
+        CString text; std::vector<CString> cur = AliasLines();
+        for (size_t i = 0; i < cur.size(); i++) text += cur[i] + L"\r\n";
+        CAliasDlg dlg(text, this);
+        if (dlg.DoModal() != IDOK) return;
+        std::vector<CString> lines; int pos = 0;
+        for (CString piece = text.Tokenize(L"\n", pos); !piece.IsEmpty(); piece = text.Tokenize(L"\n", pos)) { piece.TrimRight(L'\r'); lines.push_back(piece); }
+        m_aliases = ParseAliases(lines); SaveAliases();
+    }
+
+    // ---- the script interpreter: runs an alias body (or a //line) ----
+    struct ExecCtx { CChatWnd* w = nullptr; const CString* params = nullptr; CString gotoLabel; };
+    enum { C_NEXT = 0, C_BREAK, C_CONTINUE, C_RETURN, C_HALT, C_GOTO };
+
+    // "[ ... ]" evaluation brackets (a space after [ and before ]): the innermost are worked out first and replaced by their value,
+    // so  %a [ $+ b ]  becomes  %ab  and  [ [ %x ] ]  evaluates twice.
+    CString ExpandBrackets(CChatWnd* w, CString s, const CString& params) {
+        for (int guard = 0; guard < 64; guard++) {
+            int open = -1;
+            for (int i = 0; i + 1 < s.GetLength(); i++) if (s[i] == L'[' && s[i + 1] == L' ' && (i == 0 || s[i - 1] == L' ')) open = i;
+            if (open < 0) break;
+            int close = -1;
+            for (int i = open + 2; i < s.GetLength(); i++) if (s[i] == L']' && s[i - 1] == L' ' && (i + 1 >= s.GetLength() || s[i + 1] == L' ')) { close = i; break; }
+            if (close < 0) break;
+            int clen = close - open - 3; if (clen < 0) clen = 0;
+            CString content = s.Mid(open + 2, clen), before = s.Left(open), after = s.Mid(close + 1);
+            content.Trim();
+            bool jl = false, jr = false;
+            if (content.Left(2) == L"$+" && (content.GetLength() == 2 || content[2] == L' ')) { jl = true; content = content.Mid(2); content.TrimLeft(); }
+            if (content.Right(2) == L"$+" && (content.GetLength() == 2 || content[content.GetLength() - 3] == L' ')) { jr = true; content = content.Left(content.GetLength() - 2); content.TrimRight(); }
+            CString res = EvalIds(w, content, params);
+            if (jl) before.TrimRight();
+            if (jr) after.TrimLeft();
+            s = before + res + after;
+        }
+        return s;
+    }
+    static int FindTop(const CString& s, const wchar_t* op) {   // first occurrence of op outside parentheses, or -1
+        int d = 0, n = (int)wcslen(op);
+        for (int i = 0; i + n <= s.GetLength(); i++) {
+            if (s[i] == L'(') d++; else if (s[i] == L')' && d > 0) d--;
+            else if (d == 0 && s.Mid(i, n) == op) return i;
+        }
+        return -1;
+    }
+    // if / while conditions:  a == b  a === b  a != b  a < b  a > b  a <= b  a >= b  a isnum [lo-hi]  a isin b  a isincs b
+    // a iswm b  a iswmcs b  a ischan   (a leading ! negates the word ones), combined with && and || and parentheses.
+    bool EvalCond(CChatWnd* w, const CString& raw, const CString& params) {
+        CString s = raw; s.Trim();
+        while (s.GetLength() >= 2 && s[0] == L'(' && MatchParen(s, 0) == s.GetLength() - 1) { s = s.Mid(1, s.GetLength() - 2); s.Trim(); }
+        int p = FindTop(s, L"||");
+        if (p >= 0) return EvalCond(w, s.Left(p), params) || EvalCond(w, s.Mid(p + 2), params);
+        p = FindTop(s, L"&&");
+        if (p >= 0) return EvalCond(w, s.Left(p), params) && EvalCond(w, s.Mid(p + 2), params);
+        CString rest = s.Mid(1); rest.TrimLeft();
+        if (s.Left(1) == L"!" && rest.Left(1) == L"(") return !EvalCond(w, rest, params);
+        static const wchar_t* symOps[] = { L"===", L"==", L"!=", L"<=", L">=", L"<", L">" };
+        static const wchar_t* wordOps[] = { L"isnum", L"isincs", L"isin", L"iswmcs", L"iswm", L"ischan" };
+        int pos = -1, len = 0; CString op; int d = 0;
+        for (int i = 0; i < s.GetLength() && pos < 0; i++) {
+            if (s[i] == L'(') { d++; continue; }
+            if (s[i] == L')') { if (d > 0) d--; continue; }
+            if (d) continue;
+            for (size_t k = 0; k < sizeof symOps / sizeof symOps[0]; k++) { int n = (int)wcslen(symOps[k]); if (s.Mid(i, n) == symOps[k]) { pos = i; len = n; op = symOps[k]; break; } }
+            if (pos >= 0) break;
+            if (i > 0 && s[i - 1] == L' ') {   // a word operator must stand alone between spaces
+                int e = i; while (e < s.GetLength() && s[e] != L' ') e++;
+                CString tok = s.Mid(i, e - i), bare = tok; if (bare.Left(1) == L"!") bare = bare.Mid(1);
+                for (size_t k = 0; k < sizeof wordOps / sizeof wordOps[0]; k++) if (bare.CompareNoCase(wordOps[k]) == 0) { pos = i; len = e - i; op = tok; break; }
+            }
+        }
+        if (pos < 0) {   // no operator: true if it evaluates to something other than empty / 0
+            CString v = EvalIds(w, s, params); v.Trim();
+            return !v.IsEmpty() && v != L"0";
+        }
+        CString lv = EvalIds(w, s.Left(pos), params), rv = EvalIds(w, s.Mid(pos + len), params);
+        lv.Trim(); rv.Trim(); op.MakeLower();
+        bool neg = false; if (op.Left(1) == L"!" && op != L"!=") { neg = true; op = op.Mid(1); }
+        bool r = false;
+        if (op == L"==") r = lv.CompareNoCase(rv) == 0;
+        else if (op == L"===") r = lv.Compare(rv) == 0;
+        else if (op == L"!=") r = lv.CompareNoCase(rv) != 0;
+        else if (op == L"<" || op == L">" || op == L"<=" || op == L">=") {
+            double a = 0, b = 0;
+            if (ParseNum(lv, a) && ParseNum(rv, b)) { if (op == L"<") r = a < b; else if (op == L">") r = a > b; else if (op == L"<=") r = a <= b; else r = a >= b; }
+        }
+        else if (op == L"isnum") {
+            double a = 0; r = ParseNum(lv, a);
+            if (r && !rv.IsEmpty()) { int dash = rv.Find(L'-', 1); double lo = 0, hi = 0; if (dash > 0 && ParseNum(rv.Left(dash), lo) && ParseNum(rv.Mid(dash + 1), hi)) r = a >= lo && a <= hi; }
+        }
+        else if (op == L"isin") { CString a = lv, b = rv; a.MakeLower(); b.MakeLower(); r = b.Find(a) >= 0; }
+        else if (op == L"isincs") r = rv.Find(lv) >= 0;
+        else if (op == L"iswm") r = GlobMatch(lv, rv);      // the wildcard pattern is on the left
+        else if (op == L"iswmcs") r = GlobMatch(lv, rv, true);
+        else if (op == L"ischan") r = !lv.IsEmpty() && wcschr(L"#&+!", lv[0]) != nullptr;
+        return neg ? !r : r;
+    }
+    // One command line of a script: evaluated, then either a control word (return halt break continue goto) or a normal command.
+    int ExecCmd(ExecCtx& ctx, CString text) {
+        text.Trim();
+        if (text.IsEmpty() || text[0] == L';') return C_NEXT;
+        while (text.Left(1) == L"/") text = text.Mid(1);   // scripts don't need the slash, but aliases.ini bodies usually have one
+        text = ExpandBrackets(ctx.w, text, *ctx.params);
+        text = EvalCmdLine(ctx.w, text, *ctx.params);
+        if (m_halt) return C_HALT;
+        text.TrimRight();
+        CString rest = text, first = Word(rest); first.MakeLower(); rest.Trim();
+        if (first == L"return") { m_result = rest; return C_RETURN; }
+        if (first == L"halt") { m_halt = true; return C_HALT; }
+        if (first == L"break") return C_BREAK;
+        if (first == L"continue") return C_CONTINUE;
+        if (first == L"reseterror") return C_NEXT;
+        if (first == L"goto") { ctx.gotoLabel = rest; if (ctx.gotoLabel.Left(1) == L":") ctx.gotoLabel = ctx.gotoLabel.Mid(1); return C_GOTO; }
+        Dispatch(ctx.w, L"/" + text);
+        return m_halt ? C_HALT : C_NEXT;
+    }
+    int ExecNodes(const std::vector<SNode>& nodes, size_t start, ExecCtx& ctx) {
+        for (size_t i = start; i < nodes.size(); i++) {
+            if (m_halt) return C_HALT;
+            if (++m_steps > 200000) { Show(ctx.w, L"* Script stopped: too many steps (an endless loop?)", cPart); m_halt = true; return C_HALT; }
+            const SNode& n = nodes[i]; int r = C_NEXT;
+            if (n.kind == 0) r = ExecCmd(ctx, n.text);
+            else if (n.kind == 1) { if (EvalCond(ctx.w, n.text, *ctx.params)) r = ExecNodes(n.a, 0, ctx); else if (!n.b.empty()) r = ExecNodes(n.b, 0, ctx); }
+            else if (n.kind == 2) {
+                while (!m_halt && EvalCond(ctx.w, n.text, *ctx.params)) {
+                    if (++m_steps > 200000) { Show(ctx.w, L"* Script stopped: too many steps (an endless loop?)", cPart); m_halt = true; return C_HALT; }
+                    int rr = ExecNodes(n.a, 0, ctx);
+                    if (rr == C_BREAK) break;
+                    if (rr == C_CONTINUE || rr == C_NEXT) continue;
+                    r = rr; break;   // return / halt / goto leave the loop
+                }
+            }
+            if (r == C_GOTO) {   // jump to a label at this level; if it isn't here, let the enclosing block look
+                bool found = false;
+                for (size_t j = 0; j < nodes.size(); j++) if (nodes[j].kind == 3 && nodes[j].text.CompareNoCase(ctx.gotoLabel) == 0) { i = j; found = true; break; }
+                if (found) continue;
+                return C_GOTO;
+            }
+            if (r != C_NEXT) return r;
+        }
+        return C_NEXT;
+    }
+    void RunScript(CChatWnd* w, const std::vector<CString>& lines, const CString& params) {
+        ScopeGuard scope(this, true);   // its own variable scope: /var locals vanish when the script ends
+        std::vector<CString> toks = ScriptTokens(lines);
+        size_t pos = 0; std::vector<SNode> nodes = ParseNodes(toks, pos, false);
+        ExecCtx ctx; ctx.w = w; ctx.params = &params;
+        if (ExecNodes(nodes, 0, ctx) == C_GOTO) Show(w, L"* Label not found: " + ctx.gotoLabel, cPart);
+    }
+    void RunAlias(CChatWnd* w, AliasDef ad, CString params, CString prop = CString()) {   // by value: the body may redefine aliases while it runs
+        if (m_runStack.size() >= 24) { Show(w, L"* Aliases nested too deeply (/" + ad.name + L")", cPart); m_halt = true; return; }
+        CString savedProp = m_prop; m_prop = prop; m_runStack.push_back(ad.name);
+        RunScript(w, ad.lines, params);
+        m_runStack.pop_back(); m_prop = savedProp;
     }
 
     // ---- user input ----
-    void OnInput(CChatWnd* w, CString s, const CString* aliasParams = nullptr, bool sameScope = false) {
+    void OnInput(CChatWnd* w, CString s) {   // whatever was typed (or issued from a menu)
+        if (s.IsEmpty()) return;
+        if (m_depth == 0) { m_halt = false; m_steps = 0; }
+        m_depth++;
+        if (s.Left(2) == L"//") { std::vector<CString> one; one.push_back(s.Mid(2)); RunScript(w, one, CString()); }   // "//cmd | cmd": a one-line script, identifiers evaluated
+        else { ScopeGuard scope(this, true); Dispatch(w, s); }
+        m_depth--;
+    }
+    void Dispatch(CChatWnd* w, CString s) {   // one finished line: plain chat text, or "/command args"
         Net* net = w->net;
-        ScopeGuard scope(this, !sameScope);                      // one variable scope per script run; /var locals vanish with it
-        bool eval = aliasParams != nullptr;                      // an alias body always evaluates identifiers
-        if (s.Left(2) == L"//") { eval = true; s = s.Mid(1); }   // "//echo $me": run the command with $identifiers evaluated (mIRC style)
-        CString noParams; const CString& params = aliasParams ? *aliasParams : noParams;
-        if (eval && !sameScope && s.Left(1) == L"/") {           // script line "cmd1 | cmd2": run in order, each evaluated just before it runs
-            std::vector<CString> parts = SplitPipes(s.Mid(1));
-            if (parts.size() > 1) {
-                for (auto& part : parts) { CString c = part; c.Trim(); if (!c.IsEmpty()) OnInput(w, L"/" + c, &params, true); }
-                return;
-            }
-        }
-        if (eval && s.Left(1) == L"/") s = L"/" + EvalCmdLine(w, s.Mid(1), params);
         if (s.IsEmpty()) return;
         if (s[0] != L'/') {
             if (w->m_name == L"*status*") Note(net, L"You're not in a channel or query.", cPart);
             else Say(net, w->m_name, s);
             return;
         }
-        CString arg = s.Mid(1), cmdRaw = Word(arg), cmd = cmdRaw; cmd.MakeLower();
+        CString arg = s.Mid(1), cmdRaw = Word(arg);
+        bool bypass = false;
+        if (cmdRaw.Left(1) == L"!") { bypass = true; cmdRaw = cmdRaw.Mid(1); }   // "/!join": skip any alias of that name
+        else if (cmdRaw.Left(1) == L".") cmdRaw = cmdRaw.Mid(1);                 // "/.cmd": accepted, but its output isn't suppressed
+        CString cmd = cmdRaw; cmd.MakeLower();
         if (cmd.IsEmpty()) return;
         if (cmd[0] == L'%') {   // "%x = value" (also "%x=value"): assignment
             int eq = cmdRaw.Find(L'=');
@@ -1708,13 +2106,9 @@ class CMainFrame : public CMDIFrameWnd {
             return;
         }
         bool inChat = w->m_name != L"*status*";
-        auto al = m_alias.find(cmd);
-        if (al != m_alias.end()) {                               // user alias: run its body with the typed arguments as $1-
-            if (m_aliasDepth >= 8) { Show(w, L"* Alias recursion limit reached (/" + cmd + L")", cPart); return; }
-            CString body = al->second, aliasArgs = arg; body.Trim();
-            if (body.Left(1) == L"/") body = body.Mid(1);
-            m_aliasDepth++; OnInput(w, L"/" + body, &aliasArgs); m_aliasDepth--;
-            return;
+        if (!bypass) {
+            AliasDef* ad = FindAlias(cmd);
+            if (ad && !OnRunStack(ad->name)) { RunAlias(w, *ad, arg); return; }   // an alias may still call the built-in command of its own name
         }
         if (cmd == L"server" || cmd == L"connect") {
             bool multi = false; arg.TrimLeft();
@@ -1768,17 +2162,18 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"clear") w->Clear();
         else if (cmd == L"echo") { Show(w, arg, cInfo); }   // in the current window, so "//echo $me" shows up where you typed it
         else if (cmd == L"say") { if (inChat) Say(net, w->m_name, arg); else Note(net, L"You're not in a channel or query.", cPart); }   // sends text as-is, even if it starts with a slash
-        else if (cmd == L"alias") {
-            CString name = Word(arg); name.MakeLower(); arg.Trim();
+        else if (cmd == L"alias") {   // /alias (list)   /alias name (show)   /alias name commands (define; File > Aliases... edits multi-line ones)
+            CString name = Word(arg); arg.Trim();
+            if (name.Left(1) == L"/") name = name.Mid(1);
             if (name.IsEmpty()) {
-                if (m_alias.empty()) Show(w, L"* No aliases defined. Usage: /alias <name> <command ...>   e.g. /alias hi echo Hello $1, I am $me", cInfo);
-                for (auto& kv : m_alias) Show(w, L"* /" + kv.first + L" = " + kv.second, cInfo);
+                if (m_aliases.empty()) Show(w, L"* No aliases defined. Usage: /alias <name> <commands>   (File > Aliases... edits them all)", cInfo);
+                for (size_t i = 0; i < m_aliases.size(); i++) Show(w, L"* /" + m_aliases[i].name + L" " + (m_aliases[i].lines.size() == 1 ? m_aliases[i].lines[0] : CString(L"{ ... }")), cInfo);
             } else if (arg.IsEmpty()) {
-                auto it = m_alias.find(name);
-                if (it == m_alias.end()) Show(w, L"* No such alias: " + name, cInfo); else Show(w, L"* /" + name + L" = " + it->second, cInfo);
+                AliasDef* ad = FindAlias(name);
+                if (!ad) Show(w, L"* No such alias: " + name, cInfo);
+                else for (size_t i = 0; i < ad->lines.size(); i++) Show(w, L"* /" + ad->name + L": " + ad->lines[i], cInfo);
             } else {
-                if (arg.Left(1) == L"/") arg = arg.Mid(1);
-                m_alias[name] = arg; SaveAliases();
+                std::vector<CString> body; body.push_back(arg); SetAlias(name, body); SaveAliases();
                 Show(w, L"* Alias /" + name + L" defined", cInfo);
             }
         }
@@ -1789,8 +2184,10 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"inc") CmdIncDec(w, cmd, arg, 1);
         else if (cmd == L"dec") CmdIncDec(w, cmd, arg, -1);
         else if (cmd == L"unalias") {
-            CString name = Word(arg); name.MakeLower();
-            if (m_alias.erase(name)) { SaveAliases(); Show(w, L"* Alias /" + name + L" removed", cInfo); }
+            CString name = Word(arg); if (name.Left(1) == L"/") name = name.Mid(1);
+            bool gone = false;
+            for (size_t i = 0; i < m_aliases.size(); i++) if (m_aliases[i].name.CompareNoCase(name) == 0) { m_aliases.erase(m_aliases.begin() + i); gone = true; break; }
+            if (gone) { SaveAliases(); Show(w, L"* Alias /" + name + L" removed", cInfo); }
             else Show(w, L"* No such alias: " + name, cInfo);
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
@@ -2259,6 +2656,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
         f.AppendMenu(MF_SEPARATOR); 
         f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
+        f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
         f.AppendMenu(MF_STRING, IDM_SERVERS, L"&Server List...");
         f.AppendMenu(MF_STRING, IDM_CHANFAVS, L"Channel F&avorites...");
         f.AppendMenu(MF_SEPARATOR); 
@@ -2376,6 +2774,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
     ON_COMMAND(IDM_FONT, OnFont) 
+	ON_COMMAND(IDM_ALIASES, OnAliasEditor) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
