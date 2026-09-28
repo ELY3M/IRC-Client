@@ -79,6 +79,28 @@ static bool ParseListModes(const CString& topicIn, CString& modesOut, CString& t
     modesOut.Empty(); topicOut = topicIn;
     return false;
 }
+// $os: Windows version in mIRC's naming (XP, 2003, 2003R2, Vista, 2008, 7, 2008R2, 8, 2012, 8.1, 2012R2, 10, 11, 2016, 2019, 2022).
+// Uses RtlGetVersion because GetVersionEx reports a fake version unless the exe carries a compatibility manifest.
+static CString OsName() {
+    typedef LONG (WINAPI* RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+    OSVERSIONINFOEXW vi = {}; vi.dwOSVersionInfoSize = sizeof vi;
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn fn = nt ? (RtlGetVersionFn)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+    if (!fn || fn((PRTL_OSVERSIONINFOW)&vi) != 0) return CString();
+    bool wk = vi.wProductType == VER_NT_WORKSTATION;
+    DWORD maj = vi.dwMajorVersion, mnr = vi.dwMinorVersion, bld = vi.dwBuildNumber;
+    if (maj == 5 && mnr == 1) return CString(L"XP");
+    if (maj == 5 && mnr == 2) return CString(wk ? L"XP" : (GetSystemMetrics(SM_SERVERR2) ? L"2003R2" : L"2003"));
+    if (maj == 6 && mnr == 0) return CString(wk ? L"Vista" : L"2008");
+    if (maj == 6 && mnr == 1) return CString(wk ? L"7" : L"2008R2");
+    if (maj == 6 && mnr == 2) return CString(wk ? L"8" : L"2012");
+    if (maj == 6 && mnr == 3) return CString(wk ? L"8.1" : L"2012R2");
+    if (maj == 10) {
+        if (wk) return CString(bld >= 22000 ? L"11" : L"10");
+        return CString(bld >= 26100 ? L"2025" : bld >= 20348 ? L"2022" : bld >= 17763 ? L"2019" : L"2016");
+    }
+    return CString();
+}
 static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
     static const COLORREF pal[16] = { RGB(255,255,255), RGB(0,0,0), RGB(0,0,127), RGB(0,147,0), RGB(255,0,0), RGB(127,0,0),
         RGB(156,0,156), RGB(252,127,0), RGB(255,255,0), RGB(0,252,0), RGB(0,147,147), RGB(0,255,255), RGB(0,0,252),
@@ -869,6 +891,7 @@ struct Net {
     CString tag;      // short label prefixed onto this network's windows in the switchbar, once there's more than one
     int id = 0;
     CListWnd* listWnd = nullptr;   // this network's open /list results window, if any (one at a time, reused on repeat /list)
+    CString network;               // from the server's 005 ISUPPORT "NETWORK=" token, for $network (empty if the server doesn't say)
 };
 
 // ---------------- Channel List: /list results, sortable, right-click/double-click to join ----------------
@@ -992,6 +1015,7 @@ class CMainFrame : public CMDIFrameWnd {
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp;
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
+    std::map<CString, CString> m_alias; int m_aliasDepth = 0;   // /alias definitions (lowercase name -> command line), saved in the [aliases] ini section
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
     static CString Key(Net* net, CString s) { s.MakeLower(); CString k; k.Format(L"%d:", net ? net->id : 0); return k + s; }
@@ -1140,7 +1164,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void Connect(Net* net, const CString& host, UINT port) {
         if (net->sock.m_hSocket != INVALID_SOCKET) net->sock.Close();
-        net->conn = false; net->sock.buf.Empty(); net->sock.sendq.clear();
+        net->conn = false; net->network.Empty(); net->sock.buf.Empty(); net->sock.sendq.clear();
         delete net->sock.tls; net->sock.tls = nullptr;
         if (net->o.tls) {
             net->sock.tls = new CTls;
@@ -1195,17 +1219,109 @@ class CMainFrame : public CMDIFrameWnd {
         }
     }
 
+    // ---- identifiers: $me $chan $network $os $date $adate $day $daylight $fulldate $gmt $time, and $0 $N $N- $N-M ----
+    // Evaluated by "//cmd ..." and inside aliases (like mIRC: a plain "/cmd" line is NOT evaluated).
+    bool IdentValue(CChatWnd* w, const CString& name, CString& val) {
+        Net* net = w ? w->net : nullptr;
+        CTime now = CTime::GetCurrentTime();
+        if (name == L"me") { val = net ? net->nick : CString(); return true; }
+        if (name == L"chan") { val = (w && w->m_chan) ? w->m_name : CString(); return true; }
+        if (name == L"network") { val = net ? net->network : CString(); return true; }
+        if (name == L"os") { val = OsName(); return true; }
+        if (name == L"date") { val = now.Format(L"%d/%m/%Y"); return true; }
+        if (name == L"adate") { val = now.Format(L"%m/%d/%Y"); return true; }
+        if (name == L"day") { val = now.Format(L"%A"); return true; }
+        if (name == L"fulldate") { val = now.Format(L"%a %b %d %H:%M:%S %Y"); return true; }
+        if (name == L"time") { val = now.Format(L"%H:%M:%S"); return true; }
+        if (name == L"gmt") { val.Format(L"%I64d", (__int64)now.GetTime()); return true; }   // seconds since 1970, UTC-based
+        if (name == L"daylight") {
+            TIME_ZONE_INFORMATION tz = {}; DWORD id = GetTimeZoneInformation(&tz);
+            val.Format(L"%ld", id == TIME_ZONE_ID_DAYLIGHT ? -tz.DaylightBias * 60 : 0L);   // seconds of DST offset, 0 when not in effect
+            return true;
+        }
+        return false;
+    }
+    // 'params' is the "$1-" line: empty for a hand-typed //command, the alias arguments when an alias runs.
+    CString EvalIds(CChatWnd* w, const CString& in, const CString& params) {
+        std::vector<int> ts, te;   // start/end offsets of each space-delimited token of params
+        int pn = params.GetLength();
+        for (int i = 0; i < pn;) {
+            while (i < pn && params[i] == L' ') i++;
+            if (i >= pn) break;
+            int st = i; while (i < pn && params[i] != L' ') i++;
+            ts.push_back(st); te.push_back(i);
+        }
+        auto slice = [&](int a, int b) -> CString {   // tokens a..b (1-based, inclusive), verbatim text; b < 0 = to the end
+            int cnt = (int)ts.size();
+            if (b < 0 || b > cnt) b = cnt;
+            if (a < 1 || a > b) return CString();
+            return params.Mid(ts[a - 1], te[b - 1] - ts[a - 1]);
+        };
+        CString out; int L = in.GetLength();
+        for (int i = 0; i < L; i++) {
+            wchar_t c = in[i];
+            if (c != L'$' || i + 1 >= L) { out += c; continue; }
+            int j = i + 1;
+            if (iswdigit(in[j])) {   // $0  $N  $N-  $N-M
+                int a = 0; while (j < L && iswdigit(in[j])) { if (a < 100000) a = a * 10 + (in[j] - L'0'); j++; }
+                if (a == 0) { CString cnt; cnt.Format(L"%d", (int)ts.size()); out += cnt; }
+                else if (j < L && in[j] == L'-') {
+                    j++;
+                    if (j < L && iswdigit(in[j])) { int b = 0; while (j < L && iswdigit(in[j])) { if (b < 100000) b = b * 10 + (in[j] - L'0'); j++; } out += slice(a, b); }
+                    else out += slice(a, -1);
+                }
+                else out += slice(a, a);
+                i = j - 1; continue;
+            }
+            if (iswalpha(in[j])) {   // named identifier; matching is case-insensitive ($ME == $me)
+                int k = j; while (k < L && iswalnum(in[k])) k++;
+                CString name = in.Mid(j, k - j); name.MakeLower();
+                CString val;
+                if (IdentValue(w, name, val)) { out += val; i = k - 1; continue; }
+            }
+            out += c;   // unknown identifier or a lone '$': left exactly as typed, so typos are visible
+        }
+        return out;
+    }
+    void LoadAliases() {
+        m_alias.clear();
+        std::vector<wchar_t> buf(32768, 0);
+        DWORD n = GetPrivateProfileSectionW(L"aliases", buf.data(), (DWORD)buf.size(), AfxGetApp()->m_pszProfileName);
+        if (!n) return;
+        for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+            CString line = p; int eq = line.Find(L'=');
+            if (eq > 0) { CString k = line.Left(eq); k.MakeLower(); m_alias[k] = line.Mid(eq + 1); }
+        }
+    }
+    void SaveAliases() {
+        CWinApp* a = AfxGetApp();
+        WritePrivateProfileStringW(L"aliases", nullptr, nullptr, a->m_pszProfileName);   // drop the whole section, then rewrite it
+        for (auto& kv : m_alias) a->WriteProfileString(L"aliases", kv.first, kv.second);
+    }
+
     // ---- user input ----
-    void OnInput(CChatWnd* w, CString s) {
+    void OnInput(CChatWnd* w, CString s, const CString* aliasParams = nullptr) {
         Net* net = w->net;
-        if (s[0] != L'/' || s.Left(2) == L"//") {
-            if (s.Left(2) == L"//") s = s.Mid(1);
+        bool eval = aliasParams != nullptr;                      // an alias body always evaluates identifiers
+        if (s.Left(2) == L"//") { eval = true; s = s.Mid(1); }   // "//echo $me": run the command with $identifiers evaluated (mIRC style)
+        if (eval && s.Left(1) == L"/") s = L"/" + EvalIds(w, s.Mid(1), aliasParams ? *aliasParams : CString());
+        if (s.IsEmpty()) return;
+        if (s[0] != L'/') {
             if (w->m_name == L"*status*") Note(net, L"You're not in a channel or query.", cPart);
             else Say(net, w->m_name, s);
             return;
         }
         CString arg = s.Mid(1), cmd = Word(arg); cmd.MakeLower();
+        if (cmd.IsEmpty()) return;
         bool inChat = w->m_name != L"*status*";
+        auto al = m_alias.find(cmd);
+        if (al != m_alias.end()) {                               // user alias: run its body with the typed arguments as $1-
+            if (m_aliasDepth >= 8) { Show(w, L"* Alias recursion limit reached (/" + cmd + L")", cPart); return; }
+            CString body = al->second, params = arg; body.Trim();
+            if (body.Left(1) == L"/") body = body.Mid(1);
+            m_aliasDepth++; OnInput(w, L"/" + body, &params); m_aliasDepth--;
+            return;
+        }
         if (cmd == L"server" || cmd == L"connect") {
             bool multi = false; arg.TrimLeft();
             if (arg.Left(2).CompareNoCase(L"-m") == 0) { multi = true; arg = arg.Mid(2); arg.TrimLeft(); }
@@ -1256,10 +1372,30 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
-        else if (cmd == L"echo") { Note(net, arg); }
+        else if (cmd == L"echo") { Show(w, arg, cInfo); }   // in the current window, so "//echo $me" shows up where you typed it
+        else if (cmd == L"say") { if (inChat) Say(net, w->m_name, arg); else Note(net, L"You're not in a channel or query.", cPart); }   // sends text as-is, even if it starts with a slash
+        else if (cmd == L"alias") {
+            CString name = Word(arg); name.MakeLower(); arg.Trim();
+            if (name.IsEmpty()) {
+                if (m_alias.empty()) Show(w, L"* No aliases defined. Usage: /alias <name> <command ...>   e.g. /alias hi echo Hello $1, I am $me", cInfo);
+                for (auto& kv : m_alias) Show(w, L"* /" + kv.first + L" = " + kv.second, cInfo);
+            } else if (arg.IsEmpty()) {
+                auto it = m_alias.find(name);
+                if (it == m_alias.end()) Show(w, L"* No such alias: " + name, cInfo); else Show(w, L"* /" + name + L" = " + it->second, cInfo);
+            } else {
+                if (arg.Left(1) == L"/") arg = arg.Mid(1);
+                m_alias[name] = arg; SaveAliases();
+                Show(w, L"* Alias /" + name + L" defined", cInfo);
+            }
+        }
+        else if (cmd == L"unalias") {
+            CString name = Word(arg); name.MakeLower();
+            if (m_alias.erase(name)) { SaveAliases(); Show(w, L"* Alias /" + name + L" removed", cInfo); }
+            else Show(w, L"* No such alias: " + name, cInfo);
+        }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /ctcp /quit /clear /raw; other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /ctcp /quit /clear /echo /say /alias /unalias /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -1278,6 +1414,10 @@ class CMainFrame : public CMDIFrameWnd {
         if (b >= 0) { host = nick.Mid(b + 1); nick = nick.Left(b); }
         bool me = nick.CompareNoCase(net->nick) == 0;
 
+        if (cmd == L"005") {   // RPL_ISUPPORT: pick out NETWORK=<name> for $network (the line itself still prints below, as before)
+            size_t last = hasT ? p.size() - 1 : p.size();   // the trailing "are supported by this server" isn't a token
+            for (size_t i = 1; i < last; i++) if (p[i].Left(8).CompareNoCase(L"NETWORK=") == 0) net->network = p[i].Mid(8);
+        }
         if (cmd == L"PING") { Send(net, L"PONG :" + P(0)); }
         else if (cmd == L"PRIVMSG" || cmd == L"NOTICE") {
             CString tgt = P(0), txt = P(1); bool notice = cmd == L"NOTICE";
@@ -1686,6 +1826,7 @@ public:
         LoadFont(); 
         LoadBookmarks(); 
         LoadFavs();
+		LoadAliases();
 		LoadSkinPaths();
 		LoadSkinImages();
         CMenu f, s, c, w, h;
