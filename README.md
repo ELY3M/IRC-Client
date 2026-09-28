@@ -13,7 +13,14 @@ I want to keep this IRC Client open sourced
 sadly, this is windows only irc client.   
 
 
-
+# TO DO    
+~~multi server~~
+change background of mdi windows like I did with toolbar and switchbar   
+alias support  
+scripting 
+DCC chat/file send/server    
+address book  
+theme  
 
 
 
