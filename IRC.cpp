@@ -42,8 +42,11 @@ along with this program.  If not, see <https://gnu.org>.
 #define VERSION L"IRC Client - https://github.com/ELY3M/IRC-Client"
 #define DEFAULT_FONT L"Fixedsys"
 
-static const COLORREF cText = RGB(0,0,0), cJoin = RGB(0,140,0), cPart = RGB(150,0,0),
-                      cNote = RGB(200,110,0), cAct = RGB(150,0,150), cInfo = RGB(0,0,180);
+// These are plain (non-const) globals rather than compile-time constants so the Colors dialog can change them at
+// runtime; every existing call site that uses one as a default parameter value still works unchanged, since C++
+// re-reads a default argument's current value at each call rather than requiring it to be a compile-time constant.
+static COLORREF cText = RGB(0,0,0), cJoin = RGB(0,140,0), cPart = RGB(150,0,0), cOwn = RGB(0,0,0),
+                cNote = RGB(200,110,0), cAct = RGB(150,0,150), cInfo = RGB(0,0,180);
 
 // Remove mIRC control codes (bold, color, reverse, underline, reset)
 static CString Strip(const CString& s) {
@@ -240,7 +243,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -393,6 +396,15 @@ END_MESSAGE_MAP()
 
 // ---------------- Channel Favorites: bookmarked channels, stored in channels.ini ----------------
 struct ChanFav { CString chan, key, net; };   // net is just a display hint (where it was added from); joining always uses the active connection
+
+// A named set of colors (the Colors dialog): 7 text colors for message types, plus 3 background colors that apply to
+// the chat log, the input box, and the nick list (CLR_NONE for any of the ten means "use the system default").
+struct ColorScheme {
+    CString name;
+    COLORREF normal = RGB(0,0,0), own = RGB(0,0,0), join = RGB(0,140,0), part = RGB(150,0,0),
+             notice = RGB(200,110,0), info = RGB(0,0,180), action = RGB(150,0,150);
+    COLORREF chatBg = CLR_NONE, editBg = CLR_NONE, nickBg = CLR_NONE;
+};
 enum { IDC_FLIST = 301, IDC_FL_JOIN = 310, IDC_FL_NEW, IDC_FL_DELETE };
 class CFavDlg : public CDialog {
     std::vector<ChanFav>& fv; std::vector<WORD> t; int cnt = 0; CListBox m_list;
@@ -466,6 +478,28 @@ protected:
 };
 BEGIN_MESSAGE_MAP(CClickableStatic, CStatic)
     ON_WM_RBUTTONUP()
+END_MESSAGE_MAP()
+
+// A small filled rectangle that paints itself in whatever color it's set to and reports a left-click; used by the
+// Colors dialog for its Background / Editbox / Nicklist swatches.
+class CColorSwatch : public CStatic {
+public:
+    COLORREF color = RGB(255,255,255);
+    std::function<void()> onClick;
+protected:
+    afx_msg void OnPaint() {
+        CPaintDC dc(this); CRect r; GetClientRect(r);
+        dc.FillSolidRect(r, color);
+        dc.Draw3dRect(r, ::GetSysColor(COLOR_BTNSHADOW), ::GetSysColor(COLOR_BTNHIGHLIGHT));
+    }
+    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }
+    afx_msg void OnLButtonUp(UINT, CPoint) { if (onClick) onClick(); }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CColorSwatch, CStatic)
+    ON_WM_PAINT()
+    ON_WM_ERASEBKGND()
+    ON_WM_LBUTTONUP()
 END_MESSAGE_MAP()
 
 class CAboutDlg : public CDialog {
@@ -664,6 +698,7 @@ END_MESSAGE_MAP()
 class CBgPane : public CWnd {
 public:
     Gdiplus::Bitmap* skin = nullptr;
+    COLORREF bgColor = CLR_NONE;   // CLR_NONE = use the system window colour (the default, until the Colors dialog sets one)
     BOOL Create(CWnd* parent, UINT id) {
         return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_WINDOW + 1)), nullptr,
                             WS_CHILD | WS_VISIBLE, CRect(0, 0, 0, 0), parent, id);
@@ -672,7 +707,7 @@ protected:
     std::unique_ptr<Gdiplus::Bitmap> m_scaled; CSize m_scaledSize; Gdiplus::Bitmap* m_scaledSrc = nullptr;   // cached, pre-stretched to the current size
     afx_msg void OnPaint() {
         CPaintDC dc(this); CRect r; GetClientRect(r);
-        if (!skin) { dc.FillSolidRect(r, ::GetSysColor(COLOR_WINDOW)); return; }
+        if (!skin) { dc.FillSolidRect(r, bgColor == CLR_NONE ? ::GetSysColor(COLOR_WINDOW) : bgColor); return; }
         if (r.Width() <= 0 || r.Height() <= 0) return;
         if (!m_scaled || m_scaledSize != r.Size() || m_scaledSrc != skin) {
             auto scaled = std::make_unique<Gdiplus::Bitmap>(r.Width(), r.Height(), PixelFormat24bppRGB);
@@ -804,6 +839,19 @@ public:
     bool HasNick(const CString& n) { return FindNick(n) >= 0; }
     bool DelNick(const CString& n) { int i = FindNick(n); if (i < 0) return false; m_nicks.DeleteString(i); return true; }
     void SetLogBg(Gdiplus::Bitmap* bmp) { m_bgPic.skin = bmp; if (m_bgPic.m_hWnd) m_bgPic.Invalidate(); }   // the shared background image (see CMainFrame::SetChatSkin)
+    // The chat background color (behind the log, only visible where there's no image), and the editbox / nicklist
+    // background colors; CLR_NONE means "use the system default" for that one. See CMainFrame::ApplyColorScheme.
+    COLORREF m_editBg = CLR_NONE, m_nickBg = CLR_NONE;
+    CBrush m_editBrush, m_nickBrush;
+    void ApplyColors(COLORREF chatBg, COLORREF editBg, COLORREF nickBg) {
+        m_bgPic.bgColor = chatBg; if (m_bgPic.m_hWnd) m_bgPic.Invalidate();
+        m_editBg = editBg; if (m_editBrush.m_hObject) m_editBrush.DeleteObject();
+        if (editBg != CLR_NONE) m_editBrush.CreateSolidBrush(editBg);
+        m_nickBg = nickBg; if (m_nickBrush.m_hObject) m_nickBrush.DeleteObject();
+        if (nickBg != CLR_NONE) m_nickBrush.CreateSolidBrush(nickBg);
+        if (m_in.m_hWnd) m_in.Invalidate();
+        if (m_nicks.m_hWnd) m_nicks.Invalidate();
+    }
 
 protected:
     long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = L"Consolas"; bool m_baseBold = false, m_baseItalic = false;
@@ -845,6 +893,12 @@ protected:
         if (i >= 0 && onOpen) { m_nicks.GetText(i, n); onOpen(this, Bare(n)); }
     }
     afx_msg void OnSetFocus(CWnd*) { m_in.SetFocus(); }
+    afx_msg HBRUSH OnCtlColor(CDC* dc, CWnd* w, UINT type) {
+        HBRUSH br = CMDIChildWnd::OnCtlColor(dc, w, type);
+        if (w->m_hWnd == m_in.m_hWnd && m_editBg != CLR_NONE) { dc->SetBkColor(m_editBg); return (HBRUSH)m_editBrush; }
+        if (w->m_hWnd == m_nicks.m_hWnd && m_nickBg != CLR_NONE) { dc->SetBkColor(m_nickBg); return (HBRUSH)m_nickBrush; }
+        return br;
+    }
     // MDI's own activate/maximize transition can repaint the control through a path that skips our background image
     // (it briefly shows, then reverts to plain white and stays that way). Forcing a real erase+repaint on activation fixes it.
     afx_msg void OnMDIActivate(BOOL bActivate, CWnd* pActivateWnd, CWnd* pDeactivateWnd) {
@@ -893,6 +947,7 @@ BEGIN_MESSAGE_MAP(CChatWnd, CMDIChildWnd)
     ON_WM_SETFOCUS() 
     ON_WM_DESTROY()
     ON_WM_MDIACTIVATE()
+    ON_WM_CTLCOLOR()
     ON_LBN_DBLCLK(4, OnNickDbl)
 END_MESSAGE_MAP()
 
@@ -1641,6 +1696,123 @@ BEGIN_MESSAGE_MAP(CChanCentralDlg, CDialog)
     ON_LBN_SELCHANGE(IDC_CC_LIST, OnSel) ON_LBN_DBLCLK(IDC_CC_LIST, OnEditBtn)
 END_MESSAGE_MAP()
 
+// ---------------- Colors dialog: named color schemes (File > Colors...) ----------------
+enum { IDC_CD_SCHEME = 501, IDC_CD_NEW, IDC_CD_DELETE, IDC_CD_LIST, IDC_CD_CHOOSE,
+       IDC_CD_BGLBL, IDC_CD_BG, IDC_CD_EDITLBL, IDC_CD_EDIT, IDC_CD_NICKLBL, IDC_CD_NICK, IDC_CD_DEFAULT, IDC_CD_HELP };
+class CColorsDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    CListBox m_list; CColorSwatch m_bgSwatch, m_editSwatch, m_nickSwatch;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    static const wchar_t* const kNames[7];
+    static COLORREF ColorScheme::* const kSlot[7];
+    std::vector<ColorScheme>& out;   // CMainFrame's actual list; only overwritten (from work) if OK is pressed
+    std::vector<ColorScheme> work;   // an editable copy, so Cancel leaves the original untouched
+    int cur;
+    void RefillSchemeCombo() {
+        SendDlgItemMessage(IDC_CD_SCHEME, CB_RESETCONTENT, 0, 0);
+        for (auto& s : work) SendDlgItemMessage(IDC_CD_SCHEME, CB_ADDSTRING, 0, (LPARAM)(LPCWSTR)s.name);
+        SendDlgItemMessage(IDC_CD_SCHEME, CB_SETCURSEL, cur, 0);
+    }
+    void UpdateSwatches() {
+        ColorScheme& s = work[cur];
+        m_bgSwatch.color = s.chatBg == CLR_NONE ? ::GetSysColor(COLOR_WINDOW) : s.chatBg; if (m_bgSwatch.m_hWnd) m_bgSwatch.Invalidate();
+        m_editSwatch.color = s.editBg == CLR_NONE ? ::GetSysColor(COLOR_WINDOW) : s.editBg; if (m_editSwatch.m_hWnd) m_editSwatch.Invalidate();
+        m_nickSwatch.color = s.nickBg == CLR_NONE ? ::GetSysColor(COLOR_WINDOW) : s.nickBg; if (m_nickSwatch.m_hWnd) m_nickSwatch.Invalidate();
+    }
+    void SelectScheme(int i) {
+        cur = i; SendDlgItemMessage(IDC_CD_SCHEME, CB_SETCURSEL, cur, 0);
+        m_list.SetCurSel(0); UpdateSwatches();
+    }
+    void Pick(COLORREF ColorScheme::* slot) {
+        COLORREF cur0 = work[cur].*slot; if (cur0 == CLR_NONE) cur0 = ::GetSysColor(COLOR_WINDOW);
+        CColorDialog dlg(cur0, CC_FULLOPEN, this);
+        if (dlg.DoModal() == IDOK) { work[cur].*slot = dlg.GetColor(); UpdateSwatches(); }
+    }
+public:
+    CColorsDlg(std::vector<ColorScheme>& allSchemes, int active, CWnd* parent) : out(allSchemes), work(allSchemes), cur(active) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(250); t.push_back(220);
+        t.push_back(0); t.push_back(0); S(L"Colors"); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 8, 8, 60, 10, 0xFFFF, 0x0082, L"Scheme:");
+        Item(CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, 8, 18, 140, 90, IDC_CD_SCHEME, 0x0085, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 152, 17, 44, 14, IDC_CD_NEW, 0x0080, L"New...");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 198, 17, 44, 14, IDC_CD_DELETE, 0x0080, L"Delete");
+        Item(SS_LEFT, 8, 38, 100, 9, 0xFFFF, 0x0082, L"Text colors:");
+        Item(LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 8, 48, 150, 100, IDC_CD_LIST, 0x0083, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 166, 48, 76, 14, IDC_CD_CHOOSE, 0x0080, L"Choose...");
+        Item(SS_LEFT, 166, 72, 76, 9, IDC_CD_BGLBL, 0x0082, L"Background:");
+        Item(SS_NOTIFY | WS_TABSTOP, 166, 82, 76, 18, IDC_CD_BG, 0x0082, L"");
+        Item(SS_LEFT, 166, 106, 76, 9, IDC_CD_EDITLBL, 0x0082, L"Editbox:");
+        Item(SS_NOTIFY | WS_TABSTOP, 166, 116, 76, 18, IDC_CD_EDIT, 0x0082, L"");
+        Item(SS_LEFT, 166, 140, 76, 9, IDC_CD_NICKLBL, 0x0082, L"Nicklist:");
+        Item(SS_NOTIFY | WS_TABSTOP, 166, 150, 76, 18, IDC_CD_NICK, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 8, 154, 60, 14, IDC_CD_DEFAULT, 0x0080, L"Default");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 40, 198, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 98, 198, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 156, 198, 50, 14, IDC_CD_HELP, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        m_list.SubclassDlgItem(IDC_CD_LIST, this);
+        m_bgSwatch.SubclassDlgItem(IDC_CD_BG, this); m_bgSwatch.onClick = [this] { Pick(&ColorScheme::chatBg); };
+        m_editSwatch.SubclassDlgItem(IDC_CD_EDIT, this); m_editSwatch.onClick = [this] { Pick(&ColorScheme::editBg); };
+        m_nickSwatch.SubclassDlgItem(IDC_CD_NICK, this); m_nickSwatch.onClick = [this] { Pick(&ColorScheme::nickBg); };
+        for (int i = 0; i < 7; i++) m_list.AddString(kNames[i]);
+        RefillSchemeCombo(); SelectScheme(cur);
+        return TRUE;
+    }
+    afx_msg void OnSchemeChange() { int i = (int)SendDlgItemMessage(IDC_CD_SCHEME, CB_GETCURSEL, 0, 0); if (i >= 0) SelectScheme(i); }
+    afx_msg void OnNew() {
+        CString nm; CPromptDlg dlg(nm, L"New Scheme", L"Scheme name:", this);
+        if (dlg.DoModal() != IDOK) return;
+        nm.Trim(); nm.Remove(L',');   // the ini line is comma-separated; a comma in the name would corrupt it on reload
+        if (nm.IsEmpty()) return;
+        ColorScheme ns = work[cur]; ns.name = nm; work.push_back(ns);
+        RefillSchemeCombo(); SelectScheme((int)work.size() - 1);
+    }
+    afx_msg void OnDelete() {
+        if (work.size() <= 1) { AfxMessageBox(L"At least one scheme must remain."); return; }
+        work.erase(work.begin() + cur); if (cur >= (int)work.size()) cur = (int)work.size() - 1;
+        RefillSchemeCombo(); SelectScheme(cur);
+    }
+    afx_msg void OnChoose() {
+        int i = m_list.GetCurSel(); if (i < 0) return;
+        COLORREF v = work[cur].*kSlot[i];
+        CColorDialog dlg(v, CC_FULLOPEN, this);
+        if (dlg.DoModal() == IDOK) work[cur].*kSlot[i] = dlg.GetColor();
+    }
+    afx_msg void OnDefaultBtn() {   // resets the current scheme's colors to the built-in defaults, keeping its name
+        CString nm = work[cur].name; ColorScheme d; d.name = nm; work[cur] = d; UpdateSwatches();
+    }
+    afx_msg void OnHelpBtn() {
+        AfxMessageBox(L"Pick a scheme, or use New... to start one from the current colors.\n\n"
+                      L"The list on the left is the color used for each kind of message text; select one and click Choose... "
+                      L"to change it. Background, Editbox and Nicklist are separate: click one of those boxes directly to "
+                      L"change that area's background color.\n\nDefault resets the selected scheme's colors (not its name). "
+                      L"Changes only take effect once you click OK.", MB_ICONINFORMATION);
+    }
+    void OnOK() override { out = work; CDialog::OnOK(); }
+    int Active() const { return cur; }
+    DECLARE_MESSAGE_MAP()
+};
+const wchar_t* const CColorsDlg::kNames[7] = { L"Normal", L"Own", L"Join", L"Part", L"Notice", L"Info", L"Action" };
+COLORREF ColorScheme::* const CColorsDlg::kSlot[7] = { &ColorScheme::normal, &ColorScheme::own, &ColorScheme::join,
+    &ColorScheme::part, &ColorScheme::notice, &ColorScheme::info, &ColorScheme::action };
+BEGIN_MESSAGE_MAP(CColorsDlg, CDialog)
+    ON_CBN_SELCHANGE(IDC_CD_SCHEME, OnSchemeChange)
+    ON_BN_CLICKED(IDC_CD_NEW, OnNew) ON_BN_CLICKED(IDC_CD_DELETE, OnDelete) ON_BN_CLICKED(IDC_CD_CHOOSE, OnChoose)
+    ON_BN_CLICKED(IDC_CD_DEFAULT, OnDefaultBtn) ON_BN_CLICKED(IDC_CD_HELP, OnHelpBtn)
+END_MESSAGE_MAP()
+
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
@@ -1651,6 +1823,7 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_swSkinPath, m_tbSkinPath, m_mdiSkinPath, m_chatSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp, m_chatSkinBmp;
     CMdiClient m_mdiWrap;   // the MDI workspace, subclassed once m_hWndMDIClient exists (see Start())
+    std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
     std::vector<AliasDef> m_aliases; std::vector<CString> m_runStack;   // aliases (aliases.ini) and the alias names currently running
@@ -1778,6 +1951,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
         w->SetLogBg(m_chatSkinBmp.get());
+        { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
         m_w[Key(net, name)] = w;
         return w;
     }
@@ -1802,7 +1976,7 @@ class CMainFrame : public CMDIFrameWnd {
     void Say(Net* net, const CString& target, const CString& text, bool action = false) {
         CChatWnd* w = Find(net, target); if (!w) w = Open(net, target, IsChan(target));
         if (action) { Send(net, L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + net->nick + L" " + text, cAct); }
-        else        { Send(net, L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + net->nick + L"> " + text); }
+        else        { Send(net, L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + net->nick + L"> " + text, cOwn); }
     }
     void Connect(Net* net, const CString& host, UINT port) {
         if (net->sock.m_hSocket != INVALID_SOCKET) net->sock.Close();
@@ -2330,6 +2504,11 @@ class CMainFrame : public CMDIFrameWnd {
         for (CString piece = text.Tokenize(L"\n", pos); !piece.IsEmpty(); piece = text.Tokenize(L"\n", pos)) { piece.TrimRight(L'\r'); lines.push_back(piece); }
         m_aliases = ParseAliases(lines); SaveAliases();
     }
+    afx_msg void OnColorsDialog() {
+        CColorsDlg dlg(m_schemes, m_curScheme, this);
+        if (dlg.DoModal() != IDOK) return;
+        ApplyColorScheme(dlg.Active());
+    }
 
     // ---- the script interpreter: runs an alias body (or a //line) ----
     struct ExecCtx { CChatWnd* w = nullptr; const CString* params = nullptr; CString gotoLabel; };
@@ -2831,6 +3010,7 @@ class CMainFrame : public CMDIFrameWnd {
             else Show(w, L"* No such alias: " + name, cInfo);
         }
         else if (cmd == L"channel") OpenChannelCentral(w, arg);
+        else if (cmd == L"colors") OnColorsDialog();
         else if (cmd == L"run") {   // /run [-n] file [parameters]: launches a local program or opens a document/URL with its associated app
             CString a = arg; a.TrimLeft(); bool min = false;
             if (a.Left(2).CompareNoCase(L"-n") == 0 && (a.GetLength() == 2 || a[2] == L' ')) { min = true; a = a.Mid(2); a.TrimLeft(); }
@@ -2854,7 +3034,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3001,6 +3181,58 @@ class CMainFrame : public CMDIFrameWnd {
         CString a = abs, d = dir; a.MakeLower(); d.MakeLower();
         return (a.Left(d.GetLength()) == d) ? abs.Mid(dir.GetLength()) : abs;
     }
+    // ---- Colors dialog: named schemes, stored in IRC.ini as [colors] n0=Name,c1,c2,...,c10 (see CColorsDlg) ----
+    static CString PackColor(COLORREF c) { CString s; s.Format(c == CLR_NONE ? L"-1" : L"%d", (int)c); return s; }
+    static COLORREF UnpackColor(const CString& s) { long v = _wtol(s); return v < 0 ? CLR_NONE : (COLORREF)v; }
+    void SeedColorSchemes() {   // used when [colors] doesn't exist yet: one scheme matching the app's built-in defaults
+        ColorScheme d; d.name = L"Default";
+        m_schemes.clear(); m_schemes.push_back(d); m_curScheme = 0;
+    }
+    void SaveColors() {
+        CWinApp* a = AfxGetApp();
+        WritePrivateProfileStringW(L"colors", nullptr, nullptr, IniPath(L"IRC.ini"));   // drop the section, then rewrite it in order
+        for (size_t i = 0; i < m_schemes.size(); i++) {
+            const ColorScheme& s = m_schemes[i];
+            CString line = s.name;
+            const COLORREF vals[10] = { s.normal, s.own, s.join, s.part, s.notice, s.info, s.action, s.chatBg, s.editBg, s.nickBg };
+            for (int k = 0; k < 10; k++) line += L"," + PackColor(vals[k]);
+            CString key; key.Format(L"n%d", (int)i);
+            a->WriteProfileString(L"colors", key, line);
+        }
+        a->WriteProfileInt(L"colors", L"active", m_curScheme);
+    }
+    void LoadColors() {
+        m_schemes.clear();
+        CString path = IniPath(L"IRC.ini");
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(L"colors", buf.data(), (DWORD)buf.size(), path);
+        for (wchar_t* p = buf.data(); n && *p; p += wcslen(p) + 1) {
+            CString line = p; int eq = line.Find(L'='); if (eq <= 0) continue;
+            CString key = line.Left(eq), val = line.Mid(eq + 1);
+            if (key.Left(1).CompareNoCase(L"n") != 0 || !iswdigit(key[1])) continue;   // skips the separate "active" key
+            ColorScheme s; int pos = 0; s.name = val.Tokenize(L",", pos);
+            COLORREF* slots[10] = { &s.normal, &s.own, &s.join, &s.part, &s.notice, &s.info, &s.action, &s.chatBg, &s.editBg, &s.nickBg };
+            for (int k = 0; k < 10 && pos != -1; k++) *slots[k] = UnpackColor(val.Tokenize(L",", pos));
+            if (!s.name.IsEmpty()) m_schemes.push_back(s);
+        }
+        if (m_schemes.empty()) { SeedColorSchemes(); SaveColors(); return; }
+        m_curScheme = AfxGetApp()->GetProfileInt(L"colors", L"active", 0);
+        if (m_curScheme < 0 || m_curScheme >= (int)m_schemes.size()) m_curScheme = 0;
+    }
+    ColorScheme& CurScheme() {   // guards against an empty/out-of-range m_schemes (shouldn't normally happen once Start() has run)
+        if (m_schemes.empty()) SeedColorSchemes();
+        if (m_curScheme < 0 || m_curScheme >= (int)m_schemes.size()) m_curScheme = 0;
+        return m_schemes[m_curScheme];
+    }
+    void PushSchemeColors(const ColorScheme& s) { cText = s.normal; cOwn = s.own; cJoin = s.join; cPart = s.part; cNote = s.notice; cInfo = s.info; cAct = s.action; }
+    void ApplyColorScheme(int idx) {   // pushes the scheme's colors into the global text-color variables and every open window
+        if (idx < 0 || idx >= (int)m_schemes.size()) return;
+        m_curScheme = idx; const ColorScheme& s = m_schemes[idx];
+        PushSchemeColors(s);
+        for (auto& kv : m_w) kv.second->ApplyColors(s.chatBg, s.editBg, s.nickBg);
+        SaveColors();
+    }
+
     void LoadSkinPaths() {
         CWinApp* a = AfxGetApp();
         m_swSkinPath = a->GetProfileString(L"background", L"switchbar", L"");
@@ -3158,14 +3390,26 @@ class CMainFrame : public CMDIFrameWnd {
         Send(net, L"JOIN " + e.chan + (e.key.IsEmpty() ? CString() : L" " + e.key));
     }
 
+    // A small 4-square color-palette icon for the Colors button. The external toolbar.bmp resource (when linked in)
+    // only has the original 7 icons, so this one is always drawn programmatically into the 8th image-list slot,
+    // whichever path BuildToolbar takes below.
+    static void DrawColorsGlyph(CDC& mem, int baseX) {
+        int x = baseX + 3, y = 3;
+        auto sq = [&](int dx, int dy, COLORREF c) {
+            CBrush br(c); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(40, 40, 40)); CPen* op = mem.SelectObject(&pn);
+            mem.Rectangle(CRect(x + dx, y + dy, x + dx + 5, y + dy + 5));
+            mem.SelectObject(ob); mem.SelectObject(op);
+        };
+        sq(0, 0, RGB(220,30,30)); sq(5, 0, RGB(30,160,30)); sq(0, 5, RGB(30,90,220)); sq(5, 5, RGB(230,180,0));
+    }
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
-        const int N = 7;
+        const int N = 8;
         CBitmap resBmp;
         bool haveRes = resBmp.LoadBitmap(102) != 0;   // id 102 in MiniIRC.rc ("toolbar.bmp"); absent in the plain one-file build
         int W = haveRes ? 24 : 16, H = W; m_tbIcon = W;
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0);
         if (haveRes) {
-            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites
+            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, colors (8 icons)
         } else {
             CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
             CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
@@ -3193,24 +3437,26 @@ class CMainFrame : public CMDIFrameWnd {
               CPoint pts[10]; for (int k = 0; k < 10; k++) pts[k] = CPoint(cx + off[k][0], cy + off[k][1]);
               mem.Polygon(pts, 10);
               mem.SelectObject(ob); mem.SelectObject(op); }   // star = favorites glyph
+            DrawColorsGlyph(mem, 7 * W);   // 8th cell: the Colors icon
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
         m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        TBBUTTON b[11] = {};
+        TBBUTTON b[12] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
         b[3].iBitmap = 2; b[3].idCommand = IDM_SERVERS; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
         b[4].iBitmap = 6; b[4].idCommand = IDM_CHANFAVS; b[4].fsState = TBSTATE_ENABLED; b[4].fsStyle = TBSTYLE_BUTTON;   // channel favorites
-        b[5].fsStyle = TBSTYLE_SEP;
-        b[6].iBitmap = 3; b[6].idCommand = IDM_CASCADE; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;
-        b[7].iBitmap = 4; b[7].idCommand = IDM_TILE; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;
-        b[8].fsStyle = TBSTYLE_SEP;
-        b[9].iBitmap = 5; b[9].idCommand = IDM_ABOUT; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;
-        b[10].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(11, b);
+        b[5].iBitmap = 7; b[5].idCommand = IDM_COLORS; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;    // colors
+        b[6].fsStyle = TBSTYLE_SEP;
+        b[7].iBitmap = 3; b[7].idCommand = IDM_CASCADE; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;
+        b[8].iBitmap = 4; b[8].idCommand = IDM_TILE; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;
+        b[9].fsStyle = TBSTYLE_SEP;
+        b[10].iBitmap = 5; b[10].idCommand = IDM_ABOUT; b[10].fsState = TBSTATE_ENABLED; b[10].fsStyle = TBSTYLE_BUTTON;
+        b[11].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(12, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
@@ -3339,6 +3585,7 @@ public:
 		LoadAliases();
 		LoadVars();
 		LoadPopups();
+		LoadColors(); PushSchemeColors(CurScheme());
 		LoadSkinPaths();
 		LoadSkinImages();
 		if (m_hWndMDIClient && m_mdiWrap.SubclassWindow(m_hWndMDIClient)) {
@@ -3361,6 +3608,7 @@ public:
         f.AppendMenu(MF_SEPARATOR); 
         f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
         f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
+        f.AppendMenu(MF_STRING, IDM_COLORS, L"&Colors...");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -3485,7 +3733,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
