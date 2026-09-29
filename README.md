@@ -17,20 +17,20 @@ you may get random bugs, glitches, or crashes.
 
 
 # TO DO    
-~~multi server~~
-~~colors (colors for background/texts)~~
-~~change background of mdi windows like I did with toolbar and switchbar~~
-~~aliases system~~
+~~multi server~~  
+~~colors (colors for background/texts)~~  
+~~change background of mdi windows like I did with toolbar and switchbar~~  
+~~aliases system~~  
 ~~popup system~~  
-~~variables system~~
-script editor to let you to edit aliases/vars/scripts 
-scripting 
-identd server 
-DCC chat/file send/server    
+~~variables system~~  
+script editor to let you to edit aliases/vars/scripts   
+scripting   
+identd server   
+DCC chat/file send/server      
 address book  
 theme  
-more commands 
-many more..... 
+more commands  
+many more.....  
 
 
 
