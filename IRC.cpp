@@ -133,6 +133,19 @@ static const COLORREF kMircPalette[99] = {
 // directly, and anything else (99 = "default", or an out-of-range typo) falls back to wrapping into the classic 16,
 // which is at least never garbage.
 static COLORREF MircColor(int n) { return kMircPalette[n >= 0 && n <= 98 ? n : (((n % 16) + 16) % 16)]; }
+// mIRC-style timestamp tokens: HH (24h), h (12h, no leading zero), nn (minutes), ss (seconds), tt (am/pm).
+static CString FormatTimestamp(const CString& fmt) {
+    SYSTEMTIME st; ::GetLocalTime(&st);
+    CString out = fmt;
+    auto pad2 = [](int v) { CString s; s.Format(L"%02d", v); return s; };
+    out.Replace(L"HH", pad2(st.wHour));
+    out.Replace(L"nn", pad2(st.wMinute));
+    out.Replace(L"ss", pad2(st.wSecond));
+    out.Replace(L"tt", st.wHour < 12 ? L"am" : L"pm");
+    int h12 = st.wHour % 12; if (h12 == 0) h12 = 12;
+    CString h12s; h12s.Format(L"%d", h12); out.Replace(L"h", h12s);
+    return out;
+}
 
 static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
     COLORREF fg = base, bg = CLR_NONE; int x = r.left; CString seg; int n = s.GetLength();
@@ -837,7 +850,10 @@ public:
     std::function<void(CChatWnd*, CString)> onOpen;      // open/join a nick or #channel, on this window's network
     std::function<void(CChatWnd*, CString, CPoint)> onNickMenu;   // right-click nick(s) in the user list (the nicks, space separated)
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
-    std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped) text of each new line, for history logging
+    std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped, un-timestamped) text of each new line, for history logging
+    int m_tsMode = -1;   // this window's /timestamp override: -1 = follow the global setting, 0 = off, 1 = on
+    std::function<bool()> tsEnabled;    // resolves m_tsMode against the global setting (see CMainFrame::Open)
+    std::function<CString()> tsFormat;  // the current event timestamp format (e.g. "[HH:nn]"; a separating space is always added after it, see AddLine)
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
     CString m_topicRaw; std::vector<CString> m_topicHist;   // the channel topic with its colour codes, and earlier topics (most recent first)
     bool LogHasSelection() { long s = 0, e = 0; m_out.GetSel(s, e); return s != e; }
@@ -857,11 +873,14 @@ public:
     }
     // Renders mIRC codes: ^B bold, ^C fg[,bg], ^E strikethrough, ^I italic, ^O reset, ^R reverse, ^_ underline
     void AddLine(CString s, COLORREF base) {
-        CString ts = CTime::GetCurrentTime().Format(L"[%H:%M] "), plain = ts; long ls = 0, le = 0;
+        bool showTs = tsEnabled ? tsEnabled() : true;
+        CString ts = showTs ? FormatTimestamp(tsFormat ? tsFormat() : CString(L"[HH:nn]")) + L" " : CString();   // the space is always added here, regardless of whether the format string itself has one
+        CString plain = ts, rawMsg;   // plain: what's shown (used for the #channel-underline pass below); rawMsg: undated, for logging
+        long ls = 0, le = 0;
         m_out.SetSel(-1, -1); m_out.GetSel(ls, le);            // remember where this line starts
-        Put(ts, base, CLR_NONE, 0);
+        if (showTs) Put(ts, base, CLR_NONE, 0);
         COLORREF fg = base, bg = CLR_NONE; DWORD fx = 0; CString seg; int n = s.GetLength();
-        auto flush = [&] { if (!seg.IsEmpty()) { plain += seg; Put(seg, fg, bg, fx); seg.Empty(); } };
+        auto flush = [&] { if (!seg.IsEmpty()) { plain += seg; rawMsg += seg; Put(seg, fg, bg, fx); seg.Empty(); } };
         auto num = [&](int& i) { int v = -1; for (int k = 0; k < 2 && i + 1 < n && iswdigit(s[i + 1]); k++) v = (v < 0 ? 0 : v * 10) + s[++i] - L'0'; return v; };
         for (int i = 0; i < n; i++) {
             wchar_t c = s[i];
@@ -880,7 +899,7 @@ public:
             else seg += c;
         }
         flush(); Put(L"\r\n", base, CLR_NONE, 0);
-        if (onLog) onLog(plain);
+        if (onLog) onLog(rawMsg);
         for (int i = 0, n2 = plain.GetLength(); i < n2;) {     // underline #channel words
             if ((plain[i] == L'#' || plain[i] == L'&') && (i == 0 || iswspace(plain[i - 1]) || wcschr(L"([<,:", plain[i - 1]))) {
                 int j = i + 1; while (j < n2 && !iswspace(plain[j]) && !wcschr(L",.;:!?)>]\"'", plain[j])) j++;
@@ -1989,6 +2008,7 @@ class CMainFrame : public CMDIFrameWnd {
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp;
     CMdiClient m_mdiWrap;   // the MDI workspace, subclassed once m_hWndMDIClient exists (see Start())
     bool m_logEnabled = false; CString m_logFolder;   // chat history logging (see LoadLogging/SaveLogging/WriteLog)
+    bool m_tsGlobalOn = true; CString m_tsEventFmt = L"[HH:nn]", m_tsLogFmt = L"[HH:nn:ss]";   // see /timestamp, LoadTimestamp/SaveTimestamp
     std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
@@ -2114,6 +2134,8 @@ class CMainFrame : public CMDIFrameWnd {
         w->onNickMenu = [this](CChatWnd* c, CString nick, CPoint pt) { ShowNickMenu(c, nick, pt); };
         w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowWindowPopup(c, pt); };
         w->onLog = [this, net, w](const CString& line) { WriteLog(net, w->m_name, line); };
+        w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
+        w->tsFormat = [this]() { return m_tsEventFmt; };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
@@ -3178,6 +3200,41 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"channel") OpenChannelCentral(w, arg);
         else if (cmd == L"colors") OnColorsDialog();
         else if (cmd == L"logging") OnLoggingDialog();
+        else if (cmd == L"timestamp") {
+            CString a = arg; a.Trim();
+            if (a.Left(2).CompareNoCase(L"-f") == 0) {
+                m_tsEventFmt = a.Mid(2); m_tsEventFmt.Trim(); if (m_tsEventFmt.IsEmpty()) m_tsEventFmt = L"[HH:nn]";
+                SaveTimestamp(); Show(w, L"* Event timestamp format: " + m_tsEventFmt, cInfo);
+            } else if (a.Left(2).CompareNoCase(L"-g") == 0) {
+                m_tsLogFmt = a.Mid(2); m_tsLogFmt.Trim(); if (m_tsLogFmt.IsEmpty()) m_tsLogFmt = L"[HH:nn:ss]";
+                SaveTimestamp(); Show(w, L"* Log timestamp format: " + m_tsLogFmt, cInfo);
+            } else {
+                int target = 0;   // 0 = no target given (global); 1 = status; 2 = active; 3 = every
+                if (a.Left(2).CompareNoCase(L"-s") == 0) { target = 1; a = a.Mid(2); a.TrimLeft(); }
+                else if (a.Left(2).CompareNoCase(L"-a") == 0) { target = 2; a = a.Mid(2); a.TrimLeft(); }
+                else if (a.Left(2).CompareNoCase(L"-e") == 0) { target = 3; a = a.Mid(2); a.TrimLeft(); }
+                CString mode = Word(a); CString modeL = mode; modeL.MakeLower();
+                int val = modeL == L"on" ? 1 : modeL == L"off" ? 0 : modeL == L"default" ? -1 : -2;
+                CString winName = a; winName.Trim();
+                if (val == -2) { Show(w, L"* Usage: /timestamp [-f format | -g format | [-s|-a|-e] on|off|default [window]]", cPart); return; }
+                if (target == 0 && winName.IsEmpty()) {   // no target at all: the global switch (as mIRC's own help describes)
+                    if (val == -1) { Show(w, L"* Usage: /timestamp on|off (default only applies to a specific window)", cPart); return; }
+                    m_tsGlobalOn = (val != 0); SaveTimestamp();
+                    Show(w, CString(L"* Timestamps are now globally ") + (m_tsGlobalOn ? L"on" : L"off") + L".", cInfo);
+                } else {
+                    std::vector<CChatWnd*> targets;
+                    if (target == 1) { if (CChatWnd* sw = Status(net)) targets.push_back(sw); }
+                    else if (target == 2) { if (auto* aw = dynamic_cast<CChatWnd*>(MDIGetActive())) targets.push_back(aw); }
+                    else if (target == 3) { for (auto& kv : m_w) targets.push_back(kv.second); }
+                    else if (!winName.IsEmpty()) { if (CChatWnd* nw = Find(net, winName)) targets.push_back(nw); }
+                    if (targets.empty()) { Show(w, L"* No matching window.", cPart); return; }
+                    for (auto* tw : targets) tw->m_tsMode = val;
+                    CString state = val == -1 ? CString(L"following the global setting") : (val ? CString(L"on") : CString(L"off"));
+                    CString names; for (auto* tw : targets) names += (names.IsEmpty() ? L"" : L", ") + (tw->m_name == L"*status*" ? CString(L"status") : tw->m_name);
+                    Show(w, L"* Timestamps for " + names + L": " + state + L".", cInfo);
+                }
+            }
+        }
         else if (cmd == L"run") {   // /run [-n] file [parameters]: launches a local program or opens a document/URL with its associated app
             CString a = arg; a.TrimLeft(); bool min = false;
             if (a.Left(2).CompareNoCase(L"-n") == 0 && (a.GetLength() == 2 || a[2] == L' ')) { min = true; a = a.Mid(2); a.TrimLeft(); }
@@ -3201,7 +3258,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3364,12 +3421,25 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileInt(L"Logging", L"enabled", m_logEnabled ? 1 : 0);
         a->WriteProfileString(L"Logging", L"folder", m_logFolder);
     }
-    void WriteLog(Net* net, const CString& winName, const CString& line) {
+    void LoadTimestamp() {
+        CWinApp* a = AfxGetApp();
+        m_tsGlobalOn = a->GetProfileInt(L"Timestamp", L"global", 1) != 0;
+        m_tsEventFmt = a->GetProfileString(L"Timestamp", L"eventfmt", L"[HH:nn]");
+        m_tsLogFmt = a->GetProfileString(L"Timestamp", L"logfmt", L"[HH:nn:ss]");
+    }
+    void SaveTimestamp() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Timestamp", L"global", m_tsGlobalOn ? 1 : 0);
+        a->WriteProfileString(L"Timestamp", L"eventfmt", m_tsEventFmt);
+        a->WriteProfileString(L"Timestamp", L"logfmt", m_tsLogFmt);
+    }
+    void WriteLog(Net* net, const CString& winName, const CString& rawLine) {
         if (!m_logEnabled || m_logFolder.IsEmpty()) return;
         CString folder = m_logFolder; if (folder.Right(1) != L"\\") folder += L"\\";
         CString netTag = (net && !net->tag.IsEmpty()) ? net->tag : (net ? net->o.host : CString(L"unknown"));
         CString win = winName == L"*status*" ? CString(L"status") : winName;
         CString path = folder + SanitizeFileName(netTag) + L"_" + SanitizeFileName(win) + L".log";
+        CString line = FormatTimestamp(m_tsLogFmt) + L" " + rawLine;   // the log's own timestamp format, independent of what's shown on screen (see /timestamp -g); the space is always added regardless of the format string
         FILE* f = nullptr;
         if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f) { fwprintf(f, L"%s\n", (LPCWSTR)line); fclose(f); }
     }
@@ -3773,6 +3843,7 @@ public:
 		LoadPopups();
 		LoadColors(); PushSchemeColors(CurScheme());
 		LoadLogging();
+		LoadTimestamp();
 		LoadSkinPaths();
 		LoadSkinImages();
 		if (m_hWndMDIClient && m_mdiWrap.SubclassWindow(m_hWndMDIClient)) {
