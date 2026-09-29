@@ -20,9 +20,12 @@ change background of mdi windows like I did with toolbar and switchbar
 ~~variables system~~
 script editor to let you to edit aliases/vars/scripts 
 scripting 
+identd server 
 DCC chat/file send/server    
 address book  
 theme  
+more commands 
+many more..... 
 
 
 
