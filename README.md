@@ -12,6 +12,9 @@ I want to keep this IRC Client open sourced
 
 sadly, this is windows only irc client.   
 
+# Warning Bugs or Crashes to be expected.   
+you may get random bugs, glitches, or crashes.        
+
 
 # TO DO    
 ~~multi server~~
