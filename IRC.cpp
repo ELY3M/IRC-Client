@@ -531,6 +531,115 @@ BEGIN_MESSAGE_MAP(CColorSwatch, CStatic)
     ON_WM_RBUTTONUP()
 END_MESSAGE_MAP()
 
+// mIRC's full 99-colour palette: 0-15 are the classic set (same values used elsewhere in this file for ^C rendering);
+// 16-98 are the fixed extended colours, standardized across clients (values per the modern IRC formatting spec).
+static const COLORREF kMircPalette[99] = {
+    RGB(255,255,255), RGB(0,0,0), RGB(0,0,127), RGB(0,147,0), RGB(255,0,0), RGB(127,0,0), RGB(156,0,156), RGB(252,127,0),
+    RGB(255,255,0), RGB(0,252,0), RGB(0,147,147), RGB(0,255,255), RGB(0,0,252), RGB(255,0,255), RGB(127,127,127), RGB(210,210,210),
+    RGB(0x47,0x00,0x00), RGB(0x47,0x21,0x00), RGB(0x47,0x47,0x00), RGB(0x32,0x47,0x00), RGB(0x00,0x47,0x00), RGB(0x00,0x47,0x2c),
+    RGB(0x00,0x47,0x47), RGB(0x00,0x27,0x47), RGB(0x00,0x00,0x47), RGB(0x2e,0x00,0x47), RGB(0x47,0x00,0x47), RGB(0x47,0x00,0x2a),
+    RGB(0x74,0x00,0x00), RGB(0x74,0x3a,0x00), RGB(0x74,0x74,0x00), RGB(0x51,0x74,0x00), RGB(0x00,0x74,0x00), RGB(0x00,0x74,0x49),
+    RGB(0x00,0x74,0x74), RGB(0x00,0x40,0x74), RGB(0x00,0x00,0x74), RGB(0x4b,0x00,0x74), RGB(0x74,0x00,0x74), RGB(0x74,0x00,0x45),
+    RGB(0xb5,0x00,0x00), RGB(0xb5,0x63,0x00), RGB(0xb5,0xb5,0x00), RGB(0x7d,0xb5,0x00), RGB(0x00,0xb5,0x00), RGB(0x00,0xb5,0x71),
+    RGB(0x00,0xb5,0xb5), RGB(0x00,0x63,0xb5), RGB(0x00,0x00,0xb5), RGB(0x75,0x00,0xb5), RGB(0xb5,0x00,0xb5), RGB(0xb5,0x00,0x6b),
+    RGB(0xff,0x00,0x00), RGB(0xff,0x8c,0x00), RGB(0xff,0xff,0x00), RGB(0xb2,0xff,0x00), RGB(0x00,0xff,0x00), RGB(0x00,0xff,0xa0),
+    RGB(0x00,0xff,0xff), RGB(0x00,0x8c,0xff), RGB(0x00,0x00,0xff), RGB(0xa5,0x00,0xff), RGB(0xff,0x00,0xff), RGB(0xff,0x00,0x98),
+    RGB(0xff,0x59,0x59), RGB(0xff,0xb4,0x59), RGB(0xff,0xff,0x71), RGB(0xcf,0xff,0x60), RGB(0x6f,0xff,0x6f), RGB(0x65,0xff,0xc9),
+    RGB(0x6d,0xff,0xff), RGB(0x59,0xb4,0xff), RGB(0x59,0x59,0xff), RGB(0xc4,0x59,0xff), RGB(0xff,0x66,0xff), RGB(0xff,0x59,0xbc),
+    RGB(0xff,0x9c,0x9c), RGB(0xff,0xd3,0x9c), RGB(0xff,0xff,0x9c), RGB(0xe2,0xff,0x9c), RGB(0x9c,0xff,0x9c), RGB(0x9c,0xff,0xdb),
+    RGB(0x9c,0xff,0xff), RGB(0x9c,0xd3,0xff), RGB(0x9c,0x9c,0xff), RGB(0xdc,0x9c,0xff), RGB(0xff,0x9c,0xff), RGB(0xff,0x94,0xd3),
+    RGB(0x00,0x00,0x00), RGB(0x13,0x13,0x13), RGB(0x28,0x28,0x28), RGB(0x36,0x36,0x36), RGB(0x4d,0x4d,0x4d), RGB(0x65,0x65,0x65),
+    RGB(0x81,0x81,0x81), RGB(0x9f,0x9f,0x9f), RGB(0xbc,0xbc,0xbc), RGB(0xe2,0xe2,0xe2), RGB(0xff,0xff,0xff)
+};
+// The clickable grid itself: 0-15 as two rows of larger cells (the "basic" set, as mIRC shows them), then 16-98 as
+// twelve columns of smaller cells. Left-click picks a foreground color; right-click picks a background color (added
+// as ",NN" onto whatever's already there, since mIRC requires a foreground before a background is meaningful).
+class CColorGridCtrl : public CWnd {
+    static const int BW = 36, BH = 28, EW = 24, EH = 20, COLS = 12, GAP = 56 + 4;   // basic cell size, extended cell size, extended columns, extended area's y start
+    static CRect CellRect(int idx) {
+        if (idx < 16) { int col = idx % 8, row = idx / 8; return CRect(col * BW, row * BH, col * BW + BW - 2, row * BH + BH - 2); }
+        int k = idx - 16, col = k % COLS, row = k / COLS;
+        return CRect(col * EW, GAP + row * EH, col * EW + EW - 2, GAP + row * EH + EH - 2);
+    }
+    static int HitTest(CPoint p) {
+        if (p.y < 2 * BH) {   // inside the two basic-color rows
+            int col = p.x / BW, row = p.y / BH;
+            if (col >= 0 && col < 8 && row >= 0 && row < 2) { int idx = row * 8 + col; return idx < 16 ? idx : -1; }
+        }
+        int ey = p.y - GAP; if (ey < 0) return -1;
+        int col = p.x / EW, row = ey / EH;
+        if (col < 0 || col >= COLS || row < 0) return -1;
+        int idx = 16 + row * COLS + col;
+        return idx <= 98 ? idx : -1;
+    }
+public:
+    std::function<void(int, bool)> onPick;   // (color index 0-98, true if right-clicked = background)
+    static CSize Extent() { CRect last = CellRect(98); return CSize(COLS * EW, last.bottom + 2); }
+    BOOL Create(CWnd* parent, UINT id) {
+        CSize sz = Extent();
+        return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_3DFACE + 1)), nullptr,
+                            WS_CHILD | WS_VISIBLE, CRect(CPoint(4, 4), sz), parent, id);
+    }
+protected:
+    afx_msg void OnPaint() {
+        CPaintDC dc(this);
+        CFont f; f.CreatePointFont(80, DEFAULT_FONT); CFont* old = dc.SelectObject(&f);
+        dc.SetBkMode(TRANSPARENT);
+        for (int i = 0; i <= 98; i++) {
+            CRect r = CellRect(i); COLORREF bg = kMircPalette[i];
+            dc.FillSolidRect(r, bg);
+            dc.Draw3dRect(r, ::GetSysColor(COLOR_BTNSHADOW), ::GetSysColor(COLOR_BTNHIGHLIGHT));
+            double lum = 0.299 * GetRValue(bg) + 0.587 * GetGValue(bg) + 0.114 * GetBValue(bg);
+            dc.SetTextColor(lum > 140 ? RGB(0,0,0) : RGB(255,255,255));
+            CString n; n.Format(L"%d", i);
+            dc.DrawText(n, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        dc.SelectObject(old);
+    }
+    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }
+    afx_msg void OnLButtonDown(UINT, CPoint p) { int i = HitTest(p); if (i >= 0 && onPick) onPick(i, false); }
+    afx_msg void OnRButtonDown(UINT, CPoint p) { int i = HitTest(p); if (i >= 0 && onPick) onPick(i, true); }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CColorGridCtrl, CWnd)
+    ON_WM_PAINT()
+    ON_WM_ERASEBKGND()
+    ON_WM_LBUTTONDOWN()
+    ON_WM_RBUTTONDOWN()
+END_MESSAGE_MAP()
+
+// Ctrl+K's color picker: pick a color (or right-click for background), and it closes itself immediately -- no
+// OK/Cancel needed, Esc still closes it without picking anything (CDialog's normal default).
+class CColorPickerDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    CColorGridCtrl m_grid;
+public:
+    int picked = -1; bool pickedBg = false;
+    CColorPickerDlg(CWnd* parent) {
+        CSize sz = CColorGridCtrl::Extent();
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0);
+        t.push_back((short)((sz.cx + 16) * 4 / 13)); t.push_back((short)((sz.cy + 30) * 8 / 13));   // pixels -> rough dialog units at this font
+        t.push_back(0); t.push_back(0); S(L"Colors"); t.push_back(9); S(DEFAULT_FONT);
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        m_grid.Create(this, 1);
+        m_grid.onPick = [this](int idx, bool bg) { picked = idx; pickedBg = bg; EndDialog(IDOK); };
+        CRect cr; m_grid.GetWindowRect(cr); ScreenToClient(cr);
+        CRect wr; GetWindowRect(wr); CRect cl; GetClientRect(cl);
+        SetWindowPos(nullptr, 0, 0, cr.right + 8 + (wr.Width() - cl.Width()), cr.bottom + 8 + (wr.Height() - cl.Height()), SWP_NOMOVE | SWP_NOZORDER);
+        return TRUE;
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CColorPickerDlg, CDialog)
+END_MESSAGE_MAP()
+
 class CAboutDlg : public CDialog {
     std::vector<WORD> t; int cnt = 0;
     CClickableStatic m_banner; 
@@ -892,8 +1001,18 @@ protected:
     // it's gone along with that feature, since a plain color via SetBackgroundColor doesn't have that problem)
     afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClose) onClose(this); }
     BOOL PreTranslateMessage(MSG* p) override {
-        if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0) {   // Ctrl+B/K/U/O/I/R/E insert mIRC codes
-            wchar_t c = p->wParam == 'B' ? 2 : p->wParam == 'K' ? 3 : p->wParam == 'U' ? 31 : p->wParam == 'O' ? 15
+        if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0 && p->wParam == 'K') {   // Ctrl+K: color picker
+            CColorPickerDlg dlg(this);
+            if (dlg.DoModal() == IDOK && dlg.picked >= 0) {
+                CString code;
+                if (dlg.pickedBg) code.Format(L",%02d", dlg.picked);           // background: appended onto whatever foreground code is already there
+                else code.Format(L"%c%02d", (wchar_t)3, dlg.picked);           // foreground: a fresh color code
+                m_in.ReplaceSel(code);
+            }
+            return TRUE;
+        }
+        if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0) {   // Ctrl+B/U/O/I/R/E insert mIRC codes
+            wchar_t c = p->wParam == 'B' ? 2 : p->wParam == 'U' ? 31 : p->wParam == 'O' ? 15
                       : p->wParam == 'I' ? 29 : p->wParam == 'R' ? 22 : p->wParam == 'E' ? 30 : 0;
             if (c) { m_in.ReplaceSel(CString(c)); return TRUE; }
         }
