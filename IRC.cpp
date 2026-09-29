@@ -27,12 +27,15 @@ along with this program.  If not, see <https://gnu.org>.
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #define SECURITY_WIN32
 #include <sspi.h>
 #include <schannel.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
+#pragma comment(lib, "shell32.lib")
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
@@ -48,7 +51,7 @@ along with this program.  If not, see <https://gnu.org>.
 static COLORREF cText = RGB(0,0,0), cJoin = RGB(0,140,0), cPart = RGB(150,0,0), cOwn = RGB(0,0,0),
                 cNote = RGB(200,110,0), cAct = RGB(150,0,150), cInfo = RGB(0,0,180);
 
-// Remove mIRC control codes (bold, color, reverse, underline, reset)
+// Remove mIRC control codes (bold, color, reverse, italic, strikethrough, underline, reset)
 static CString Strip(const CString& s) {
     CString o; int n = s.GetLength();
     auto dig = [&](int j) { return j < n && iswdigit(s[j]); };
@@ -57,7 +60,7 @@ static CString Strip(const CString& s) {
         if (c == 3) {
             int k = 0; while (k < 2 && dig(i + 1)) { i++; k++; }
             if (k && i + 1 < n && s[i + 1] == L',' && dig(i + 2)) { i += 2; if (dig(i + 1)) i++; }
-        } else if (c == 2 || c == 15 || c == 22 || c == 29 || c == 31) {}
+        } else if (c == 2 || c == 15 || c == 22 || c == 29 || c == 30 || c == 31) {}
         else o += c;
     }
     return o;
@@ -113,8 +116,26 @@ static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
     COLORREF fg = base, bg = CLR_NONE; int x = r.left; CString seg; int n = s.GetLength();
     int saved = dc->SaveDC();
     dc->IntersectClipRect(r);   // keeps per-segment background fills from bleeding past this cell
+    // Bold/italic/underline/strikethrough each need their own HFONT (a single font's style can't be changed per
+    // character), derived from whatever font the cell is already using and built lazily as each combination is
+    // actually hit, then cleaned up before returning. Reverse just swaps fg/bg, same as the chat log.
+    HFONT baseFont = (HFONT)::GetCurrentObject(dc->GetSafeHdc(), OBJ_FONT);
+    LOGFONT lf = {}; ::GetObjectW(baseFont, sizeof(lf), &lf);
+    HFONT variants[16] = {};
+    bool bold = false, italic = false, underline = false, strike = false;
+    auto selectStyle = [&]() {
+        int idx = (bold ? 1 : 0) | (italic ? 2 : 0) | (underline ? 4 : 0) | (strike ? 8 : 0);
+        if (idx == 0) { ::SelectObject(dc->GetSafeHdc(), baseFont); return; }
+        if (!variants[idx]) {
+            LOGFONT v = lf;
+            v.lfWeight = bold ? FW_BOLD : FW_NORMAL; v.lfItalic = italic; v.lfUnderline = underline; v.lfStrikeOut = strike;
+            variants[idx] = ::CreateFontIndirectW(&v);
+        }
+        ::SelectObject(dc->GetSafeHdc(), variants[idx]);
+    };
     auto flush = [&]() {
         if (seg.IsEmpty()) return;
+        selectStyle();
         SIZE sz = dc->GetTextExtent(seg);
         CRect tr(x, r.top, x + sz.cx, r.bottom);
         if (bg != CLR_NONE) dc->FillSolidRect(tr, bg);
@@ -133,11 +154,17 @@ static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
             fg = pal[f % 16];
             if (i + 2 < n && s[i + 1] == L',' && iswdigit(s[i + 2])) { i++; bg = pal[num(i) % 16]; }   // background spec, now rendered
         }
-        else if (c == 15) { flush(); fg = base; bg = CLR_NONE; }   // reset
-        else if (c == 2 || c == 22 || c == 29 || c == 31) {}       // bold/reverse/italic/underline: not rendered here
+        else if (c == 15) { flush(); fg = base; bg = CLR_NONE; bold = italic = underline = strike = false; }   // reset
+        else if (c == 2) { flush(); bold = !bold; }
+        else if (c == 29) { flush(); italic = !italic; }
+        else if (c == 30) { flush(); strike = !strike; }
+        else if (c == 31) { flush(); underline = !underline; }
+        else if (c == 22) { flush(); COLORREF t = fg; fg = bg == CLR_NONE ? RGB(255,255,255) : bg; bg = t; }   // reverse
         else seg += c;
     }
     flush();
+    ::SelectObject(dc->GetSafeHdc(), baseFont);
+    for (HFONT v : variants) if (v) ::DeleteObject(v);
     dc->RestoreDC(saved);
 }
 static CString Word(CString& s) {
@@ -243,7 +270,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -699,6 +726,7 @@ public:
     std::function<void(CChatWnd*, CString)> onOpen;      // open/join a nick or #channel, on this window's network
     std::function<void(CChatWnd*, CString, CPoint)> onNickMenu;   // right-click nick(s) in the user list (the nicks, space separated)
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
+    std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped) text of each new line, for history logging
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
     CString m_topicRaw; std::vector<CString> m_topicHist;   // the channel topic with its colour codes, and earlier topics (most recent first)
     bool LogHasSelection() { long s = 0, e = 0; m_out.GetSel(s, e); return s != e; }
@@ -707,7 +735,7 @@ public:
     void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
         m_out.SetSel(-1, -1);
         CHARFORMAT2 cf = {}; cf.cbSize = sizeof cf;
-        cf.dwMask = CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_FACE | CFM_SIZE;
+        cf.dwMask = CFM_COLOR | CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_FACE | CFM_SIZE;
         cf.crTextColor = fg;
         cf.dwEffects = fx | (m_baseBold ? CFE_BOLD : 0) | (m_baseItalic ? CFE_ITALIC : 0);
         if (bg == CLR_NONE) cf.dwEffects |= CFE_AUTOBACKCOLOR;   // no explicit mIRC background colour: leave it transparent so a background image shows through
@@ -716,7 +744,7 @@ public:
         m_out.SetSelectionCharFormat(cf);
         m_out.ReplaceSel(t);
     }
-    // Renders mIRC codes: ^B bold, ^C fg[,bg], ^I italic, ^O reset, ^R reverse, ^_ underline
+    // Renders mIRC codes: ^B bold, ^C fg[,bg], ^E strikethrough, ^I italic, ^O reset, ^R reverse, ^_ underline
     void AddLine(CString s, COLORREF base) {
         static const COLORREF pal[16] = { RGB(255,255,255), RGB(0,0,0), RGB(0,0,127), RGB(0,147,0), RGB(255,0,0), RGB(127,0,0),
             RGB(156,0,156), RGB(252,127,0), RGB(255,255,0), RGB(0,252,0), RGB(0,147,147), RGB(0,255,255), RGB(0,0,252),
@@ -731,6 +759,7 @@ public:
             wchar_t c = s[i];
             if (c == 2) { flush(); fx ^= CFE_BOLD; }
             else if (c == 29) { flush(); fx ^= CFE_ITALIC; }
+            else if (c == 30) { flush(); fx ^= CFE_STRIKEOUT; }
             else if (c == 31) { flush(); fx ^= CFE_UNDERLINE; }
             else if (c == 22) { flush(); COLORREF t = fg; fg = bg == CLR_NONE ? RGB(255,255,255) : bg; bg = t; }
             else if (c == 15) { flush(); fg = base; bg = CLR_NONE; fx = 0; }
@@ -743,6 +772,7 @@ public:
             else seg += c;
         }
         flush(); Put(L"\r\n", base, CLR_NONE, 0);
+        if (onLog) onLog(plain);
         for (int i = 0, n2 = plain.GetLength(); i < n2;) {     // underline #channel words
             if ((plain[i] == L'#' || plain[i] == L'&') && (i == 0 || iswspace(plain[i - 1]) || wcschr(L"([<,:", plain[i - 1]))) {
                 int j = i + 1; while (j < n2 && !iswspace(plain[j]) && !wcschr(L",.;:!?)>]\"'", plain[j])) j++;
@@ -862,8 +892,9 @@ protected:
     // it's gone along with that feature, since a plain color via SetBackgroundColor doesn't have that problem)
     afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClose) onClose(this); }
     BOOL PreTranslateMessage(MSG* p) override {
-        if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0) {   // Ctrl+B/K/U/O/I insert mIRC codes
-            wchar_t c = p->wParam == 'B' ? 2 : p->wParam == 'K' ? 3 : p->wParam == 'U' ? 31 : p->wParam == 'O' ? 15 : p->wParam == 'I' ? 29 : 0;
+        if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0) {   // Ctrl+B/K/U/O/I/R/E insert mIRC codes
+            wchar_t c = p->wParam == 'B' ? 2 : p->wParam == 'K' ? 3 : p->wParam == 'U' ? 31 : p->wParam == 'O' ? 15
+                      : p->wParam == 'I' ? 29 : p->wParam == 'R' ? 22 : p->wParam == 'E' ? 30 : 0;
             if (c) { m_in.ReplaceSel(CString(c)); return TRUE; }
         }
         if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && (p->wParam == VK_UP || p->wParam == VK_DOWN)) {   // command history
@@ -1770,6 +1801,65 @@ BEGIN_MESSAGE_MAP(CColorsDlg, CDialog)
     ON_BN_CLICKED(IDC_CD_DEFAULT, OnDefaultBtn) ON_BN_CLICKED(IDC_CD_HELP, OnHelpBtn)
 END_MESSAGE_MAP()
 
+// ---------------- Logging dialog: chat history on/off and where it's saved (File > Logging...) ----------------
+enum { IDC_LG_ENABLE = 601, IDC_LG_FOLDER, IDC_LG_BROWSE, IDC_LG_HELP };
+class CLoggingDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    bool enabled; CString folder;   // in/out: current settings in, the (possibly edited) settings out if OK is pressed
+    CLoggingDlg(bool en, const CString& fld, CWnd* parent) : enabled(en), folder(fld) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(270); t.push_back(112);
+        t.push_back(0); t.push_back(0); S(L"Logging"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 220, 10, IDC_LG_ENABLE, 0x0080, L"Log chat history to disk");
+        Item(SS_LEFT, 8, 24, 60, 9, 0xFFFF, 0x0082, L"Log folder:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 34, 190, 12, IDC_LG_FOLDER, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 202, 34, 60, 12, IDC_LG_BROWSE, 0x0080, L"Browse...");
+        Item(SS_LEFT, 8, 52, 254, 28, 0xFFFF, 0x0082,
+             L"One file per network and window (e.g. Libera_#channel.log), plain text, appended to on every line.");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 68, 88, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 124, 88, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 180, 88, 50, 14, IDC_LG_HELP, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        CheckDlgButton(IDC_LG_ENABLE, enabled);
+        SetDlgItemText(IDC_LG_FOLDER, folder);
+        return TRUE;
+    }
+    afx_msg void OnBrowse() {
+        BROWSEINFOW bi = {}; wchar_t buf[MAX_PATH] = {};
+        CString cur; GetDlgItemText(IDC_LG_FOLDER, cur);
+        bi.hwndOwner = m_hWnd; bi.pszDisplayName = buf; bi.lpszTitle = L"Choose a folder for chat logs"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+        if (pidl) { if (SHGetPathFromIDListW(pidl, buf)) SetDlgItemText(IDC_LG_FOLDER, buf); CoTaskMemFree(pidl); }
+    }
+    afx_msg void OnHelpBtn() {
+        AfxMessageBox(L"When enabled, every line shown in a status, channel or query window is appended to a plain-text "
+                      L"file in the folder below, one file per network and window. Color codes are stripped; timestamps "
+                      L"are kept. The folder is created automatically if it doesn't exist yet.", MB_ICONINFORMATION);
+    }
+    void OnOK() override {
+        enabled = IsDlgButtonChecked(IDC_LG_ENABLE) != 0;
+        GetDlgItemText(IDC_LG_FOLDER, folder); folder.Trim();
+        CDialog::OnOK();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CLoggingDlg, CDialog)
+    ON_BN_CLICKED(IDC_LG_BROWSE, OnBrowse) ON_BN_CLICKED(IDC_LG_HELP, OnHelpBtn)
+END_MESSAGE_MAP()
+
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
@@ -1780,6 +1870,7 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_swSkinPath, m_tbSkinPath, m_mdiSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp;
     CMdiClient m_mdiWrap;   // the MDI workspace, subclassed once m_hWndMDIClient exists (see Start())
+    bool m_logEnabled = false; CString m_logFolder;   // chat history logging (see LoadLogging/SaveLogging/WriteLog)
     std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
@@ -1904,6 +1995,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
         w->onNickMenu = [this](CChatWnd* c, CString nick, CPoint pt) { ShowNickMenu(c, nick, pt); };
         w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowWindowPopup(c, pt); };
+        w->onLog = [this, net, w](const CString& line) { WriteLog(net, w->m_name, line); };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
@@ -2465,6 +2557,13 @@ class CMainFrame : public CMDIFrameWnd {
         if (dlg.DoModal() != IDOK) return;
         ApplyColorScheme(dlg.Active());
     }
+    afx_msg void OnLoggingDialog() {
+        CLoggingDlg dlg(m_logEnabled, m_logFolder, this);
+        if (dlg.DoModal() != IDOK) return;
+        m_logEnabled = dlg.enabled; m_logFolder = dlg.folder;
+        if (m_logEnabled && !m_logFolder.IsEmpty()) SHCreateDirectoryExW(nullptr, m_logFolder, nullptr);   // create it (and any missing parent folders) up front
+        SaveLogging();
+    }
 
     // ---- the script interpreter: runs an alias body (or a //line) ----
     struct ExecCtx { CChatWnd* w = nullptr; const CString* params = nullptr; CString gotoLabel; };
@@ -2960,6 +3059,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"channel") OpenChannelCentral(w, arg);
         else if (cmd == L"colors") OnColorsDialog();
+        else if (cmd == L"logging") OnLoggingDialog();
         else if (cmd == L"run") {   // /run [-n] file [parameters]: launches a local program or opens a document/URL with its associated app
             CString a = arg; a.TrimLeft(); bool min = false;
             if (a.Left(2).CompareNoCase(L"-n") == 0 && (a.GetLength() == 2 || a[2] == L' ')) { min = true; a = a.Mid(2); a.TrimLeft(); }
@@ -2983,7 +3083,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3130,6 +3230,32 @@ class CMainFrame : public CMDIFrameWnd {
         CString a = abs, d = dir; a.MakeLower(); d.MakeLower();
         return (a.Left(d.GetLength()) == d) ? abs.Mid(dir.GetLength()) : abs;
     }
+    // ---- Logging: chat history saved to disk, one file per network+window (see CLoggingDlg) ----
+    static CString SanitizeFileName(CString s) {   // strips characters Windows won't allow in a file name
+        CString o; for (int i = 0; i < s.GetLength(); i++) { wchar_t c = s[i]; o += wcschr(L"\\/:*?\"<>|", c) ? L'_' : c; }
+        o.Trim(); return o.IsEmpty() ? CString(L"_") : o;
+    }
+    void LoadLogging() {
+        CWinApp* a = AfxGetApp();
+        m_logEnabled = a->GetProfileInt(L"Logging", L"enabled", 0) != 0;
+        m_logFolder = a->GetProfileString(L"Logging", L"folder", IniPath(L"logs"));
+        if (m_logEnabled && !m_logFolder.IsEmpty()) SHCreateDirectoryExW(nullptr, m_logFolder, nullptr);
+    }
+    void SaveLogging() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Logging", L"enabled", m_logEnabled ? 1 : 0);
+        a->WriteProfileString(L"Logging", L"folder", m_logFolder);
+    }
+    void WriteLog(Net* net, const CString& winName, const CString& line) {
+        if (!m_logEnabled || m_logFolder.IsEmpty()) return;
+        CString folder = m_logFolder; if (folder.Right(1) != L"\\") folder += L"\\";
+        CString netTag = (net && !net->tag.IsEmpty()) ? net->tag : (net ? net->o.host : CString(L"unknown"));
+        CString win = winName == L"*status*" ? CString(L"status") : winName;
+        CString path = folder + SanitizeFileName(netTag) + L"_" + SanitizeFileName(win) + L".log";
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f) { fwprintf(f, L"%s\n", (LPCWSTR)line); fclose(f); }
+    }
+
     // ---- Colors dialog: named schemes, stored in IRC.ini as [colors] n0=Name,c1,c2,...,c10 (see CColorsDlg) ----
     static CString PackColor(COLORREF c) { CString s; s.Format(c == CLR_NONE ? L"-1" : L"%d", (int)c); return s; }
     static COLORREF UnpackColor(const CString& s) { long v = _wtol(s); return v < 0 ? CLR_NONE : (COLORREF)v; }
@@ -3528,6 +3654,7 @@ public:
 		LoadVars();
 		LoadPopups();
 		LoadColors(); PushSchemeColors(CurScheme());
+		LoadLogging();
 		LoadSkinPaths();
 		LoadSkinImages();
 		if (m_hWndMDIClient && m_mdiWrap.SubclassWindow(m_hWndMDIClient)) {
@@ -3551,6 +3678,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
         f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
         f.AppendMenu(MF_STRING, IDM_COLORS, L"&Colors...");
+        f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -3675,7 +3803,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
