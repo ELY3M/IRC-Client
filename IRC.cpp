@@ -30,6 +30,7 @@ along with this program.  If not, see <https://gnu.org>.
 #define SECURITY_WIN32
 #include <sspi.h>
 #include <schannel.h>
+#include <shellapi.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "secur32.lib")
 #include <gdiplus.h>
@@ -142,6 +143,14 @@ static CString Word(CString& s) {
     return w;
 }
 static CString Bare(CString s) { s.TrimLeft(L"@+%&~"); return s; }
+// Splits off the first word for /run, honoring a "quoted path" the way mIRC does; what's left (untouched) becomes the parameters.
+static CString RunWord(CString& s) {
+    s.TrimLeft(); CString w;
+    if (!s.IsEmpty() && s[0] == L'"') { int e = s.Find(L'"', 1); if (e > 0) { w = s.Mid(1, e - 1); s = s.Mid(e + 1); s.TrimLeft(); return w; } }
+    int i = s.Find(L' ');
+    if (i < 0) { w = s; s.Empty(); } else { w = s.Left(i); s = s.Mid(i + 1); }
+    return w;
+}
 static CString IniPath(LPCWSTR name) {   // e.g. IniPath(L"servers.ini") -> full path next to the .exe
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     CString p = exe; return p.Left(p.ReverseFind(L'\\') + 1) + name;
@@ -231,7 +240,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -579,7 +588,13 @@ public:
 class CLogEdit : public CRichEditCtrl {
 public:
     std::function<void(CString)> onLink;
+    std::function<bool(CPoint)> onContext;   // right-click: return true if a popup menu was shown (otherwise the default edit menu appears)
 protected:
+    afx_msg void OnContextMenu(CWnd*, CPoint pt) {
+        if (pt.x == -1 && pt.y == -1) GetCursorPos(&pt);
+        if (onContext && onContext(pt)) return;
+        Default();
+    }
     afx_msg void OnLButtonUp(UINT, CPoint p) {
         Default();
         long s = 0, e = 0; GetSel(s, e);
@@ -598,6 +613,7 @@ protected:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CLogEdit, CRichEditCtrl)
+    ON_WM_CONTEXTMENU()
     ON_WM_LBUTTONUP()
 END_MESSAGE_MAP()
 
@@ -608,15 +624,16 @@ class CListWnd;   // forward decl: the /list results window, defined further dow
 // ---------------- Nick list: right-click a nick for Whois / Query / Notice ----------------
 class CNickList : public CListBox {
 public:
-    std::function<void(CString, CPoint)> onRClick;
+    std::function<void(CString, CPoint)> onRClick;   // (the selected nicks, space separated with the clicked one first; screen point)
 protected:
     afx_msg void OnRButtonDown(UINT, CPoint p) {
         BOOL outside = TRUE; int idx = ItemFromPoint(p, outside);
         if (idx < 0 || outside) return;
-        SetCurSel(idx);
-        CString s; GetText(idx, s);
+        if (!GetSel(idx)) { SelItemRange(FALSE, 0, GetCount() - 1); SetSel(idx, TRUE); }   // right-clicking a nick outside the selection selects just that one
+        CString names, s; GetText(idx, s); names = Bare(s);
+        for (int i = 0; i < GetCount(); i++) if (i != idx && GetSel(i) > 0) { GetText(i, s); names += L" " + Bare(s); }
         CPoint sp = p; ClientToScreen(&sp);
-        if (onRClick) onRClick(s, sp);
+        if (onRClick) onRClick(names, sp);
     }
     DECLARE_MESSAGE_MAP()
 };
@@ -631,8 +648,12 @@ public:
     std::function<void(CChatWnd*, CString)> onInput;
     std::function<void(CChatWnd*)> onClose;
     std::function<void(CChatWnd*, CString)> onOpen;      // open/join a nick or #channel, on this window's network
-    std::function<void(CChatWnd*, CString, CPoint)> onNickMenu;   // right-click a nick in the user list
+    std::function<void(CChatWnd*, CString, CPoint)> onNickMenu;   // right-click nick(s) in the user list (the nicks, space separated)
+    std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
+    CString m_topicRaw; std::vector<CString> m_topicHist;   // the channel topic with its colour codes, and earlier topics (most recent first)
+    bool LogHasSelection() { long s = 0, e = 0; m_out.GetSel(s, e); return s != e; }
+    void LogCopy() { m_out.Copy(); }
 
     void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
         m_out.SetSel(-1, -1);
@@ -687,7 +708,15 @@ public:
         m_out.SendMessage(WM_VSCROLL, SB_BOTTOM, 0);
     }
     void Clear() { m_out.SetWindowText(L""); }
-    void SetTopic(const CString& t) { if (m_chan) m_topic.SetWindowText(Strip(t)); }
+    void SetTopic(const CString& t) {
+        if (!m_chan) return;
+        m_topic.SetWindowText(Strip(t));
+        m_topicRaw = t;
+        if (t.IsEmpty()) return;
+        for (size_t i = 0; i < m_topicHist.size(); i++) if (m_topicHist[i] == t) { m_topicHist.erase(m_topicHist.begin() + i); break; }
+        m_topicHist.insert(m_topicHist.begin(), t);
+        if (m_topicHist.size() > 25) m_topicHist.pop_back();
+    }
     void AddNick(const CString& n) { if (m_chan && !n.IsEmpty() && !HasNick(Bare(n))) m_nicks.AddString(n); }
     void ApplyFont(const LOGFONT& lf) {   // called once at creation and again whenever the user changes the font
         m_font.DeleteObject(); m_font.CreateFontIndirectW(&lf);
@@ -729,13 +758,14 @@ protected:
         CRect z(0, 0, 0, 0);
         m_out.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, z, this, 1);
         m_out.LimitText(0x7FFFFFF); m_out.onLink = [this](CString w) { if (onOpen) onOpen(this, w); };
+        m_out.onContext = [this](CPoint pt) { return onLogMenu ? onLogMenu(this, pt) : false; };
         m_in.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, z, this, 2);
         m_font.CreatePointFont(100, DEFAULT_FONT);
         m_out.SetFont(&m_font); m_in.SetFont(&m_font);
         if (m_chan) {
             m_topic.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, z, this, 3);
-            m_nicks.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_SORT | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, z, this, 4);
-            m_nicks.onRClick = [this](CString n, CPoint pt) { if (onNickMenu) onNickMenu(this, Bare(n), pt); };
+            m_nicks.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_SORT | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL, z, this, 4);
+            m_nicks.onRClick = [this](CString n, CPoint pt) { if (onNickMenu) onNickMenu(this, n, pt); };
             m_topic.SetFont(&m_font); m_nicks.SetFont(&m_font);
         }
         return 0;
@@ -750,7 +780,7 @@ protected:
         m_in.MoveWindow(0, cy - h, cx, h);
     }
     afx_msg void OnNickDbl() {   // double-click a nick in the list -> open a query window
-        int i = m_nicks.GetCurSel(); CString n;
+        int i = m_nicks.GetCaretIndex(); CString n;   // (GetCurSel doesn't work on a multiple-selection list)
         if (i >= 0 && onOpen) { m_nicks.GetText(i, n); onOpen(this, Bare(n)); }
     }
     afx_msg void OnSetFocus(CWnd*) { m_in.SetFocus(); }
@@ -884,6 +914,7 @@ END_MESSAGE_MAP()
 
 // ---------------- Net: one IRC connection (its own socket, nick, options and status text) ----------------
 struct Net {
+    CString chanmodes = L"beI,k,l,imnpst";   // from 005 CHANMODES=: list modes, always-parameter modes, set-parameter modes, flags
     CIrcSock sock;
     bool conn = false;
     CString nick = L"User";
@@ -1240,11 +1271,11 @@ class CAliasDlg : public CDialog {
         t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
     }
 public:
-    CAliasDlg(CString& v, CWnd* parent) : val(v) {
+    CAliasDlg(CString& v, CWnd* parent, const wchar_t* title = L"Aliases", const wchar_t* hint = L"One alias per line:  /name commands     (multi-line:  /name {   lines   } )") : val(v) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(340); t.push_back(230);
-        t.push_back(0); t.push_back(0); S(L"Aliases"); t.push_back(9); S(DEFAULT_FONT);
-        Item(SS_LEFT, 6, 6, 328, 10, 0xFFFF, 0x0082, L"One alias per line:  /name commands     (multi-line:  /name {   lines   } )");
+        t.push_back(0); t.push_back(0); S(title); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 6, 6, 328, 10, 0xFFFF, 0x0082, hint);
         Item(WS_BORDER | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN, 6, 20, 328, 184, 101, 0x0081, L"");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 224, 210, 50, 14, IDOK, 0x0080, L"OK");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 280, 210, 50, 14, IDCANCEL, 0x0080, L"Cancel");
@@ -1261,6 +1292,257 @@ public:
     }
     void OnOK() override { GetDlgItemText(101, val); CDialog::OnOK(); }
 };
+
+// ---------------- Popup menus: file format ----------------
+struct PopupItem { CString title; std::vector<CString> cmd; int depth = 0; };   // cmd empty: a submenu heading, a "-" separator, or a plain label
+enum { IDP_BAR = 20000, IDP_CTX = 21000, IDP_COPY = 29999 };   // menu ids: menu-bar popups / the popup being shown / the built-in Copy
+static const wchar_t* const kPopSec[5] = { L"mpopup", L"cpopup", L"qpopup", L"lpopup", L"bpopup" };        // status, channel, query, nick list, menu bar
+static const wchar_t* const kPopType[5] = { L"status", L"channel", L"query", L"nicklist", L"menubar" };   // what $menu returns
+// "Title:/commands" one per line; leading dots make sub menus (".Sub", "..Sub sub"); "-" is a separator; "Title {" ... "}" is a multi-line item.
+static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
+    std::vector<PopupItem> out;
+    for (size_t i = 0; i < in.size(); i++) {
+        CString t = in[i]; t.TrimLeft();
+        if (t.IsEmpty() || t[0] == L';') continue;
+        PopupItem it; int dots = 0; while (dots < t.GetLength() && t[dots] == L'.') dots++;
+        it.depth = dots; t = t.Mid(dots); t.TrimLeft();
+        int c = -1, d = 0;   // the title ends at the first ':' outside parentheses (so $iif(a:b,c) is safe)
+        for (int k = 0; k < t.GetLength(); k++) { if (t[k] == L'(') d++; else if (t[k] == L')' && d > 0) d--; else if (t[k] == L':' && d == 0) { c = k; break; } }
+        CString cmd;
+        if (c >= 0) { it.title = t.Left(c); cmd = t.Mid(c + 1); }
+        else { it.title = t; if (t.Right(1) == L"{" && BraceDelta(t) > 0) { it.title = t.Left(t.GetLength() - 1); cmd = L"{"; } }
+        it.title.Trim(); cmd.Trim();
+        if (!cmd.IsEmpty()) {
+            int db = BraceDelta(cmd);
+            if (db <= 0) {
+                if (cmd.Left(1) == L"{" && cmd.Right(1) == L"}") { cmd = cmd.Mid(1, cmd.GetLength() - 2); cmd.Trim(); }
+                it.cmd.push_back(cmd);
+            } else {   // a { ... } body over several lines
+                bool outer = cmd.Left(1) == L"{";
+                if (outer) { cmd = cmd.Mid(1); cmd.TrimLeft(); }
+                if (!cmd.IsEmpty()) it.cmd.push_back(cmd);
+                while (db > 0 && i + 1 < in.size()) {
+                    CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                    if (db <= 0) {
+                        if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) it.cmd.push_back(head); }
+                        else it.cmd.push_back(l);
+                        break;
+                    }
+                    it.cmd.push_back(l);
+                }
+            }
+        }
+        if (it.title.IsEmpty() && it.cmd.empty()) continue;
+        out.push_back(it);
+    }
+    return out;
+}
+
+// ---------------- Channel Central: /channel  (topic, modes, and the ban / except / invite / quiet lists) ----------------
+enum { IDC_CC_TOPIC = 401, IDC_CC_LISTLBL, IDC_CC_LIST, IDC_CC_BANS, IDC_CC_EXC, IDC_CC_INV, IDC_CC_QUI, IDC_CC_EDIT, IDC_CC_REMOVE, IDC_CC_STATUS,
+       IDC_CC_T, IDC_CC_N, IDC_CC_I, IDC_CC_M, IDC_CC_P, IDC_CC_S, IDC_CC_KEYCK, IDC_CC_KEY, IDC_CC_SHOW, IDC_CC_LIMCK, IDC_CC_LIM, IDC_CC_HELP };
+class CChanCentralDlg : public CDialog {
+    struct Entry { CString mask, by, when; };
+    std::vector<WORD> t; int cnt = 0; CListBox m_list;
+    std::vector<Entry> lists[4]; bool loaded[4] = { false, false, false, false }, requested[4] = { false, false, false, false };
+    int cur = 0; bool origKnown = false; CString origFlags, origKey; int origLimit = 0; bool hasE = true, hasI = true, hasQ = false;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    static std::vector<CString> Groups(const CString& s) {   // "beI,k,l,imnpst" -> 4 groups (empty groups kept)
+        std::vector<CString> g; int st = 0;
+        for (;;) { int c = s.Find(L',', st); if (c < 0) { g.push_back(s.Mid(st)); break; } g.push_back(s.Mid(st, c - st)); st = c + 1; }
+        return g;
+    }
+    static wchar_t Letter(int ty) { return L"beIq"[ty]; }   // the mode letter behind each list: bans, excepts, invites, quiets
+    static CString FmtWhen(const CString& w) {
+        __int64 v = _wtoi64(w); if (v <= 0) return w;
+        return CTime((__time64_t)v).Format(L"%Y-%m-%d %H:%M");
+    }
+    static CString Disp(const Entry& e) {
+        CString s = e.mask;
+        if (!e.by.IsEmpty()) s += L"   set by " + e.by;
+        if (!e.when.IsEmpty()) s += L"   " + FmtWhen(e.when);
+        return s;
+    }
+    void FixExtent() {   // lets the list scroll sideways to fit its longest line
+        CDC* dc = m_list.GetDC(); if (!dc) return;
+        CFont* f = m_list.GetFont(); CFont* old = f ? dc->SelectObject(f) : nullptr;
+        int w = 0;
+        for (int i = 0; i < m_list.GetCount(); i++) { CString s; m_list.GetText(i, s); w = (std::max)(w, (int)dc->GetTextExtent(s).cx); }
+        if (old) dc->SelectObject(old);
+        m_list.ReleaseDC(dc); m_list.SetHorizontalExtent(w + 8);
+    }
+    void UpdateButtons() { BOOL sel = m_list.GetCurSel() != LB_ERR; GetDlgItem(IDC_CC_EDIT)->EnableWindow(sel); GetDlgItem(IDC_CC_REMOVE)->EnableWindow(sel); }
+    void SetStatus(const CString& s) { if (m_hWnd) SetDlgItemText(IDC_CC_STATUS, s); }
+    void RefreshList() {
+        if (!m_hWnd) return;
+        m_list.ResetContent();
+        for (size_t i = 0; i < lists[cur].size(); i++) m_list.AddString(Disp(lists[cur][i]));
+        FixExtent(); UpdateButtons();
+    }
+    CString CountText(int ty) { CString s; s.Format(L"%d entr%s", (int)lists[ty].size(), lists[ty].size() == 1 ? L"y" : L"ies"); return s; }
+    void SwitchList(int ty) {
+        cur = ty; CheckRadioButton(IDC_CC_BANS, IDC_CC_QUI, IDC_CC_BANS + ty);
+        static const wchar_t* nm[4] = { L"Bans", L"Excepts", L"Invites", L"Quiets" };
+        SetDlgItemText(IDC_CC_LISTLBL, CString(nm[ty]) + L" List:");
+        if (!requested[ty] && sendRaw) { requested[ty] = true; sendRaw(L"MODE " + chan + L" +" + CString(Letter(ty))); }   // the lists are fetched when first opened
+        SetStatus(loaded[ty] ? CountText(ty) : CString(L"Loading the list..."));
+        RefreshList();
+    }
+    void ApplyModesToControls() {
+        if (!m_hWnd || !origKnown) return;
+        static const struct { UINT id; wchar_t c; } fl[] = { { IDC_CC_T, L't' }, { IDC_CC_N, L'n' }, { IDC_CC_I, L'i' }, { IDC_CC_M, L'm' }, { IDC_CC_P, L'p' }, { IDC_CC_S, L's' } };
+        for (size_t i = 0; i < sizeof fl / sizeof fl[0]; i++) CheckDlgButton(fl[i].id, origFlags.Find(fl[i].c) >= 0);
+        bool hk = origFlags.Find(L'k') >= 0, hl = origFlags.Find(L'l') >= 0;
+        CheckDlgButton(IDC_CC_KEYCK, hk); SetDlgItemText(IDC_CC_KEY, origKey == L"*" ? CString() : origKey); GetDlgItem(IDC_CC_KEY)->EnableWindow(hk);   // a key the server hides shows as "*"
+        CheckDlgButton(IDC_CC_LIMCK, hl); if (hl) SetDlgItemInt(IDC_CC_LIM, origLimit, FALSE); GetDlgItem(IDC_CC_LIM)->EnableWindow(hl);
+    }
+public:
+    Net* net = nullptr; CString chan, chanModes = L"beI,k,l,imnpst", curTopic; std::vector<CString> topicHist;
+    std::function<void(const CString&)> sendRaw;   // sends a raw line to this channel's server
+
+    CChanCentralDlg(const CString& c, CWnd* parent) : chan(c) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(326); t.push_back(266);
+        t.push_back(0); t.push_back(0); S(L"Channel Central " + chan); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 8, 6, 200, 9, 0xFFFF, 0x0082, L"Topic history:");
+        Item(CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, 8, 16, 310, 90, IDC_CC_TOPIC, 0x0085, L"");
+        Item(SS_LEFT, 8, 36, 200, 9, IDC_CC_LISTLBL, 0x0082, L"Bans List:");
+        Item(LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WS_TABSTOP, 8, 46, 310, 70, IDC_CC_LIST, 0x0083, L"");
+        Item(BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP | WS_TABSTOP, 62, 122, 56, 14, IDC_CC_BANS, 0x0080, L"Bans");
+        Item(BS_AUTORADIOBUTTON | BS_PUSHLIKE, 122, 122, 56, 14, IDC_CC_EXC, 0x0080, L"Excepts");
+        Item(BS_AUTORADIOBUTTON | BS_PUSHLIKE, 182, 122, 56, 14, IDC_CC_INV, 0x0080, L"Invites");
+        Item(BS_AUTORADIOBUTTON | BS_PUSHLIKE, 62, 140, 56, 14, IDC_CC_QUI, 0x0080, L"Quiets");
+        Item(BS_PUSHBUTTON | WS_GROUP | WS_TABSTOP, 122, 140, 56, 14, IDC_CC_EDIT, 0x0080, L"Edit...");
+        Item(BS_PUSHBUTTON, 182, 140, 56, 14, IDC_CC_REMOVE, 0x0080, L"Remove");
+        Item(SS_LEFT, 8, 158, 310, 9, IDC_CC_STATUS, 0x0082, L"");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 170, 140, 10, IDC_CC_T, 0x0080, L"Operators set topic");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 182, 140, 10, IDC_CC_N, 0x0080, L"No external messages");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 194, 140, 10, IDC_CC_I, 0x0080, L"Invite only channel");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 206, 140, 10, IDC_CC_M, 0x0080, L"Moderated channel");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 218, 140, 10, IDC_CC_P, 0x0080, L"Private channel");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 230, 140, 10, IDC_CC_S, 0x0080, L"Secret channel");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 172, 170, 100, 10, IDC_CC_KEYCK, 0x0080, L"Channel key:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, 172, 182, 100, 12, IDC_CC_KEY, 0x0081, L"");
+        Item(BS_AUTOCHECKBOX | BS_PUSHLIKE | WS_TABSTOP, 276, 182, 38, 12, IDC_CC_SHOW, 0x0080, L"Show");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 172, 202, 100, 10, IDC_CC_LIMCK, 0x0080, L"Maximum users:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 172, 214, 46, 12, IDC_CC_LIM, 0x0081, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 76, 246, 52, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 134, 246, 52, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 192, 246, 52, 14, IDC_CC_HELP, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    // ---- called as the server's replies arrive ----
+    void SetModes(const CString& modes, const std::vector<CString>& args) {   // 324: e.g. "+ntkl" with args "secret" "50"
+        std::vector<CString> grp = Groups(chanModes);
+        origKnown = true; origFlags.Empty(); origKey.Empty(); origLimit = 0;
+        size_t ai = 0; bool plus = true;
+        for (int i = 0; i < modes.GetLength(); i++) {
+            wchar_t c = modes[i];
+            if (c == L'+') { plus = true; continue; }
+            if (c == L'-') { plus = false; continue; }
+            if (!plus) continue;
+            origFlags += c;
+            bool takesArg = (grp.size() > 1 && grp[1].Find(c) >= 0) || (grp.size() > 2 && grp[2].Find(c) >= 0);   // these come with a parameter in the reply
+            if (takesArg) { CString a = ai < args.size() ? args[ai++] : CString(); if (c == L'k') origKey = a; else if (c == L'l') origLimit = _wtoi(a); }
+        }
+        ApplyModesToControls();
+        if (!loaded[cur]) SetStatus(L"Loading the list...");
+    }
+    void AddEntry(int ty, const CString& mask, const CString& by, const CString& when) {
+        Entry e; e.mask = mask; e.by = by; e.when = when; lists[ty].push_back(e);
+        if (m_hWnd && ty == cur) { m_list.AddString(Disp(e)); FixExtent(); }
+    }
+    void EndList(int ty) { loaded[ty] = true; if (m_hWnd && ty == cur) SetStatus(CountText(ty)); }
+    void Status(const CString& s) { SetStatus(s); }
+
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        m_list.SubclassDlgItem(IDC_CC_LIST, this);
+        for (size_t i = 0; i < topicHist.size(); i++) SendDlgItemMessage(IDC_CC_TOPIC, CB_ADDSTRING, 0, (LPARAM)(LPCWSTR)topicHist[i]);
+        SetDlgItemText(IDC_CC_TOPIC, curTopic);
+        std::vector<CString> grp = Groups(chanModes);
+        if (!grp.empty()) { hasE = grp[0].Find(L'e') >= 0; hasI = grp[0].Find(L'I') >= 0; hasQ = grp[0].Find(L'q') >= 0; }   // which lists this network has
+        GetDlgItem(IDC_CC_EXC)->EnableWindow(hasE); GetDlgItem(IDC_CC_INV)->EnableWindow(hasI); GetDlgItem(IDC_CC_QUI)->EnableWindow(hasQ);
+        GetDlgItem(IDC_CC_KEY)->EnableWindow(FALSE); GetDlgItem(IDC_CC_LIM)->EnableWindow(FALSE);
+        SendDlgItemMessage(IDC_CC_KEY, EM_SETPASSWORDCHAR, L'*', 0);
+        CheckRadioButton(IDC_CC_BANS, IDC_CC_QUI, IDC_CC_BANS);
+        requested[0] = true;
+        if (sendRaw) { sendRaw(L"MODE " + chan); sendRaw(L"MODE " + chan + L" +b"); }   // ask for the modes and the ban list
+        SetStatus(L"Asking the server for the modes and the ban list...");
+        ApplyModesToControls(); RefreshList();
+        return TRUE;
+    }
+    void OnOK() override {   // only what changed is sent
+        CString tp; GetDlgItemText(IDC_CC_TOPIC, tp);
+        if (sendRaw && tp != curTopic) sendRaw(L"TOPIC " + chan + L" :" + tp);
+        if (sendRaw && origKnown) {
+            static const struct { UINT id; wchar_t c; } fl[] = { { IDC_CC_T, L't' }, { IDC_CC_N, L'n' }, { IDC_CC_I, L'i' }, { IDC_CC_M, L'm' }, { IDC_CC_P, L'p' }, { IDC_CC_S, L's' } };
+            CString plus, minus;
+            for (size_t i = 0; i < sizeof fl / sizeof fl[0]; i++) {
+                bool was = origFlags.Find(fl[i].c) >= 0, now = IsDlgButtonChecked(fl[i].id) != 0;
+                if (now && !was) plus += fl[i].c; else if (!now && was) minus += fl[i].c;
+            }
+            CString line; if (!plus.IsEmpty()) line += L"+" + plus; if (!minus.IsEmpty()) line += L"-" + minus;
+            if (!line.IsEmpty()) sendRaw(L"MODE " + chan + L" " + line);
+            CString key; GetDlgItemText(IDC_CC_KEY, key); key.Trim();
+            bool hadK = origFlags.Find(L'k') >= 0, keepHidden = hadK && origKey == L"*" && key.IsEmpty();
+            bool wantK = IsDlgButtonChecked(IDC_CC_KEYCK) != 0 && (!key.IsEmpty() || keepHidden);
+            if (hadK && !wantK) sendRaw(L"MODE " + chan + L" -k " + (origKey.IsEmpty() ? CString(L"*") : origKey));
+            else if (wantK && !keepHidden && (!hadK || key != origKey)) { if (hadK) sendRaw(L"MODE " + chan + L" -k " + origKey); sendRaw(L"MODE " + chan + L" +k " + key); }
+            int lim = (int)GetDlgItemInt(IDC_CC_LIM, nullptr, FALSE);
+            bool hadL = origFlags.Find(L'l') >= 0, wantL = IsDlgButtonChecked(IDC_CC_LIMCK) != 0 && lim > 0;
+            if (hadL && !wantL) sendRaw(L"MODE " + chan + L" -l");
+            else if (wantL && (!hadL || lim != origLimit)) { CString ls; ls.Format(L"%d", lim); sendRaw(L"MODE " + chan + L" +l " + ls); }
+        }
+        CDialog::OnOK();
+    }
+    afx_msg void OnBans() { SwitchList(0); }
+    afx_msg void OnExc() { SwitchList(1); }
+    afx_msg void OnInv() { SwitchList(2); }
+    afx_msg void OnQui() { SwitchList(3); }
+    afx_msg void OnSel() { UpdateButtons(); }
+    afx_msg void OnRemoveBtn() {   // applied at once, as in mIRC
+        int i = m_list.GetCurSel(); if (i == LB_ERR || i >= (int)lists[cur].size()) return;
+        if (sendRaw) sendRaw(L"MODE " + chan + L" -" + CString(Letter(cur)) + L" " + lists[cur][i].mask);
+        lists[cur].erase(lists[cur].begin() + i); RefreshList(); SetStatus(CountText(cur));
+    }
+    afx_msg void OnEditBtn() {   // replaces the selected mask with an edited one
+        int i = m_list.GetCurSel(); if (i == LB_ERR || i >= (int)lists[cur].size()) return;
+        CString old = lists[cur][i].mask, nm = old;
+        CPromptDlg dlg(nm, L"Edit", L"Mask:", this);
+        if (dlg.DoModal() != IDOK) return;
+        nm.Trim(); if (nm.IsEmpty() || nm == old) return;
+        CString l = CString(Letter(cur));
+        if (sendRaw) sendRaw(L"MODE " + chan + L" -" + l + L"+" + l + L" " + old + L" " + nm);
+        lists[cur][i].mask = nm; RefreshList();
+    }
+    afx_msg void OnKeyCk() { GetDlgItem(IDC_CC_KEY)->EnableWindow(IsDlgButtonChecked(IDC_CC_KEYCK) != 0); }
+    afx_msg void OnLimCk() { GetDlgItem(IDC_CC_LIM)->EnableWindow(IsDlgButtonChecked(IDC_CC_LIMCK) != 0); }
+    afx_msg void OnShow() {   // show / hide the key as you type it
+        SendDlgItemMessage(IDC_CC_KEY, EM_SETPASSWORDCHAR, IsDlgButtonChecked(IDC_CC_SHOW) ? 0 : L'*', 0);
+        GetDlgItem(IDC_CC_KEY)->Invalidate();
+    }
+    afx_msg void OnHelp() {
+        AfxMessageBox(L"Tick the modes you want and press OK; only what you changed is sent.\n\nThe topic is set from the box at the top, and earlier topics are in its drop-down.\n\n"
+                      L"Bans, Excepts, Invites and Quiets switch the list below (a list is fetched the first time you open it; you need to be a channel operator "
+                      L"to see some of them). Select an entry, then Edit... or Remove: those take effect immediately.", MB_ICONINFORMATION);
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CChanCentralDlg, CDialog)
+    ON_BN_CLICKED(IDC_CC_BANS, OnBans) ON_BN_CLICKED(IDC_CC_EXC, OnExc) ON_BN_CLICKED(IDC_CC_INV, OnInv) ON_BN_CLICKED(IDC_CC_QUI, OnQui)
+    ON_BN_CLICKED(IDC_CC_EDIT, OnEditBtn) ON_BN_CLICKED(IDC_CC_REMOVE, OnRemoveBtn) ON_BN_CLICKED(IDC_CC_KEYCK, OnKeyCk)
+    ON_BN_CLICKED(IDC_CC_LIMCK, OnLimCk) ON_BN_CLICKED(IDC_CC_SHOW, OnShow) ON_BN_CLICKED(IDC_CC_HELP, OnHelp)
+    ON_LBN_SELCHANGE(IDC_CC_LIST, OnSel) ON_LBN_DBLCLK(IDC_CC_LIST, OnEditBtn)
+END_MESSAGE_MAP()
 
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
@@ -1393,6 +1675,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
         w->onNickMenu = [this](CChatWnd* c, CString nick, CPoint pt) { ShowNickMenu(c, nick, pt); };
+        w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowWindowPopup(c, pt); };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
@@ -1424,7 +1707,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void Connect(Net* net, const CString& host, UINT port) {
         if (net->sock.m_hSocket != INVALID_SOCKET) net->sock.Close();
-        net->conn = false; net->network.Empty(); net->sock.buf.Empty(); net->sock.sendq.clear();
+        net->conn = false; net->network.Empty(); net->chanmodes = L"beI,k,l,imnpst"; net->sock.buf.Empty(); net->sock.sendq.clear();
         delete net->sock.tls; net->sock.tls = nullptr;
         if (net->o.tls) {
             net->sock.tls = new CTls;
@@ -1435,7 +1718,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (!net->sock.Create() || (!net->sock.Connect(host, port) && GetLastError() != WSAEWOULDBLOCK))
             Note(net, L"Connect failed", cPart);
     }
-    void ShowNickMenu(CChatWnd* c, const CString& nick, CPoint pt) {   // right-click a nick in the user list
+    void ShowNickMenuLegacy(CChatWnd* c, const CString& nick, CPoint pt) {   // the built-in Whois / Query / Notice menu, used when [lpopup] is empty
         Net* net = c->net; if (!net) return;
         CMenu m; m.CreatePopupMenu();
         m.AppendMenu(MF_STRING, 1, L"Whois");
@@ -1486,6 +1769,8 @@ class CMainFrame : public CMDIFrameWnd {
         CTime now = CTime::GetCurrentTime();
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"null") { val.Empty(); return true; }
+        if (name == L"server") { val = (net && net->conn) ? net->o.host : CString(); return true; }   // empty ($null) when not connected
+        if (name == L"menu" || name == L"menutype" || name == L"menucontext") { val = m_menuType; return true; }   // which popup is being built: status channel query nicklist menubar
         if (name == L"prop") { val = m_prop; return true; }         // the .property used to call a custom identifier: $add(1,2).negative
         if (name == L"result") { val = m_result; return true; }     // what the last alias/identifier "return"ed
         if (name == L"error") { val.Empty(); return true; }
@@ -1729,6 +2014,23 @@ class CMainFrame : public CMDIFrameWnd {
             else val = e->name;
             return true;
         }
+        if (name == L"iif") {   // $iif(condition,then[,else]): only the branch that is taken gets evaluated
+            std::vector<CString> parts; CString cur; int depth = 0;
+            for (int k = 0; k < rawArgs.GetLength(); k++) {
+                wchar_t ch = rawArgs[k];
+                if (ch == L'(') depth++; else if (ch == L')' && depth > 0) depth--;
+                if (ch == L',' && depth == 0 && parts.size() < 2) { parts.push_back(cur); cur.Empty(); } else cur += ch;
+            }
+            parts.push_back(cur);
+            if (parts.size() < 2) return false;
+            CString pick = EvalCond(w, parts[0], params) ? parts[1] : (parts.size() > 2 ? parts[2] : CString());
+            pick.Trim(); val = EvalIds(w, pick, params); return true;
+        }
+        if (name == L"style") {   // $style(N) first in a popup item: 1 = checked, 2 = disabled, 3 = both
+            double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 3) return false;
+            val.Format(L"%c%d%c", 0x1E, (int)x, 0x1E); return true;
+        }
+        if (!w && FindAlias(name)) return false;   // no window to run a script in (the menu bar being built): leave it as typed
         if (AliasDef* ad = FindAlias(name)) {   // a user alias used as an identifier: $add(1,2) runs /add with $1=1 $2=2 and gives its "return" value
             if (OnRunStack(ad->name)) return false;
             CString a = EvalIds(w, rawArgs, params), plist; int pos = 0;
@@ -2076,6 +2378,237 @@ class CMainFrame : public CMDIFrameWnd {
         m_runStack.pop_back(); m_prop = savedProp;
     }
 
+    // ---- popup menus: popups.ini  ([mpopup] status  [cpopup] channel  [qpopup] query  [lpopup] nick list  [bpopup] menu bar) ----
+    std::vector<CString> m_popRaw[5];                          // each section's lines, exactly as in the file / editor
+    std::vector<std::vector<CString>> m_bpActs, m_ctxActs;     // what each menu-bar item / each item of the popup being shown runs
+    int m_bpCount = 0; CString m_menuType;                     // how many menu-bar menus were inserted; the value of $menu
+
+    void SeedPopups() {   // used when popups.ini doesn't exist yet
+        static const wchar_t* mp[] = { L"Server", L".Lusers:/lusers", L".Motd:/motd", L".Time:/time", L"Names", L".#mIRC:/names #mirc", L".#irchelp: /names #irchelp",
+            L".names ?:/names #$$?=\"Enter a channel name:\"", L"Join", L".#mIRC:/join #mirc", L".#irchelp:/join #irchelp", L".join ?:/join #$$?=\"Enter a channel to join:\"",
+            L"Query", L".query ?:/query $$?=\"Enter nickname to talk to:\"", L"Other", L".Whois ?:/whois $$?=\"Enter a nickname:\"", L".Query:/query $$?=\"Enter a nickname:\"",
+            L".Nickname:/nick $$?=\"Enter your new nickname:\"", L".Away", L"..Set Away...:/away $$?=\"Enter your away message:\"", L"..Set Back:/away", L".List Channels:/list",
+            L"-", L"Edit Notes:/run notepad.exe notes.txt", L"Quit IRC:/quit Leaving" };
+        static const wchar_t* cp[] = { L"Channel Modes:/channel" };
+        static const wchar_t* qp[] = { L"Info:/uwho $$1", L"Whois:/whois $$1", L"Query:/query $$1", L"-", L"Ignore:/ignore $$1 1 | /closemsg $$1", L"-", L"CTCP",
+            L".Ping:/ctcp $$1 ping", L".Time:/ctcp $$1 time", L".Version:/ctcp $$1 version", L"DCC", L".Send:/dcc send $$1", L".Chat:/dcc chat $$1" };
+        static const wchar_t* lp[] = { L"Info:/uwho $1", L"Whois:/whois $$1", L"Query:/query $$1", L"-", L"Control", L".Ignore:/ignore $$1 1", L".Unignore:/ignore -r $$1 1",
+            L".Op:/mode # +ooo $$1 $2 $3", L".Deop:/mode # -ooo $$1 $2 $3", L".Voice:/mode # +vvv $$1 $2 $3", L".Devoice:/mode # -vvv $$1 $2 $3", L".Kick:/kick # $$1",
+            L".Kick (why):/kick # $$1 $$?=\"Reason:\"", L".Ban:/ban $$1 2", L".Ban, Kick:/ban $$1 2 | /timer 1 3 /kick # $$1", L".Ban, Kick (why):/ban $$1 2 | /timer 1 3 /kick # $$1 $$?=\"Reason:\"",
+            L"CTCP", L".Ping:/ctcp $$1 ping", L".Time:/ctcp $$1 time", L".Version:/ctcp $$1 version", L"DCC", L".Send:/dcc send $$1", L".Chat:/dcc chat $$1", L"-",
+            L"Slap!:/me slaps $$1 around a bit with a large trout" };
+        static const wchar_t* bp[] = { L"Commands", L"Join channel:/join #$$?=\"Enter channel name:\"", L"Part channel:/part #$$?=\"Enter channel name:\"",
+            L"Query user:/query $$?=\"Enter nickname and message:\"", L"Send notice:/notice $$?=\"Enter nickname and message:\"", L"Whois user:/whois $$?=\"Enter nickname:\"",
+            L"Send CTCP", L".Ping:/ctcp $$?=\"Enter nickname:\" ping", L".Time:/ctcp $$?=\"Enter nickname:\" time", L".Version:/ctcp $$?=\"Enter nickname:\" version",
+            L"Set Away", L".On:/away $$?=\"Enter away message:\"", L".Off:/away", L"Invite user:/invite $$?=\"Enter nickname and channel:\"",
+            L"Ban user:/ban $$?=\"Enter channel and nickname:\"", L"Kick user:/kick $$?=\"Enter channel and nickname:\"", L"Ignore user:/ignore $$?=\"Enter nickname:\"",
+            L"Unignore user:/ignore -r $$?=\"Enter nickname:\"", L"Change nick:/nick $$?=\"Enter new nickname:\"", L"Quit IRC:/quit" };
+        auto fill = [&](int sec, const wchar_t* const* a, size_t n) { m_popRaw[sec].clear(); for (size_t i = 0; i < n; i++) m_popRaw[sec].push_back(a[i]); };
+        fill(0, mp, sizeof mp / sizeof mp[0]); fill(1, cp, sizeof cp / sizeof cp[0]); fill(2, qp, sizeof qp / sizeof qp[0]);
+        fill(3, lp, sizeof lp / sizeof lp[0]); fill(4, bp, sizeof bp / sizeof bp[0]);
+    }
+    void SavePopups() {
+        CString path = IniPath(L"popups.ini");
+        for (int s = 0; s < 5; s++) {
+            WritePrivateProfileStringW(kPopSec[s], nullptr, nullptr, path);   // drop the section, then rewrite it in order
+            for (size_t i = 0; i < m_popRaw[s].size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(kPopSec[s], key, m_popRaw[s][i], path); }
+        }
+    }
+    void LoadPopups() {
+        CString path = IniPath(L"popups.ini");
+        for (int s = 0; s < 5; s++) m_popRaw[s].clear();
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { SeedPopups(); SavePopups(); return; }
+        std::vector<wchar_t> buf(262144, 0);
+        for (int s = 0; s < 5; s++) {
+            DWORD n = GetPrivateProfileSectionW(kPopSec[s], buf.data(), (DWORD)buf.size(), path);
+            if (!n) continue;
+            for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_popRaw[s].push_back(line.Mid(eq + 1)); }
+        }
+    }
+    afx_msg void OnPopupEditor(UINT id) {
+        int sec = (int)id - (int)IDM_POPEDIT0; if (sec < 0 || sec > 4) return;
+        static const wchar_t* names[5] = { L"Status window popup", L"Channel window popup", L"Query window popup", L"Nick list popup", L"Menu bar popup" };
+        CString text; for (size_t i = 0; i < m_popRaw[sec].size(); i++) text += m_popRaw[sec][i] + L"\r\n";
+        CAliasDlg dlg(text, this, names[sec], L"One item per line:   Title:/command     .Sub item     -  (separator)     Title {  lines  }");
+        if (dlg.DoModal() != IDOK) return;
+        m_popRaw[sec].clear(); int pos = 0;
+        for (CString piece = text.Tokenize(L"\n", pos); !piece.IsEmpty(); piece = text.Tokenize(L"\n", pos)) { piece.TrimRight(L'\r'); m_popRaw[sec].push_back(piece); }
+        SavePopups();
+        if (sec == 4) RebuildMenuBarPopups();
+    }
+    CChatWnd* ActiveOrStatus() {
+        CChatWnd* a = dynamic_cast<CChatWnd*>(MDIGetActive());
+        if (a) return a;
+        if (!m_nets.empty()) return Status(m_nets.front().get());
+        return nullptr;
+    }
+    void RunPopupLines(CChatWnd* w, const std::vector<CString>& lines, const CString& params) {   // a chosen item: its commands run like an alias body, with $1.. = params
+        if (!w) return;
+        if (m_depth == 0) { m_halt = false; m_steps = 0; }
+        m_depth++; RunScript(w, lines, params); m_depth--;
+    }
+    // $submenu($id($1)) items are replaced by the one-line menu items the identifier returns (called with begin, 1, 2, ... and end).
+    std::vector<PopupItem> ExpandSubmenus(const std::vector<PopupItem>& in, CChatWnd* w, const CString& params) {
+        std::vector<PopupItem> out;
+        for (size_t k = 0; k < in.size(); k++) {
+            const PopupItem& it = in[k];
+            CString t = it.title; t.Trim();
+            if (t.Left(9).CompareNoCase(L"$submenu(") != 0 || t.Right(1) != L")") { out.push_back(it); continue; }
+            if (!w) continue;
+            CString inner = t.Mid(9, t.GetLength() - 10);
+            auto ask = [&](const CString& p) { CString r = EvalIds(w, inner, p); m_halt = false; r.Trim(); return r; };
+            CString begin = ask(CString(L"begin"));
+            std::vector<CString> got;
+            for (int n = 1; n <= 300; n++) { CString nn; nn.Format(L"%d", n); CString r = ask(nn); if (r.IsEmpty()) break; got.push_back(r); }
+            CString end = ask(CString(L"end"));
+            if (got.empty()) continue;
+            CString dots(L'.', it.depth);
+            if (begin == L"-") { PopupItem sp; sp.title = L"-"; sp.depth = it.depth; out.push_back(sp); }
+            for (size_t g = 0; g < got.size(); g++) {
+                std::vector<CString> one; one.push_back(dots + got[g]);
+                std::vector<PopupItem> parsed = ParsePopupItems(one);
+                for (size_t q = 0; q < parsed.size(); q++) out.push_back(parsed[q]);
+            }
+            if (end == L"-") { PopupItem sp; sp.title = L"-"; sp.depth = it.depth; out.push_back(sp); }
+        }
+        return out;
+    }
+    void SkipKids(const std::vector<PopupItem>& items, size_t& i, int depth) { while (i < items.size() && items[i].depth > depth) i++; }
+    // Builds the items at 'depth' (starting at items[i]) into m. Titles are evaluated now, each time, so they can vary ($iif, $style, $1...);
+    // a title that comes out empty hides the item. Ids are handed out from 'base' and what each one runs is recorded in acts.
+    void BuildPopupLevel(CMenu& m, const std::vector<PopupItem>& items, size_t& i, int depth, UINT base, std::vector<std::vector<CString>>& acts, CChatWnd* w, const CString& params) {
+        bool lastSep = true;   // no separator first, none twice in a row, none last
+        while (i < items.size()) {
+            const PopupItem& it = items[i];
+            if (it.depth < depth) break;
+            if (it.depth > depth) { i++; continue; }
+            i++;
+            bool hasKids = i < items.size() && items[i].depth > depth;
+            CString t = EvalIds(w, it.title, params); m_halt = false; t.Trim();
+            UINT flags = 0;
+            while (t.GetLength() >= 3 && t[0] == 0x1E && t[2] == 0x1E) { int n = t[1] - L'0'; if (n & 1) flags |= MF_CHECKED; if (n & 2) flags |= MF_GRAYED; t = t.Mid(3); t.TrimLeft(); }
+            if (t.IsEmpty()) { SkipKids(items, i, depth); continue; }
+            if (t == L"-" && it.cmd.empty()) { if (!lastSep) { m.AppendMenu(MF_SEPARATOR); lastSep = true; } SkipKids(items, i, depth); continue; }
+            if (hasKids) {
+                CMenu sub; sub.CreatePopupMenu();
+                BuildPopupLevel(sub, items, i, depth + 1, base, acts, w, params);
+                if (sub.GetMenuItemCount() > 0) { m.AppendMenu(MF_POPUP | flags, (UINT_PTR)sub.Detach(), t); lastSep = false; }
+            } else if (!it.cmd.empty() && acts.size() < 900) {
+                m.AppendMenu(MF_STRING | flags, base + (UINT)acts.size(), t); acts.push_back(it.cmd); lastSep = false;
+            } else { m.AppendMenu(MF_STRING | MF_GRAYED, 0, t); lastSep = false; }
+        }
+        int n = m.GetMenuItemCount();
+        if (lastSep && n > 0) m.DeleteMenu(n - 1, MF_BYPOSITION);
+    }
+    // Shows popup section 'sec' for window w at pt; params are $1 $2 ... (the selected nicks, or the query's nick). Returns false if that
+    // popup has nothing to show, so the caller can fall back to the default menu.
+    bool ShowContextPopup(CChatWnd* w, int sec, const CString& params, CPoint pt, bool canCopy) {
+        if (!w || m_popRaw[sec].empty()) return false;
+        if (m_depth == 0) { m_halt = false; m_steps = 0; }
+        m_depth++;
+        m_menuType = kPopType[sec];
+        std::vector<PopupItem> items = ExpandSubmenus(ParsePopupItems(m_popRaw[sec]), w, params);
+        CMenu m; m.CreatePopupMenu(); m_ctxActs.clear();
+        if (canCopy) { m.AppendMenu(MF_STRING, IDP_COPY, L"Copy"); m.AppendMenu(MF_SEPARATOR); }
+        int before = m.GetMenuItemCount(); size_t i = 0;
+        BuildPopupLevel(m, items, i, 0, IDP_CTX, m_ctxActs, w, params);
+        m_depth--;
+        if (m.GetMenuItemCount() <= before) return false;
+        SetForegroundWindow(); m_menuOpen = true;
+        int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
+        if (cmd == IDP_COPY) w->LogCopy();
+        else if (cmd >= IDP_CTX && (size_t)(cmd - IDP_CTX) < m_ctxActs.size()) { std::vector<CString> lines = m_ctxActs[cmd - IDP_CTX]; RunPopupLines(w, lines, params); }
+        return true;
+    }
+    bool ShowWindowPopup(CChatWnd* c, CPoint pt) {   // right-click in a chat log: status / channel / query popup
+        int sec = c->m_name == L"*status*" ? 0 : (c->m_chan ? 1 : 2);
+        CString params; if (sec == 2) params = c->m_name;   // in a query window $1 is the person you're talking to
+        return ShowContextPopup(c, sec, params, pt, c->LogHasSelection());
+    }
+    void ShowNickMenu(CChatWnd* c, const CString& nicks, CPoint pt) {   // right-click nick(s) in the user list: [lpopup], or the built-in menu if it's empty
+        if (ShowContextPopup(c, 3, nicks, pt, false)) return;
+        CString rest = nicks, first = Word(rest);
+        ShowNickMenuLegacy(c, first, pt);
+    }
+    int FindMenuBarIndex(const wchar_t* name) {
+        int n = m_menu.GetMenuItemCount();
+        for (int i = 0; i < n; i++) { CString s; m_menu.GetMenuString(i, s, MF_BYPOSITION); s.Remove(L'&'); if (s.CompareNoCase(name) == 0) return i; }
+        return -1;
+    }
+    // [bpopup]: a bare top-level heading (no command, no sub items) names a menu-bar menu that takes the top-level items after it;
+    // with no such heading, each top-level item that has sub items becomes a menu of its own.
+    void RebuildMenuBarPopups() {
+        if (!m_menu.GetSafeHmenu()) return;
+        int win = FindMenuBarIndex(L"Window"); if (win < 0) return;
+        for (int k = 0; k < m_bpCount && win - m_bpCount >= 0; k++) m_menu.DeleteMenu(win - m_bpCount, MF_BYPOSITION);
+        m_bpCount = 0; m_bpActs.clear();
+        win = FindMenuBarIndex(L"Window"); if (win < 0) return;
+        std::vector<PopupItem> items = ParsePopupItems(m_popRaw[4]);
+        struct Grp { CString title; std::vector<PopupItem> items; };
+        std::vector<Grp> groups; int cur = -1;
+        for (size_t i = 0; i < items.size();) {
+            size_t j = i + 1; while (j < items.size() && items[j].depth > items[i].depth) j++;   // this item and its sub items are [i, j)
+            const PopupItem& it = items[i];
+            if (it.depth != 0) { i = j; continue; }
+            bool bare = (j == i + 1) && it.cmd.empty() && it.title != L"-";
+            if (bare) { Grp g; g.title = it.title; groups.push_back(g); cur = (int)groups.size() - 1; }
+            else if (cur >= 0) { for (size_t k = i; k < j; k++) groups[cur].items.push_back(items[k]); }
+            else if (j > i + 1) { Grp g; g.title = it.title; for (size_t k = i + 1; k < j; k++) { PopupItem c2 = items[k]; c2.depth--; g.items.push_back(c2); } groups.push_back(g); }
+            else { Grp g; g.title = L"Popups"; g.items.push_back(it); groups.push_back(g); cur = (int)groups.size() - 1; }
+            i = j;
+        }
+        m_menuType = L"menubar"; int pos = win;
+        for (size_t g = 0; g < groups.size(); g++) {
+            if (groups[g].items.empty()) continue;
+            CMenu sub; sub.CreatePopupMenu(); size_t i = 0;
+            BuildPopupLevel(sub, groups[g].items, i, 0, IDP_BAR, m_bpActs, nullptr, CString());
+            if (sub.GetMenuItemCount() == 0) continue;
+            CString title = EvalIds(nullptr, groups[g].title, CString()); m_halt = false; title.Trim();
+            if (title.IsEmpty()) title = groups[g].title;
+            m_menu.InsertMenu(pos++, MF_BYPOSITION | MF_POPUP, (UINT_PTR)sub.Detach(), title);
+            m_bpCount++;
+        }
+        DrawMenuBar();
+    }
+    afx_msg void OnMenubarPopup(UINT id) {   // an item of a menu-bar popup: runs in the window you're in
+        size_t idx = (size_t)id - IDP_BAR; if (idx >= m_bpActs.size()) return;
+        std::vector<CString> lines = m_bpActs[idx];
+        CChatWnd* w = ActiveOrStatus();
+        if (w) RunPopupLines(w, lines, CString());
+    }
+
+    // ---- /channel: Channel Central ----
+    CChanCentralDlg* m_cc = nullptr;   // the dialog while it's open, so the server's replies can be routed to it
+    void OpenChannelCentral(CChatWnd* w, CString arg) {
+        Net* net = w->net; if (!net) return;
+        CString a = arg, chan = Word(a);
+        if (chan.IsEmpty() && w->m_chan) chan = w->m_name;
+        if (chan.IsEmpty() || !wcschr(L"#&+!", chan[0])) { Show(w, L"* Usage: /channel [#channel]   (or use it in a channel window)", cPart); return; }
+        if (!net->conn) { Show(w, L"* Not connected.", cPart); return; }
+        if (m_cc) return;   // one at a time
+        CChanCentralDlg dlg(chan, this);
+        dlg.net = net; dlg.chanModes = net->chanmodes;
+        if (CChatWnd* cw = Find(net, chan)) { dlg.curTopic = cw->m_topicRaw; dlg.topicHist = cw->m_topicHist; }
+        dlg.sendRaw = [this, net](const CString& l) { Send(net, l); };
+        m_cc = &dlg;
+        dlg.DoModal();   // its constructor-side setup asks the server for the modes and ban list; the replies arrive through HandleCCNumeric
+        m_cc = nullptr;
+    }
+    bool HandleCCNumeric(Net* net, const CString& cmd, const std::vector<CString>& p) {
+        if (!m_cc || m_cc->net != net) return false;
+        auto P = [&](size_t i) { return i < p.size() ? p[i] : CString(); };
+        if (P(1).CompareNoCase(m_cc->chan) != 0) return false;   // every reply we care about names the channel as its first parameter after our nick
+        if (cmd == L"324") { std::vector<CString> args; for (size_t i = 3; i < p.size(); i++) args.push_back(p[i]); m_cc->SetModes(P(2), args); return true; }   // RPL_CHANNELMODEIS
+        if (cmd == L"329") return true;                                                                                                  // channel creation time: not shown
+        if (cmd == L"367") { m_cc->AddEntry(0, P(2), P(3), P(4)); return true; }   if (cmd == L"368") { m_cc->EndList(0); return true; }   // bans
+        if (cmd == L"348") { m_cc->AddEntry(1, P(2), P(3), P(4)); return true; }   if (cmd == L"349") { m_cc->EndList(1); return true; }   // excepts
+        if (cmd == L"346") { m_cc->AddEntry(2, P(2), P(3), P(4)); return true; }   if (cmd == L"347") { m_cc->EndList(2); return true; }   // invites
+        if (cmd == L"728") { m_cc->AddEntry(3, P(3), P(4), P(5)); return true; }   if (cmd == L"729") { m_cc->EndList(3); return true; }   // quiets (charybdis-style servers)
+        if (cmd == L"482") { m_cc->Status(P(2)); return true; }                                                                          // "You're not channel operator"
+        return false;
+    }
+
     // ---- user input ----
     void OnInput(CChatWnd* w, CString s) {   // whatever was typed (or issued from a menu)
         if (s.IsEmpty()) return;
@@ -2190,9 +2723,31 @@ class CMainFrame : public CMDIFrameWnd {
             if (gone) { SaveAliases(); Show(w, L"* Alias /" + name + L" removed", cInfo); }
             else Show(w, L"* No such alias: " + name, cInfo);
         }
+        else if (cmd == L"channel") OpenChannelCentral(w, arg);
+        else if (cmd == L"run") {   // /run [-n] file [parameters]: launches a local program or opens a document/URL with its associated app
+            CString a = arg; a.TrimLeft(); bool min = false;
+            if (a.Left(2).CompareNoCase(L"-n") == 0 && (a.GetLength() == 2 || a[2] == L' ')) { min = true; a = a.Mid(2); a.TrimLeft(); }
+            CString file = RunWord(a), params = a;   // whatever's left, unsplit, is passed straight through as the parameters
+            if (file.IsEmpty()) { Show(w, L"* Usage: /run [-n] <file> [parameters]", cPart); return; }
+            HINSTANCE r = ShellExecuteW(m_hWnd, nullptr, file, params.IsEmpty() ? nullptr : (LPCWSTR)params, nullptr, min ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
+            if ((INT_PTR)r <= 32) {
+                wchar_t msg[256]; FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, (DWORD)(INT_PTR)r, 0, msg, 256, nullptr);
+                CString e = msg; e.TrimRight(L"\r\n");
+                Show(w, L"* /run: couldn't start '" + file + L"' (" + e + L")", cPart);
+            }
+        }
+        else if (cmd == L"away") Send(net, arg.IsEmpty() ? CString(L"AWAY") : L"AWAY :" + arg);
+        else if (cmd == L"kick") {   // /kick [#chan] nick [reason]: the reason is sent as trailing text so it can be several words
+            CString a = arg, first = Word(a), chan, nick;
+            if (!first.IsEmpty() && wcschr(L"#&+!", first[0])) { chan = first; nick = Word(a); }
+            else { chan = w->m_chan ? w->m_name : CString(); nick = first; }
+            a.Trim();
+            if (chan.IsEmpty() || nick.IsEmpty()) Note(net, L"Usage: /kick [#channel] <nick> [reason]", cPart);
+            else Send(net, L"KICK " + chan + L" " + nick + (a.IsEmpty() ? CString() : L" :" + a));
+        }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -2213,8 +2768,12 @@ class CMainFrame : public CMDIFrameWnd {
 
         if (cmd == L"005") {   // RPL_ISUPPORT: pick out NETWORK=<name> for $network (the line itself still prints below, as before)
             size_t last = hasT ? p.size() - 1 : p.size();   // the trailing "are supported by this server" isn't a token
-            for (size_t i = 1; i < last; i++) if (p[i].Left(8).CompareNoCase(L"NETWORK=") == 0) net->network = p[i].Mid(8);
+            for (size_t i = 1; i < last; i++) {
+                if (p[i].Left(8).CompareNoCase(L"NETWORK=") == 0) net->network = p[i].Mid(8);
+                if (p[i].Left(10).CompareNoCase(L"CHANMODES=") == 0) net->chanmodes = p[i].Mid(10);   // e.g. beI,k,l,imnpst  (a comma-separated four groups)
+            }
         }
+        if (m_cc && HandleCCNumeric(net, cmd, p)) return;   // 324 mode reply, 367/348/346/728 list entries and their end markers
         if (cmd == L"PING") { Send(net, L"PONG :" + P(0)); }
         else if (cmd == L"PRIVMSG" || cmd == L"NOTICE") {
             CString tgt = P(0), txt = P(1); bool notice = cmd == L"NOTICE";
@@ -2648,6 +3207,7 @@ public:
         LoadFavs();
 		LoadAliases();
 		LoadVars();
+		LoadPopups();
 		LoadSkinPaths();
 		LoadSkinImages();
         CMenu f, s, c, w, h;
@@ -2657,6 +3217,13 @@ public:
         f.AppendMenu(MF_SEPARATOR); 
         f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
         f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
+        { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
+          ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
+          ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
+          ps.AppendMenu(MF_STRING, IDM_POPEDIT2, L"&Query window...");
+          ps.AppendMenu(MF_STRING, IDM_POPEDIT3, L"&Nick list...");
+          ps.AppendMenu(MF_STRING, IDM_POPEDIT4, L"&Menu bar...");
+          f.AppendMenu(MF_POPUP, (UINT_PTR)ps.Detach(), L"&Popups"); }
         f.AppendMenu(MF_STRING, IDM_SERVERS, L"&Server List...");
         f.AppendMenu(MF_STRING, IDM_CHANFAVS, L"Channel F&avorites...");
         f.AppendMenu(MF_SEPARATOR); 
@@ -2676,6 +3243,7 @@ public:
         m_menu.AppendMenu(MF_POPUP, (UINT_PTR)w.Detach(), L"&Window");
 		m_menu.AppendMenu(MF_POPUP, (UINT_PTR)h.Detach(), L"&Help");   
         SetMenu(&m_menu); DrawMenuBar();
+        RebuildMenuBarPopups();   // the [bpopup] menus from popups.ini go in before "Window"
         static UINT ind[4] = { 0, 0, 0, 0 };
         m_bar.Create(this); m_bar.SetIndicators(ind, 4);
         m_bar.SetPaneInfo(0, 0, SBPS_STRETCH, 100); m_bar.SetPaneInfo(1, 0, SBPS_NORMAL, 130);
@@ -2775,6 +3343,8 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_EXIT, OnExit) 
     ON_COMMAND(IDM_FONT, OnFont) 
 	ON_COMMAND(IDM_ALIASES, OnAliasEditor) 
+	ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) 
+	ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
