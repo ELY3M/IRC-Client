@@ -485,7 +485,7 @@ END_MESSAGE_MAP()
 class CColorSwatch : public CStatic {
 public:
     COLORREF color = RGB(255,255,255);
-    std::function<void()> onClick;
+    std::function<void()> onClick, onClear;   // left click: choose a color. right click: reset to "use the default" (CLR_NONE)
 protected:
     afx_msg void OnPaint() {
         CPaintDC dc(this); CRect r; GetClientRect(r);
@@ -494,12 +494,14 @@ protected:
     }
     afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }
     afx_msg void OnLButtonUp(UINT, CPoint) { if (onClick) onClick(); }
+    afx_msg void OnRButtonUp(UINT, CPoint) { if (onClear) onClear(); }
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CColorSwatch, CStatic)
     ON_WM_PAINT()
     ON_WM_ERASEBKGND()
     ON_WM_LBUTTONUP()
+    ON_WM_RBUTTONUP()
 END_MESSAGE_MAP()
 
 class CAboutDlg : public CDialog {
@@ -623,6 +625,11 @@ class CLogEdit : public CRichEditCtrl {
 public:
     std::function<void(CString)> onLink;
     std::function<bool(CPoint)> onContext;   // right-click: return true if a popup menu was shown (otherwise the default edit menu appears)
+    // Background color only -- an image here was tried and abandoned (see CMainFrame's Colors/background notes):
+    // RichEdit's own internal painting actively fights anything external trying to draw its background, in ways
+    // that never fully resolved. A plain color goes through RichEdit's own native mechanism instead (see
+    // CChatWnd::ApplyColors' call to SetBackgroundColor), which doesn't have that problem.
+    COLORREF bgColor = CLR_NONE;
 protected:
     afx_msg void OnContextMenu(CWnd*, CPoint pt) {   // keyboard-invoked only (Shift+F10 / Menu key): those still arrive this way
         if (pt.x == -1 && pt.y == -1) GetCursorPos(&pt);
@@ -630,17 +637,12 @@ protected:
         Default();
     }
     // A real right-click is caught here directly rather than relying on Windows to synthesize WM_CONTEXTMENU
-    // afterward, since that synthesis isn't reliably reaching this control (observed: it stopped once the control
-    // started skipping its own background erase, below). Handling the raw click ourselves sidesteps that entirely.
+    // afterward, since that synthesis isn't reliably reaching this control. Handling the raw click ourselves
+    // sidesteps that entirely.
     afx_msg void OnRButtonUp(UINT, CPoint p) {
         CPoint sp = p; ClientToScreen(&sp);
         if (!onContext || !onContext(sp)) Default();   // Default() here still lets Windows show its own Copy/Paste menu when we decline
     }
-    // Never erase: skipping the erase here is what lets CBgPane's picture (or its own plain white, when there's no
-    // image) show through underneath, since RichEdit's own default erase would otherwise paint an opaque background
-    // over it every time. Text itself stays transparent via Put()'s use of CFE_AUTOBACKCOLOR, so it draws directly
-    // on top of whatever CBgPane has already painted.
-    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }
     afx_msg void OnLButtonUp(UINT, CPoint p) {
         Default();
         long s = 0, e = 0; GetSel(s, e);
@@ -662,7 +664,6 @@ BEGIN_MESSAGE_MAP(CLogEdit, CRichEditCtrl)
     ON_WM_CONTEXTMENU()
     ON_WM_RBUTTONUP()
     ON_WM_LBUTTONUP()
-    ON_WM_ERASEBKGND()
 END_MESSAGE_MAP()
 
 // ---------------- MDI child: status / channel / query window ----------------
@@ -687,47 +688,6 @@ protected:
 };
 BEGIN_MESSAGE_MAP(CNickList, CListBox)
     ON_WM_RBUTTONDOWN()
-END_MESSAGE_MAP()
-
-// A background image behind the chat log is more reliable as a plain window sitting one level down in z-order than
-// as a hook into RichEdit's own paint messages: RichEdit doesn't reliably call back through WM_ERASEBKGND on every
-// occasion that matters (activating a window, maximizing, etc.), so that approach could show the image once and then
-// lose it for good. A plain window's own WM_PAINT does not have that problem. The log itself is marked
-// WS_EX_TRANSPARENT (see CChatWnd::OnCreate) so Windows paints this pane before the log paints on top of it; the log
-// also never receives mouse input meant for this pane, since OnNcHitTest below removes it from hit-testing entirely.
-class CBgPane : public CWnd {
-public:
-    Gdiplus::Bitmap* skin = nullptr;
-    COLORREF bgColor = CLR_NONE;   // CLR_NONE = use the system window colour (the default, until the Colors dialog sets one)
-    BOOL Create(CWnd* parent, UINT id) {
-        return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_WINDOW + 1)), nullptr,
-                            WS_CHILD | WS_VISIBLE, CRect(0, 0, 0, 0), parent, id);
-    }
-protected:
-    std::unique_ptr<Gdiplus::Bitmap> m_scaled; CSize m_scaledSize; Gdiplus::Bitmap* m_scaledSrc = nullptr;   // cached, pre-stretched to the current size
-    afx_msg void OnPaint() {
-        CPaintDC dc(this); CRect r; GetClientRect(r);
-        if (!skin) { dc.FillSolidRect(r, bgColor == CLR_NONE ? ::GetSysColor(COLOR_WINDOW) : bgColor); return; }
-        if (r.Width() <= 0 || r.Height() <= 0) return;
-        if (!m_scaled || m_scaledSize != r.Size() || m_scaledSrc != skin) {
-            auto scaled = std::make_unique<Gdiplus::Bitmap>(r.Width(), r.Height(), PixelFormat24bppRGB);
-            Gdiplus::Graphics gs(scaled.get());
-            gs.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            gs.DrawImage(skin, 0, 0, r.Width(), r.Height());
-            m_scaled = std::move(scaled); m_scaledSize = r.Size(); m_scaledSrc = skin;
-        }
-        Gdiplus::Graphics g(dc.m_hDC); g.DrawImage(m_scaled.get(), 0, 0);
-    }
-    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }   // OnPaint always fully repaints its own area (image or plain color)
-    // Pure decoration: this window must never be the one that receives a click, no matter what the actual z-order
-    // turns out to be. HTTRANSPARENT tells Windows to keep looking past this window for mouse-message purposes.
-    afx_msg LRESULT OnNcHitTest(CPoint) { return HTTRANSPARENT; }
-    DECLARE_MESSAGE_MAP()
-};
-BEGIN_MESSAGE_MAP(CBgPane, CWnd)
-    ON_WM_PAINT()
-    ON_WM_ERASEBKGND()
-    ON_WM_NCHITTEST()
 END_MESSAGE_MAP()
 
 class CChatWnd : public CMDIChildWnd {
@@ -838,13 +798,16 @@ public:
     }
     bool HasNick(const CString& n) { return FindNick(n) >= 0; }
     bool DelNick(const CString& n) { int i = FindNick(n); if (i < 0) return false; m_nicks.DeleteString(i); return true; }
-    void SetLogBg(Gdiplus::Bitmap* bmp) { m_bgPic.skin = bmp; if (m_bgPic.m_hWnd) m_bgPic.Invalidate(); }   // the shared background image (see CMainFrame::SetChatSkin)
-    // The chat background color (behind the log, only visible where there's no image), and the editbox / nicklist
+    // (background image on the chat log itself was tried and abandoned -- see the notes on CLogEdit)
+    // The chat background color (behind the log text, only visible where there's no image), and the editbox / nicklist
     // background colors; CLR_NONE means "use the system default" for that one. See CMainFrame::ApplyColorScheme.
     COLORREF m_editBg = CLR_NONE, m_nickBg = CLR_NONE;
     CBrush m_editBrush, m_nickBrush;
     void ApplyColors(COLORREF chatBg, COLORREF editBg, COLORREF nickBg) {
-        m_bgPic.bgColor = chatBg; if (m_bgPic.m_hWnd) m_bgPic.Invalidate();
+        m_out.bgColor = chatBg;
+        // RichEdit's own native background-color mechanism handles this correctly (unlike trying to paint it
+        // ourselves -- see the notes on CLogEdit and this app's Colors feature for why that was abandoned).
+        if (m_out.m_hWnd) { m_out.SetBackgroundColor(chatBg == CLR_NONE, chatBg); m_out.Invalidate(); }
         m_editBg = editBg; if (m_editBrush.m_hObject) m_editBrush.DeleteObject();
         if (editBg != CLR_NONE) m_editBrush.CreateSolidBrush(editBg);
         m_nickBg = nickBg; if (m_nickBrush.m_hObject) m_nickBrush.DeleteObject();
@@ -856,15 +819,12 @@ public:
 protected:
     long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = L"Consolas"; bool m_baseBold = false, m_baseItalic = false;
     std::vector<CString> m_hist; int m_histPos = -1;   // per-window input history; -1 = not currently browsing it
-    CLogEdit m_out; CBgPane m_bgPic; CEdit m_in, m_topic; CNickList m_nicks; CFont m_font;
+    CLogEdit m_out; CEdit m_in, m_topic; CNickList m_nicks; CFont m_font;
 
     afx_msg int OnCreate(LPCREATESTRUCT cs) {
         if (CMDIChildWnd::OnCreate(cs) == -1) return -1;
         CRect z(0, 0, 0, 0);
-        m_bgPic.Create(this, 5);   // created first so the log (below) sits on top of it in z-order
         m_out.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, z, this, 1);
-        m_out.ModifyStyleEx(0, WS_EX_TRANSPARENT);   // needed for reliable paint ordering against m_bgPic (removing this brought back the image dropping out)
-        m_out.BringWindowToTop();                    // belt-and-suspenders: guarantees m_out is the one that receives mouse input over this area, not m_bgPic
         m_out.LimitText(0x7FFFFFF); m_out.onLink = [this](CString w) { if (onOpen) onOpen(this, w); };
         m_out.onContext = [this](CPoint pt) { return onLogMenu ? onLogMenu(this, pt) : false; };
         m_in.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, z, this, 2);
@@ -884,7 +844,6 @@ protected:
         int h = 22, top = m_chan ? h : 0, nw = m_chan ? 140 : 0;
         if (m_chan) m_topic.MoveWindow(0, 0, cx, h);
         m_out.MoveWindow(0, top, cx - nw, cy - top - h);
-        m_bgPic.MoveWindow(0, top, cx - nw, cy - top - h);
         if (m_chan) m_nicks.MoveWindow(cx - nw, top, nw, cy - top - h);
         m_in.MoveWindow(0, cy - h, cx, h);
     }
@@ -899,12 +858,8 @@ protected:
         if (w->m_hWnd == m_nicks.m_hWnd && m_nickBg != CLR_NONE) { dc->SetBkColor(m_nickBg); return (HBRUSH)m_nickBrush; }
         return br;
     }
-    // MDI's own activate/maximize transition can repaint the control through a path that skips our background image
-    // (it briefly shows, then reverts to plain white and stays that way). Forcing a real erase+repaint on activation fixes it.
-    afx_msg void OnMDIActivate(BOOL bActivate, CWnd* pActivateWnd, CWnd* pDeactivateWnd) {
-        CMDIChildWnd::OnMDIActivate(bActivate, pActivateWnd, pDeactivateWnd);
-        if (bActivate && m_out.m_hWnd) m_out.Invalidate(TRUE);
-    }
+    // (the MDI-activate repaint timer that used to live here was specifically to fight the background-image race;
+    // it's gone along with that feature, since a plain color via SetBackgroundColor doesn't have that problem)
     afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClose) onClose(this); }
     BOOL PreTranslateMessage(MSG* p) override {
         if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0) {   // Ctrl+B/K/U/O/I insert mIRC codes
@@ -946,7 +901,6 @@ BEGIN_MESSAGE_MAP(CChatWnd, CMDIChildWnd)
     ON_WM_SIZE() 
     ON_WM_SETFOCUS() 
     ON_WM_DESTROY()
-    ON_WM_MDIACTIVATE()
     ON_WM_CTLCOLOR()
     ON_LBN_DBLCLK(4, OnNickDbl)
 END_MESSAGE_MAP()
@@ -1447,7 +1401,7 @@ public:
 
 // ---------------- Popup menus: file format ----------------
 struct PopupItem { CString title; std::vector<CString> cmd; int depth = 0; };   // cmd empty: a submenu heading, a "-" separator, or a plain label
-enum { IDP_BAR = 20000, IDP_CTX = 21000, IDP_COPY = 29999, IDP_BG_SET = 29998, IDP_BG_CLEAR = 29997 };   // menu ids: menu-bar popups / the popup being shown / the built-ins
+enum { IDP_BAR = 20000, IDP_CTX = 21000, IDP_COPY = 29999 };   // menu ids: menu-bar popups / the popup being shown / the built-in Copy
 static const wchar_t* const kPopSec[5] = { L"mpopup", L"cpopup", L"qpopup", L"lpopup", L"bpopup" };        // status, channel, query, nick list, menu bar
 static const wchar_t* const kPopType[5] = { L"status", L"channel", L"query", L"nicklist", L"menubar" };   // what $menu returns
 // "Title:/commands" one per line; leading dots make sub menus (".Sub", "..Sub sub"); "-" is a separator; "Title {" ... "}" is a multi-line item.
@@ -1764,8 +1718,11 @@ public:
         CDialog::OnInitDialog();
         m_list.SubclassDlgItem(IDC_CD_LIST, this);
         m_bgSwatch.SubclassDlgItem(IDC_CD_BG, this); m_bgSwatch.onClick = [this] { Pick(&ColorScheme::chatBg); };
+        m_bgSwatch.onClear = [this] { work[cur].chatBg = CLR_NONE; UpdateSwatches(); };
         m_editSwatch.SubclassDlgItem(IDC_CD_EDIT, this); m_editSwatch.onClick = [this] { Pick(&ColorScheme::editBg); };
+        m_editSwatch.onClear = [this] { work[cur].editBg = CLR_NONE; UpdateSwatches(); };
         m_nickSwatch.SubclassDlgItem(IDC_CD_NICK, this); m_nickSwatch.onClick = [this] { Pick(&ColorScheme::nickBg); };
+        m_nickSwatch.onClear = [this] { work[cur].nickBg = CLR_NONE; UpdateSwatches(); };
         for (int i = 0; i < 7; i++) m_list.AddString(kNames[i]);
         RefillSchemeCombo(); SelectScheme(cur);
         return TRUE;
@@ -1797,8 +1754,8 @@ public:
         AfxMessageBox(L"Pick a scheme, or use New... to start one from the current colors.\n\n"
                       L"The list on the left is the color used for each kind of message text; select one and click Choose... "
                       L"to change it. Background, Editbox and Nicklist are separate: click one of those boxes directly to "
-                      L"change that area's background color.\n\nDefault resets the selected scheme's colors (not its name). "
-                      L"Changes only take effect once you click OK.", MB_ICONINFORMATION);
+                      L"change that area's background color; right-click one to reset it back to the default.\n\n"
+                      L"Default resets the selected scheme's colors (not its name). Changes only take effect once you click OK.", MB_ICONINFORMATION);
     }
     void OnOK() override { out = work; CDialog::OnOK(); }
     int Active() const { return cur; }
@@ -1820,8 +1777,8 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<ChanFav> m_favs;         // saved channel favorites (channels.ini)
     CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
     int m_tbIcon = 16;   // toolbar icon edge in pixels (24 with the resource strip, 16 for the drawn fallback)
-    CString m_swSkinPath, m_tbSkinPath, m_mdiSkinPath, m_chatSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
-    std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp, m_chatSkinBmp;
+    CString m_swSkinPath, m_tbSkinPath, m_mdiSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
+    std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp;
     CMdiClient m_mdiWrap;   // the MDI workspace, subclassed once m_hWndMDIClient exists (see Start())
     std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
@@ -1950,7 +1907,6 @@ class CMainFrame : public CMDIFrameWnd {
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         w->ApplyFont(m_chatFont);
-        w->SetLogBg(m_chatSkinBmp.get());
         { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
         m_w[Key(net, name)] = w;
         return w;
@@ -2780,9 +2736,9 @@ class CMainFrame : public CMDIFrameWnd {
     }
     // Shows popup section 'sec' for window w at pt; params are $1 $2 ... (the selected nicks, or the query's nick). Returns false if that
     // popup has nothing to show, so the caller can fall back to the default menu.
-    bool ShowContextPopup(CChatWnd* w, int sec, const CString& params, CPoint pt, bool canCopy, bool bgOpt = false) {
+    bool ShowContextPopup(CChatWnd* w, int sec, const CString& params, CPoint pt, bool canCopy) {
         if (!w) return false;
-        if (m_popRaw[sec].empty() && !canCopy && !bgOpt) return false;
+        if (m_popRaw[sec].empty() && !canCopy) return false;
         if (m_depth == 0) { m_halt = false; m_steps = 0; }
         m_depth++;
         m_menuType = kPopType[sec];
@@ -2792,25 +2748,18 @@ class CMainFrame : public CMDIFrameWnd {
         size_t i = 0;
         if (!items.empty()) BuildPopupLevel(m, items, i, 0, IDP_CTX, m_ctxActs, w, params);
         m_depth--;
-        if (bgOpt) {
-            if (m.GetMenuItemCount() > 0) m.AppendMenu(MF_SEPARATOR);
-            m.AppendMenu(MF_STRING, IDP_BG_SET, L"Background Image...");
-            if (HasChatSkin()) m.AppendMenu(MF_STRING, IDP_BG_CLEAR, L"Clear Background Image");
-        }
         if (m.GetMenuItemCount() == 0) return false;
         SetForegroundWindow(); m_menuOpen = true;
         int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
         m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
         if (cmd == IDP_COPY) w->LogCopy();
-        else if (cmd == IDP_BG_SET) { CString f = PickSkinFile(); if (!f.IsEmpty()) SetChatSkin(f); }
-        else if (cmd == IDP_BG_CLEAR) SetChatSkin(CString());
         else if (cmd >= IDP_CTX && (size_t)(cmd - IDP_CTX) < m_ctxActs.size()) { std::vector<CString> lines = m_ctxActs[cmd - IDP_CTX]; RunPopupLines(w, lines, params); }
         return true;
     }
-    bool ShowWindowPopup(CChatWnd* c, CPoint pt) {   // right-click in a chat log: status / channel / query popup, plus a Background Image option
+    bool ShowWindowPopup(CChatWnd* c, CPoint pt) {   // right-click in a chat log: status / channel / query popup
         int sec = c->m_name == L"*status*" ? 0 : (c->m_chan ? 1 : 2);
         CString params; if (sec == 2) params = c->m_name;   // in a query window $1 is the person you're talking to
-        return ShowContextPopup(c, sec, params, pt, c->LogHasSelection(), true);
+        return ShowContextPopup(c, sec, params, pt, c->LogHasSelection());
     }
     void ShowNickMenu(CChatWnd* c, const CString& nicks, CPoint pt) {   // right-click nick(s) in the user list: [lpopup], or the built-in menu if it's empty
         if (ShowContextPopup(c, 3, nicks, pt, false)) return;
@@ -3238,17 +3187,15 @@ class CMainFrame : public CMDIFrameWnd {
         m_swSkinPath = a->GetProfileString(L"background", L"switchbar", L"");
         m_tbSkinPath = a->GetProfileString(L"background", L"toolbar", L"");
         m_mdiSkinPath = a->GetProfileString(L"background", L"mdi", L"");
-        m_chatSkinPath = a->GetProfileString(L"background", L"chat", L"");
     }
     void SaveSkinPaths() {
         CWinApp* a = AfxGetApp();
         a->WriteProfileString(L"background", L"switchbar", m_swSkinPath);
         a->WriteProfileString(L"background", L"toolbar", m_tbSkinPath);
         a->WriteProfileString(L"background", L"mdi", m_mdiSkinPath);
-        a->WriteProfileString(L"background", L"chat", m_chatSkinPath);
     }
     void LoadSkinImages() {   // (re)loads the actual pictures from whatever paths are currently set
-        m_swSkinBmp.reset(); m_tbSkinBmp.reset(); m_mdiSkinBmp.reset(); m_chatSkinBmp.reset();
+        m_swSkinBmp.reset(); m_tbSkinBmp.reset(); m_mdiSkinBmp.reset();
         if (!m_swSkinPath.IsEmpty()) {
             auto bmp = std::make_unique<Gdiplus::Bitmap>(ResolveSkinPath(m_swSkinPath));
             if (bmp->GetLastStatus() == Gdiplus::Ok) m_swSkinBmp = std::move(bmp);
@@ -3261,10 +3208,6 @@ class CMainFrame : public CMDIFrameWnd {
             auto bmp = std::make_unique<Gdiplus::Bitmap>(ResolveSkinPath(m_mdiSkinPath));
             if (bmp->GetLastStatus() == Gdiplus::Ok) m_mdiSkinBmp = std::move(bmp);
         }
-        if (!m_chatSkinPath.IsEmpty()) {
-            auto bmp = std::make_unique<Gdiplus::Bitmap>(ResolveSkinPath(m_chatSkinPath));
-            if (bmp->GetLastStatus() == Gdiplus::Ok) m_chatSkinBmp = std::move(bmp);
-        }
         m_sw.skin = m_swSkinBmp.get();
     }
     CString PickSkinFile() {
@@ -3272,23 +3215,22 @@ class CMainFrame : public CMDIFrameWnd {
             L"Image Files (*.bmp;*.jpg;*.jpeg;*.png;*.gif)|*.bmp;*.jpg;*.jpeg;*.png;*.gif|All Files (*.*)|*.*||", this);
         return fd.DoModal() == IDOK ? fd.GetPathName() : CString();
     }
+    // Called after every reload so nothing is left holding a pointer into a Gdiplus::Bitmap that LoadSkinImages()
+    // just destroyed and replaced -- LoadSkinImages() reloads both skins together (whichever one's path changed),
+    // so every consumer needs refreshing every time, not just the one the caller happens to be changing.
+    void RefreshSkinConsumers() {
+        m_sw.skin = m_swSkinBmp.get(); m_sw.Invalidate();
+        m_mdiWrap.skin = m_mdiSkinBmp.get(); if (m_mdiWrap.m_hWnd) m_mdiWrap.Invalidate();
+        if (m_tb.m_hWnd) m_tb.Invalidate();
+    }
     void SetSkin(bool toolbar, const CString& absPathOrEmpty) {   // empty = clear that skin back to plain color
         CString stored = absPathOrEmpty.IsEmpty() ? CString() : RelativizeSkinPath(absPathOrEmpty);
         (toolbar ? m_tbSkinPath : m_swSkinPath) = stored;
-        SaveSkinPaths(); LoadSkinImages();
-        if (toolbar) m_tb.Invalidate(); else m_sw.Invalidate();
+        SaveSkinPaths(); LoadSkinImages(); RefreshSkinConsumers();
     }
-    bool HasChatSkin() const { return !m_chatSkinPath.IsEmpty(); }
     void SetMdiSkin(const CString& absPathOrEmpty) {   // empty = clear back to the normal workspace colour
         m_mdiSkinPath = absPathOrEmpty.IsEmpty() ? CString() : RelativizeSkinPath(absPathOrEmpty);
-        SaveSkinPaths(); LoadSkinImages();
-        m_mdiWrap.skin = m_mdiSkinBmp.get();
-        if (m_mdiWrap.m_hWnd) m_mdiWrap.Invalidate();
-    }
-    void SetChatSkin(const CString& absPathOrEmpty) {   // shared by every Status / Channel / Query window; empty = clear back to plain white
-        m_chatSkinPath = absPathOrEmpty.IsEmpty() ? CString() : RelativizeSkinPath(absPathOrEmpty);
-        SaveSkinPaths(); LoadSkinImages();
-        for (auto& kv : m_w) kv.second->SetLogBg(m_chatSkinBmp.get());
+        SaveSkinPaths(); LoadSkinImages(); RefreshSkinConsumers();
     }
     void LoadOpts() {
         CWinApp* a = AfxGetApp();
