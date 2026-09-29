@@ -18,8 +18,10 @@ you may get random bugs, glitches, or crashes.
 
 # TO DO    
 ~~multi server~~
-change background of mdi windows like I did with toolbar and switchbar   
-~~aliases system~~  
+~~colors (colors for background/texts)~~
+~~change background of mdi windows like I did with toolbar and switchbar~~
+~~aliases system~~
+~~popup system~~  
 ~~variables system~~
 script editor to let you to edit aliases/vars/scripts 
 scripting 
