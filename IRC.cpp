@@ -53,8 +53,25 @@ along with this program.  If not, see <https://gnu.org>.
 // These are plain (non-const) globals rather than compile-time constants so the Colors dialog can change them at
 // runtime; every existing call site that uses one as a default parameter value still works unchanged, since C++
 // re-reads a default argument's current value at each call rather than requiring it to be a compile-time constant.
-static COLORREF cText = RGB(0,0,0), cJoin = RGB(0,140,0), cPart = RGB(150,0,0), cOwn = RGB(0,0,0),
-                cNote = RGB(200,110,0), cAct = RGB(150,0,150), cInfo = RGB(0,0,180);
+static COLORREF cText = RGB(0,0,0), 
+                cCTCP = RGB(255, 0, 0),
+                cHighlight = RGB(127, 0, 0),
+                cInvite = RGB(0, 147, 0),
+                cJoin = RGB(0,147,0),
+                cPart = RGB(0,147,0),
+                cQuit = RGB(0, 0, 127),
+                cMode = RGB(0, 147, 0),
+                cTopic = RGB(0, 147, 0),
+                cKick = RGB(0, 147, 0),
+                cNickname = RGB(0, 147, 0),
+                cOwn = RGB(0,0,0),
+                cNotice = RGB(200,110,0), 
+                cAction = RGB(156,0,156),
+                cOther = RGB(156, 0, 156),
+                cInfo = RGB(0,0,127),
+                cInfo2 = RGB(0, 147, 0),
+                cWallops = RGB(127, 0, 0),
+                cWhois = RGB(0, 0, 0);
 
 // Remove mIRC control codes (bold, color, reverse, italic, strikethrough, underline, reset)
 static CString Strip(const CString& s) {
@@ -642,8 +659,25 @@ static unsigned __stdcall DnsWorkerProc(void* p) {
 // the chat log, the input box, and the nick list (CLR_NONE for any of the ten means "use the system default").
 struct ColorScheme {
     CString name;
-    COLORREF normal = RGB(0,0,0), own = RGB(0,0,0), join = RGB(0,140,0), part = RGB(150,0,0),
-             notice = RGB(200,110,0), info = RGB(0,0,180), action = RGB(150,0,150);
+    COLORREF normal = RGB(0,0,0), 
+             ctcp = RGB(255, 0, 0),
+             highlight = RGB(127, 0, 0),
+             invite = RGB(0, 147, 0),
+             join = RGB(0, 147, 0),
+             part = RGB(0, 147, 0),
+             quit = RGB(0, 0, 127),
+             mode = RGB(0, 147, 0),
+             topic = RGB(0, 147, 0),
+             kick = RGB(0, 147, 0),
+             nickname = RGB(0, 147, 0),
+             own = RGB(0,0,0), 
+             notice = RGB(200,110,0), 
+             other = RGB(156, 0, 156),
+             info = RGB(0,0,127), 
+             info2 = RGB(0, 147, 0),
+             action = RGB(150,0,150),
+             wallops = RGB(127, 0, 0),
+             whois = RGB(0, 0, 0);
     COLORREF chatBg = CLR_NONE, editBg = CLR_NONE, nickBg = CLR_NONE;
 };
 enum { IDC_FLIST = 301, IDC_FL_JOIN = 310, IDC_FL_NEW, IDC_FL_DELETE };
@@ -2086,8 +2120,8 @@ class CColorsDlg : public CDialog {
         t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
         t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
     }
-    static const wchar_t* const kNames[7];
-    static COLORREF ColorScheme::* const kSlot[7];
+    static const wchar_t* const kNames[19];
+    static COLORREF ColorScheme::* const kSlot[19];
     std::vector<ColorScheme>& out;   // CMainFrame's actual list; only overwritten (from work) if OK is pressed
     std::vector<ColorScheme> work;   // an editable copy, so Cancel leaves the original untouched
     int cur;
@@ -2114,14 +2148,14 @@ class CColorsDlg : public CDialog {
 public:
     CColorsDlg(std::vector<ColorScheme>& allSchemes, int active, CWnd* parent) : out(allSchemes), work(allSchemes), cur(active) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
-        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(250); t.push_back(220);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(250); t.push_back(275);
         t.push_back(0); t.push_back(0); S(L"Colors"); t.push_back(9); S(DEFAULT_FONT);
         Item(SS_LEFT, 8, 8, 60, 10, 0xFFFF, 0x0082, L"Scheme:");
         Item(CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, 8, 18, 140, 90, IDC_CD_SCHEME, 0x0085, L"");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 152, 17, 44, 14, IDC_CD_NEW, 0x0080, L"New...");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 198, 17, 44, 14, IDC_CD_DELETE, 0x0080, L"Delete");
         Item(SS_LEFT, 8, 38, 100, 9, 0xFFFF, 0x0082, L"Text colors:");
-        Item(LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 8, 48, 150, 100, IDC_CD_LIST, 0x0083, L"");
+        Item(LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 8, 48, 150, 160, IDC_CD_LIST, 0x0083, L"");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 166, 48, 76, 14, IDC_CD_CHOOSE, 0x0080, L"Choose...");
         Item(SS_LEFT, 166, 72, 76, 9, IDC_CD_BGLBL, 0x0082, L"Background:");
         Item(SS_NOTIFY | WS_TABSTOP, 166, 82, 76, 18, IDC_CD_BG, 0x0082, L"");
@@ -2129,10 +2163,10 @@ public:
         Item(SS_NOTIFY | WS_TABSTOP, 166, 116, 76, 18, IDC_CD_EDIT, 0x0082, L"");
         Item(SS_LEFT, 166, 140, 76, 9, IDC_CD_NICKLBL, 0x0082, L"Nicklist:");
         Item(SS_NOTIFY | WS_TABSTOP, 166, 150, 76, 18, IDC_CD_NICK, 0x0082, L"");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 8, 154, 60, 14, IDC_CD_DEFAULT, 0x0080, L"Default");
-        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 40, 198, 50, 14, IDOK, 0x0080, L"OK");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 98, 198, 50, 14, IDCANCEL, 0x0080, L"Cancel");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 156, 198, 50, 14, IDC_CD_HELP, 0x0080, L"Help");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 8, 215, 60, 14, IDC_CD_DEFAULT, 0x0080, L"Default");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 40, 250, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 98, 250, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 156, 250, 50, 14, IDC_CD_HELP, 0x0080, L"Help");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
@@ -2145,7 +2179,7 @@ public:
         m_editSwatch.onClear = [this] { work[cur].editBg = CLR_NONE; UpdateSwatches(); };
         m_nickSwatch.SubclassDlgItem(IDC_CD_NICK, this); m_nickSwatch.onClick = [this] { Pick(&ColorScheme::nickBg); };
         m_nickSwatch.onClear = [this] { work[cur].nickBg = CLR_NONE; UpdateSwatches(); };
-        for (int i = 0; i < 7; i++) m_list.AddString(kNames[i]);
+        for (int i = 0; i < 19; i++) m_list.AddString(kNames[i]);
         RefillSchemeCombo(); SelectScheme(cur);
         return TRUE;
     }
@@ -2183,9 +2217,51 @@ public:
     int Active() const { return cur; }
     DECLARE_MESSAGE_MAP()
 };
-const wchar_t* const CColorsDlg::kNames[7] = { L"Normal", L"Own", L"Join", L"Part", L"Notice", L"Info", L"Action" };
-COLORREF ColorScheme::* const CColorsDlg::kSlot[7] = { &ColorScheme::normal, &ColorScheme::own, &ColorScheme::join,
-    &ColorScheme::part, &ColorScheme::notice, &ColorScheme::info, &ColorScheme::action };
+
+const wchar_t* const CColorsDlg::kNames[19] = { 
+    L"Normal",
+    L"CTCP",
+    L"Highlight",
+    L"Invite",
+    L"Join",
+    L"Part",
+    L"Quit",
+    L"Mode",
+    L"Topic",
+    L"Kick",
+    L"Nickname",
+    L"Own",
+    L"Notice",
+    L"Action",
+    L"Other",
+    L"Info",
+    L"Info2",
+    L"Wallops",
+    L"Whois"
+};
+
+COLORREF ColorScheme::* const CColorsDlg::kSlot[19] = { 
+    &ColorScheme::normal,
+    &ColorScheme::ctcp,
+    &ColorScheme::highlight,
+    &ColorScheme::invite,
+    &ColorScheme::join,
+    &ColorScheme::part,
+    &ColorScheme::quit,
+    &ColorScheme::mode,
+    &ColorScheme::topic,
+    &ColorScheme::kick,
+    &ColorScheme::nickname,
+    &ColorScheme::own,
+    &ColorScheme::notice,  
+    &ColorScheme::action,
+    &ColorScheme::other,
+    &ColorScheme::info,
+    &ColorScheme::info2,
+    &ColorScheme::wallops,
+    &ColorScheme::whois
+};
+
 BEGIN_MESSAGE_MAP(CColorsDlg, CDialog)
     ON_CBN_SELCHANGE(IDC_CD_SCHEME, OnSchemeChange)
     ON_BN_CLICKED(IDC_CD_NEW, OnNew) ON_BN_CLICKED(IDC_CD_DELETE, OnDelete) ON_BN_CLICKED(IDC_CD_CHOOSE, OnChoose)
@@ -2452,7 +2528,7 @@ class CMainFrame : public CMDIFrameWnd {
     void Show(CChatWnd* w, const CString& t, COLORREF c = cText, int tsOverride = -1) {
         if (!w) return;
         w->AddLine(t, c, tsOverride);
-        if (w != dynamic_cast<CChatWnd*>(MDIGetActive())) w->m_act = (std::max)(w->m_act, (c == cText || c == cAct) ? 2 : 1);
+        if (w != dynamic_cast<CChatWnd*>(MDIGetActive())) w->m_act = (std::max)(w->m_act, (c == cText || c == cAction) ? 2 : 1);
     }
     void Activate(CMDIChildWnd* w) { if (w->IsIconic()) MDIRestore(w); MDIActivate(w); }   // CMDIChildWnd base: works for both CChatWnd and CListWnd
     void Goto(Net* net, const CString& t) {   // switchbar / double-click target: existing window is activated, unknown #chan is joined
@@ -2586,7 +2662,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void Say(Net* net, const CString& target, const CString& text, bool action = false) {
         CChatWnd* w = Find(net, target); if (!w) w = Open(net, target, IsChan(target));
-        if (action) { Send(net, L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + net->nick + L" " + text, cAct); }
+        if (action) { Send(net, L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + net->nick + L" " + text, cAction); }
         else        { Send(net, L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + net->nick + L"> " + text, cOwn); }
     }
     void Connect(Net* net, const CString& host, UINT port) {
@@ -2620,7 +2696,7 @@ class CMainFrame : public CMDIFrameWnd {
             case 3: {
                 CString txt;
                 CPromptDlg d(txt, L"Send Notice", L"Notice to " + nick + L":", this);
-                if (d.DoModal() == IDOK && !txt.IsEmpty()) { Send(net, L"NOTICE " + nick + L" :" + txt); Note(net, L"-> -" + nick + L"- " + txt, cNote); }
+                if (d.DoModal() == IDOK && !txt.IsEmpty()) { Send(net, L"NOTICE " + nick + L" :" + txt); Note(net, L"-> -" + nick + L"- " + txt, cNotice); }
                 break;
             }
         }
@@ -3677,7 +3753,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"msg" || cmd == L"m") { CString t = Word(arg); Say(net, t, arg); }
         else if (cmd == L"query" || cmd == L"q") { CString t = Word(arg); Open(net, t, false); if (!arg.IsEmpty()) Say(net, t, arg); }
         else if (cmd == L"me" && inChat) Say(net, w->m_name, arg, true);
-        else if (cmd == L"notice") { CString t = Word(arg); Send(net, L"NOTICE " + t + L" :" + arg); Note(net, L"-> -" + t + L"- " + arg, cNote); }
+        else if (cmd == L"notice") { CString t = Word(arg); Send(net, L"NOTICE " + t + L" :" + arg); Note(net, L"-> -" + t + L"- " + arg, cNotice); }
         else if (cmd == L"ctcp") {
             CString t = Word(arg); CString type = Word(arg); type.MakeUpper();
             if (t.IsEmpty() || type.IsEmpty()) { Note(net, L"Usage: /ctcp <nick> <version|time|ping> [args]", cPart); return; }
@@ -3685,7 +3761,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (type == L"PING" && arg.IsEmpty()) { CString ts; ts.Format(L"%lu", ::GetTickCount()); payload += L" " + ts; }
             else if (!arg.IsEmpty()) payload += L" " + arg;
             Send(net, L"PRIVMSG " + t + L" :" + CString(wchar_t(1)) + payload + CString(wchar_t(1)));
-            Note(net, L"[CTCP " + type + L" to " + t + L"]", cNote);
+            Note(net, L"[CTCP " + type + L" to " + t + L"]", cCTCP);
         }
         else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
@@ -3715,8 +3791,8 @@ class CMainFrame : public CMDIFrameWnd {
             if (cFlag) {
                 CString name = Word(a); CString nl = name; nl.MakeLower();
                 if (nl == L"normal") col = cText; else if (nl == L"own") col = cOwn; else if (nl == L"join") col = cJoin;
-                else if (nl == L"part") col = cPart; else if (nl == L"notice") col = cNote; else if (nl == L"info") col = cInfo;
-                else if (nl == L"action") col = cAct;
+                else if (nl == L"part") col = cPart; else if (nl == L"notice") col = cNotice; else if (nl == L"info") col = cInfo;
+                else if (nl == L"action") col = cAction;
                 else { Show(w, L"* /echo: unknown color name '" + name + L"' (try Normal, Own, Join, Part, Notice, Info, Action).", cPart, 0); return; }
             }
             CChatWnd* target = nullptr;
@@ -3901,8 +3977,8 @@ class CMainFrame : public CMDIFrameWnd {
                 return;
             }
             CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
-            if (ctcp) Show(w, L"* " + nick + txt.Mid(6), cAct);   // ACTION (/me): a real chat message, so it still uses the normal window
-            else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNote);
+            if (ctcp) Show(w, L"* " + nick + txt.Mid(6), cAction);   // ACTION (/me): a real chat message, so it still uses the normal window
+            else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
             else Show(w, L"<" + nick + L"> " + txt);
         }
         else if (cmd == L"JOIN") {
@@ -3922,22 +3998,22 @@ class CMainFrame : public CMDIFrameWnd {
             for (auto& kv : m_w) {
                 CChatWnd* w = kv.second; if (w->net != net) continue;
                 if (w->DelNick(nick) || (!w->m_chan && w->m_name.CompareNoCase(nick) == 0))
-                    Show(w, L"* " + nick + L" has quit (" + P(0) + L")", cPart);
+                    Show(w, L"* " + nick + L" has quit (" + P(0) + L")", cQuit);
             }
         }
         else if (cmd == L"NICK") {
             CString nn = P(0); if (me) net->nick = nn;
             for (auto& kv : m_w) {
                 CChatWnd* w = kv.second; if (w->net != net) continue;
-                if (w->DelNick(nick)) { w->AddNick(nn); Show(w, L"* " + nick + L" is now known as " + nn, cInfo); }
+                if (w->DelNick(nick)) { w->AddNick(nn); Show(w, L"* " + nick + L" is now known as " + nn, cNickname); }
             }
         }
         else if (cmd == L"TOPIC") {
-            if (CChatWnd* w = Find(net, P(0))) { w->SetTopic(P(1)); Show(w, L"* " + nick + L" changed the topic to: " + P(1), cInfo); }
+            if (CChatWnd* w = Find(net, P(0))) { w->SetTopic(P(1)); Show(w, L"* " + nick + L" changed the topic to: " + P(1), cTopic); }
         }
         else if (cmd == L"MODE") {
             CChatWnd* w = Find(net, P(0)); CString m; for (size_t i = 1; i < p.size(); i++) m += p[i] + L" ";
-            Show(w ? w : Status(net), L"* " + nick + L" sets mode " + m, cInfo);
+            Show(w ? w : Status(net), L"* " + nick + L" sets mode " + m, cMode);
             if (w && p.size() > 2) { w->m_refresh = true; Send(net, L"NAMES " + P(0)); }
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cInfo); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
@@ -3958,23 +4034,23 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"366") {}
         else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cPart); Send(net, L"NICK " + net->nick); }
         //whois stuff
-        else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)), cText); }   // RPL_WHOISUSER: nick user host * :realname
-        else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)), cText); } // RPL_WHOISSERVER
+        else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)), cWhois); }   // RPL_WHOISUSER: nick user host * :realname
+        else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)), cWhois); } // RPL_WHOISSERVER
         else if (cmd == L"317") {   // RPL_WHOISIDLE: nick idle [signon] :seconds idle, signon time
             long idle = _wtol(P(2));
             CString s; s.Format(L"%s has been idle for %ldh %ldm %lds", (LPCWSTR)P(1), idle / 3600, (idle / 60) % 60, idle % 60);
             CString signon = P(3);
             if (!signon.IsEmpty() && IsAllDigits(signon)) { CTime ct((time_t)_wtoi64(signon)); s += L", signed on " + ct.Format(L"%a %b %d %H:%M:%S %Y"); }
-            Note(net, s, cText);
+            Note(net, s, cWhois);
         }
-        else if (cmd == L"318") { Note(net, P(1) + L" End of /WHOIS list.", cText); }  //End of /WHOIS list. //-- End of WHOIS -- // RPL_ENDOFWHOIS
-        else if (cmd == L"319") { Note(net, P(1) + L" is on channels: " + P(2), cText); }  // RPL_WHOISCHANNELS
+        else if (cmd == L"318") { Note(net, P(1) + L" End of /WHOIS list.", cWhois); }  //End of /WHOIS list. //-- End of WHOIS -- // RPL_ENDOFWHOIS
+        else if (cmd == L"319") { Note(net, P(1) + L" is on channels: " + P(2), cWhois); }  // RPL_WHOISCHANNELS
         else if (cmd == L"301" || cmd == L"313" || cmd == L"330" || cmd == L"338" || cmd == L"378" || cmd == L"379" || cmd == L"671") {
             // other common WHOIS-block lines (away, IRC operator, logged-in-as, actual host, connecting-from, user modes,
             // secure connection -- numbers and exact wording vary by server); joined the same way the old generic
             // fallback did, just consistently colored with the rest of the WHOIS block instead of falling through to it
             CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
-            Note(net, j.IsEmpty() ? raw : j, cText);
+            Note(net, j.IsEmpty() ? raw : j, cWhois);
         }
         else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
             CString trailing = P(1); int tp = 0;
@@ -4315,7 +4391,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (!line.IsEmpty()) {
             if (it.asCmd) { if (w) Dispatch(w, line); }
             else if (!it.alias.IsEmpty()) { if (w) { if (AliasDef* ad = FindAlias(it.alias)) RunAlias(w, *ad, it.target + L" " + line); } }
-            else if (it.notice) { if (it.net && it.net->conn) Send(it.net, L"NOTICE " + it.target + L" :" + line); if (it.echo && w) Show(w, L"-> -" + it.target + L"- " + line, cNote); }
+            else if (it.notice) { if (it.net && it.net->conn) Send(it.net, L"NOTICE " + it.target + L" :" + line); if (it.echo && w) Show(w, L"-> -" + it.target + L"- " + line, cNotice); }
             else { if (it.net && it.net->conn) Say(it.net, it.target, line); }
         }
         it.dueAt = now + (ULONGLONG)it.delay;
@@ -4667,8 +4743,30 @@ class CMainFrame : public CMDIFrameWnd {
         for (size_t i = 0; i < m_schemes.size(); i++) {
             const ColorScheme& s = m_schemes[i];
             CString line = s.name;
-            const COLORREF vals[10] = { s.normal, s.own, s.join, s.part, s.notice, s.info, s.action, s.chatBg, s.editBg, s.nickBg };
-            for (int k = 0; k < 10; k++) line += L"," + PackColor(vals[k]);
+            const COLORREF vals[21] = { 
+                s.normal,
+                s.ctcp,
+                s.highlight,
+                s.invite,
+                s.join,
+                s.part,
+                s.quit,
+                s.mode,
+                s.topic,
+                s.kick,
+                s.nickname,
+                s.own,
+                s.notice,
+                s.info,
+                s.info2,
+                s.action,
+                s.wallops,
+                s.wallops,
+                s.chatBg, 
+                s.editBg, 
+                s.nickBg 
+            };
+            for (int k = 0; k < 21; k++) line += L"," + PackColor(vals[k]);
             CString key; key.Format(L"n%d", (int)i);
             a->WriteProfileString(L"colors", key, line);
         }
@@ -4684,8 +4782,30 @@ class CMainFrame : public CMDIFrameWnd {
             CString key = line.Left(eq), val = line.Mid(eq + 1);
             if (key.Left(1).CompareNoCase(L"n") != 0 || !iswdigit(key[1])) continue;   // skips the separate "active" key
             ColorScheme s; int pos = 0; s.name = val.Tokenize(L",", pos);
-            COLORREF* slots[10] = { &s.normal, &s.own, &s.join, &s.part, &s.notice, &s.info, &s.action, &s.chatBg, &s.editBg, &s.nickBg };
-            for (int k = 0; k < 10 && pos != -1; k++) *slots[k] = UnpackColor(val.Tokenize(L",", pos));
+            COLORREF* slots[21] = {             
+                &s.normal,
+                &s.ctcp,
+                &s.highlight,
+                &s.invite,
+                &s.join,
+                &s.part,
+                &s.quit,
+                &s.mode,
+                &s.topic,
+                &s.kick,
+                &s.nickname,
+                &s.own,
+                &s.notice,
+                &s.info,
+                &s.info2,
+                &s.action,
+                &s.wallops,
+                &s.wallops,
+                &s.chatBg,
+                &s.editBg,
+                &s.nickBg
+            };
+            for (int k = 0; k < 21 && pos != -1; k++) *slots[k] = UnpackColor(val.Tokenize(L",", pos));
             if (!s.name.IsEmpty()) m_schemes.push_back(s);
         }
         if (m_schemes.empty()) { SeedColorSchemes(); SaveColors(); return; }
@@ -4697,7 +4817,27 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_curScheme < 0 || m_curScheme >= (int)m_schemes.size()) m_curScheme = 0;
         return m_schemes[m_curScheme];
     }
-    void PushSchemeColors(const ColorScheme& s) { cText = s.normal; cOwn = s.own; cJoin = s.join; cPart = s.part; cNote = s.notice; cInfo = s.info; cAct = s.action; }
+
+    void PushSchemeColors(const ColorScheme& s) { 
+        cText = s.normal; 
+        cCTCP = s.ctcp;
+        cHighlight = s.highlight;
+        cInvite = s.invite; 
+        cJoin = s.join;
+        cPart = s.part;
+        cQuit = s.quit;
+        cMode = s.mode; 
+        cTopic = s.topic;  
+        cKick = s.kick; 
+        cNickname = s.nickname; 
+        cOwn = s.own; 
+        cNotice = s.notice; 
+        cInfo = s.info;
+        cInfo2 = s.info2;
+        cAction = s.action; 
+        cWallops = s.wallops; 
+        cWhois = s.wallops;
+    }
     void ApplyColorScheme(int idx) {   // pushes the scheme's colors into the global text-color variables and every open window
         if (idx < 0 || idx >= (int)m_schemes.size()) return;
         m_curScheme = idx; const ColorScheme& s = m_schemes[idx];

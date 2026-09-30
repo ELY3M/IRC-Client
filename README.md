@@ -19,6 +19,7 @@ you may get random bugs, glitches, or crashes.
 # TO DO    
 ~~multi server~~  
 ~~colors (colors for background/texts)~~  
+~~background images on toolbar and switchbar~~  
 ~~change background of mdi windows like I did with toolbar and switchbar~~  
 ~~aliases system~~  
 ~~popup system~~  
