@@ -33,7 +33,11 @@ along with this program.  If not, see <https://gnu.org>.
 #include <schannel.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <ws2tcpip.h>
+#include <windns.h>
+#include <process.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "shell32.lib")
 #include <gdiplus.h>
@@ -471,6 +475,96 @@ struct PlayItem {
     ULONGLONG dueAt = 0;   // GetTickCount64() value at which the next line may send; 0 = not yet scheduled (send immediately)
     CString Status() const { return pos == 0 ? CString(L"waiting") : (pos >= lines.size() ? CString(L"done") : CString(L"running")); }
 };
+
+// ---------------- /dns: background-threaded resolution, one request in flight at a time ----------------
+// One queued /dns request. A nickname stays "isNickname" until a USERHOST reply fills in resolvedHost (see OnLine's
+// "302" handling); only then does it actually get resolved. See CMainFrame::CmdDns / StartNextDnsIfIdle.
+struct DnsRequest {
+    int id = 0;
+    Net* net = nullptr; CString winName;
+    CString query, resolvedHost, nsServer;
+    bool ipv4 = true, ipv6 = true, hostForce = false, multi = false, isNickname = false, reverse = false;
+    CString status = L"queued";   // queued | waiting for userhost | resolving | done | error
+    std::vector<CString> addrs;
+    std::vector<std::pair<CString, CString>> records;   // -m: (type, value) pairs, e.g. ("MX", "10 mail.example.com")
+    CString error;
+};
+// What actually crosses the thread boundary: plain std::wstring/std::vector only (no CString/MFC heap assumptions
+// across threads). The worker fills in the result fields, then posts this pointer back; the main thread owns
+// deleting it afterward.
+struct DnsJob {
+    int id = 0; HWND hwnd = nullptr;
+    std::wstring query, nsServer;
+    bool ipv4 = true, ipv6 = true, multi = false, reverse = false;
+    std::vector<std::wstring> addrs;
+    std::vector<std::pair<std::wstring, std::wstring>> records;
+    std::wstring error;
+};
+static std::wstring DnsPtrName(const std::wstring& ip) {   // builds the in-addr.arpa / ip6.arpa query name for a PTR lookup
+    IN_ADDR a4;
+    if (InetPtonW(AF_INET, ip.c_str(), &a4) == 1) {
+        BYTE* b = (BYTE*)&a4.S_un.S_addr; wchar_t buf[64];
+        swprintf_s(buf, L"%d.%d.%d.%d.in-addr.arpa", b[3], b[2], b[1], b[0]);
+        return buf;
+    }
+    IN6_ADDR a6;
+    if (InetPtonW(AF_INET6, ip.c_str(), &a6) == 1) {
+        std::wstring s;
+        for (int i = 15; i >= 0; i--) { wchar_t hex[8]; swprintf_s(hex, L"%x.%x.", a6.u.Byte[i] & 0xF, a6.u.Byte[i] >> 4); s += hex; }
+        return s + L"ip6.arpa";
+    }
+    return ip;   // shouldn't happen: caller only builds a PTR name once it's already confirmed this is a literal IP
+}
+static PIP4_ARRAY DnsServerArray(const std::wstring& ns, IP4_ARRAY& storage) {   // DnsQuery_W's custom-server option is IPv4-only (a limitation of this legacy API)
+    if (ns.empty()) return nullptr;
+    IN_ADDR a; if (InetPtonW(AF_INET, ns.c_str(), &a) != 1) return nullptr;
+    storage.AddrCount = 1; storage.AddrArray[0] = a.S_un.S_addr; return &storage;
+}
+static void DnsCollect(PCWSTR name, WORD type, PIP4_ARRAY srv, std::vector<std::wstring>* addrs, std::vector<std::pair<std::wstring, std::wstring>>* recs, const wchar_t* typeName) {
+    PDNS_RECORD rec = nullptr;
+    if (DnsQuery_W(name, type, DNS_QUERY_STANDARD, srv, &rec, nullptr) != 0 || !rec) return;
+    for (PDNS_RECORD r = rec; r; r = r->pNext) {
+        if (r->wType != type) continue;
+        std::wstring val;
+        wchar_t buf[128];
+        switch (type) {
+            case DNS_TYPE_A: { IN_ADDR a; a.S_un.S_addr = r->Data.A.IpAddress; InetNtopW(AF_INET, &a, buf, 128); val = buf; break; }
+            case DNS_TYPE_AAAA: InetNtopW(AF_INET6, &r->Data.AAAA.Ip6Address, buf, 128); val = buf; break;
+            case DNS_TYPE_PTR: val = r->Data.PTR.pNameHost; break;
+            case DNS_TYPE_NS: val = r->Data.NS.pNameHost; break;
+            case DNS_TYPE_MX: swprintf_s(buf, L"%d ", r->Data.MX.wPreference); val = std::wstring(buf) + r->Data.MX.pNameExchange; break;
+            case DNS_TYPE_SOA: val = std::wstring(r->Data.SOA.pNamePrimaryServer) + L" " + r->Data.SOA.pNameAdministrator; break;
+            case DNS_TYPE_SRV: swprintf_s(buf, L"%d %d %d ", r->Data.SRV.wPriority, r->Data.SRV.wWeight, r->Data.SRV.wPort); val = std::wstring(buf) + r->Data.SRV.pNameTarget; break;
+            case DNS_TYPE_TEXT: for (DWORD i = 0; i < r->Data.TXT.dwStringCount; i++) { if (i) val += L" "; val += r->Data.TXT.pStringArray[i]; } break;
+        }
+        if (addrs) addrs->push_back(val);
+        if (recs) recs->push_back({ typeName, val });
+    }
+    DnsRecordListFree(rec, DnsFreeRecordList);
+}
+static unsigned __stdcall DnsWorkerProc(void* p) {
+    std::unique_ptr<DnsJob> j((DnsJob*)p);
+    IP4_ARRAY srvStorage; PIP4_ARRAY srv = DnsServerArray(j->nsServer, srvStorage);
+    if (j->multi) {
+        static const struct { const wchar_t* name; WORD type; } kTypes[] = {
+            { L"A", DNS_TYPE_A }, { L"AAAA", DNS_TYPE_AAAA }, { L"NS", DNS_TYPE_NS }, { L"MX", DNS_TYPE_MX },
+            { L"SOA", DNS_TYPE_SOA }, { L"SRV", DNS_TYPE_SRV }, { L"TXT", DNS_TYPE_TEXT }
+        };
+        for (auto& kt : kTypes) DnsCollect(j->query.c_str(), kt.type, srv, nullptr, &j->records, kt.name);
+        if (j->records.empty()) j->error = L"No records found.";
+    } else if (j->reverse) {
+        std::wstring ptr = DnsPtrName(j->query);
+        DnsCollect(ptr.c_str(), DNS_TYPE_PTR, srv, &j->addrs, nullptr, L"PTR");
+        if (j->addrs.empty()) j->error = L"Couldn't resolve.";
+    } else {
+        if (j->ipv4) DnsCollect(j->query.c_str(), DNS_TYPE_A, srv, &j->addrs, nullptr, L"A");
+        if (j->ipv6) DnsCollect(j->query.c_str(), DNS_TYPE_AAAA, srv, &j->addrs, nullptr, L"AAAA");
+        if (j->addrs.empty()) j->error = L"Couldn't resolve.";
+    }
+    HWND hwnd = j->hwnd; int id = j->id;
+    ::PostMessage(hwnd, WM_APP + 50, (WPARAM)id, (LPARAM)j.release());   // ownership passes to the main thread, which deletes it after reading the results
+    return 0;
+}
 
 // A named set of colors (the Colors dialog): 7 text colors for message types, plus 3 background colors that apply to
 // the chat log, the input box, and the nick list (CLR_NONE for any of the ten means "use the system default").
@@ -935,8 +1029,11 @@ public:
         m_out.ReplaceSel(t);
     }
     // Renders mIRC codes: ^B bold, ^C fg[,bg], ^E strikethrough, ^I italic, ^O reset, ^R reverse, ^_ underline
-    void AddLine(CString s, COLORREF base) {
-        bool showTs = tsEnabled ? tsEnabled() : true;
+    // tsOverride: -1 = the window's normal /timestamp setting (every caller except /echo uses this), 0 = never
+    // timestamp this line, 1 = reserved/unused for now. /echo's plain form passes 0 (mIRC never timestamps a bare
+    // /echo); /echo -t passes -1, applying the normal on/off rule to that one line rather than forcing it on.
+    void AddLine(CString s, COLORREF base, int tsOverride = -1) {
+        bool showTs = tsOverride >= 0 ? (tsOverride != 0) : (tsEnabled ? tsEnabled() : true);
         CString ts = showTs ? FormatTimestamp(tsFormat ? tsFormat() : CString(L"[HH:nn]")) + L" " : CString();   // the space is always added here, regardless of whether the format string itself has one
         CString plain = ts, rawMsg;   // plain: what's shown (used for the #channel-underline pass below); rawMsg: undated, for logging
         long ls = 0, le = 0;
@@ -2073,6 +2170,8 @@ class CMainFrame : public CMDIFrameWnd {
     bool m_logEnabled = false; CString m_logFolder;   // chat history logging (see LoadLogging/SaveLogging/WriteLog)
     bool m_tsGlobalOn = true; CString m_tsEventFmt = L"[HH:nn]", m_tsLogFmt = L"[HH:nn:ss]";   // see /timestamp, LoadTimestamp/SaveTimestamp
     std::vector<PlayItem> m_playQueue; CString m_pnick; UINT_PTR m_playTimerId = 0;   // see /play, /playctrl, PlayTick
+    std::vector<DnsRequest> m_dnsQueue; std::map<CString, int> m_pendingUserhost; int m_dnsSeq = 0;
+    std::vector<std::pair<CString, CString>> m_lastDnsRecords;   // the most recently completed -m request's records, for $dns(T,N)
     std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
@@ -2108,9 +2207,9 @@ class CMainFrame : public CMDIFrameWnd {
         net->sock.onLine = [this, net](const CString& s) { OnLine(net, s); };
         net->sock.onDrop = [this, net]() { net->conn = false; SetState(net, L"Disconnected"); Note(net, L"Disconnected.", cPart); };
     }
-    void Show(CChatWnd* w, const CString& t, COLORREF c = cText) {
+    void Show(CChatWnd* w, const CString& t, COLORREF c = cText, int tsOverride = -1) {
         if (!w) return;
-        w->AddLine(t, c);
+        w->AddLine(t, c, tsOverride);
         if (w != dynamic_cast<CChatWnd*>(MDIGetActive())) w->m_act = (std::max)(w->m_act, (c == cText || c == cAct) ? 2 : 1);
     }
     void Activate(CMDIChildWnd* w) { if (w->IsIconic()) MDIRestore(w); MDIActivate(w); }   // CMDIChildWnd base: works for both CChatWnd and CListWnd
@@ -2518,6 +2617,16 @@ class CMainFrame : public CMDIFrameWnd {
             val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
         }
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
+        if (name == L"dns") {   // $dns(T,N): T is a record type (A/AAAA/NS/MX/SOA/SRV/TXT) or * for all, from the last /dns -m request
+            CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
+            CString T = c < 0 ? a : a.Left(c); T.Trim(); T.MakeUpper();
+            double nn = 1; if (c >= 0 && !ParseNum(a.Mid(c + 1), nn)) return false;
+            std::vector<CString> matches;
+            for (auto& rec : m_lastDnsRecords) if (T == L"*" || rec.first.CompareNoCase(T) == 0) matches.push_back(rec.second);
+            int idx = (int)nn;
+            if (idx < 1 || idx > (int)matches.size()) { val.Empty(); return true; }
+            val = matches[idx - 1]; return true;
+        }
         if (name == L"play") {   // $play(N) or $play(Nick,N): .type .fname .topic .pos .lines .delay .status
             CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L',');
             CString who = c < 0 ? CString() : a.Left(c); who.Trim();
@@ -3250,7 +3359,61 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
-        else if (cmd == L"echo") { Show(w, arg, cInfo); }   // in the current window, so "//echo $me" shows up where you typed it
+        else if (cmd == L"echo") {   // /echo [color] [-switches] [-c color name] [#channel|nick] <text>  (local only: never sent to the server)
+            CString a = arg; a.Trim();
+            int colorNum = -1;
+            { CString tmp = a; CString first = Word(tmp); if (!first.IsEmpty() && IsAllDigits(first)) { colorNum = _wtoi(first); a = tmp; } }
+            bool eFlag = false, hFlag = false, tFlag = false, sFlag = false, aFlagSw = false, qFlag = false, lFlag = false,
+                 bFlag = false, fFlag = false, nFlag = false, gFlag = false, cFlag = false;
+            int indentN = 0;
+            if (a.Left(1) == L"-") {
+                int i = 1; for (; i < a.GetLength() && a[i] != L' '; i++) {
+                    wchar_t c = a[i];
+                    if (c == L'c') cFlag = true; else if (c == L'e') eFlag = true; else if (c == L'g') gFlag = true;
+                    else if (c == L'h') hFlag = true; else if (c == L's') sFlag = true; else if (c == L'a') aFlagSw = true;
+                    else if (c == L'q') qFlag = true; else if (c == L'l') lFlag = true; else if (c == L'b') bFlag = true;
+                    else if (c == L'f') fFlag = true; else if (c == L'n') nFlag = true; else if (c == L't') tFlag = true;
+                    else if (c == L'i') { CString digs; while (i + 1 < a.GetLength() && iswdigit(a[i + 1])) digs += a[++i]; indentN = digs.IsEmpty() ? 0 : _wtoi(digs); }
+                    // -d, -m, -r are accepted (so a mIRC-style switch string doesn't error out) but have no distinct
+                    // effect here: this client has no separate "single message" window type, message-vs-event
+                    // distinction, or strip-settings dialog to apply them to.
+                }
+                a = a.Mid(i); a.TrimLeft();
+            }
+            COLORREF col = colorNum >= 0 ? MircColor(colorNum) : cText;
+            if (cFlag) {
+                CString name = Word(a); CString nl = name; nl.MakeLower();
+                if (nl == L"normal") col = cText; else if (nl == L"own") col = cOwn; else if (nl == L"join") col = cJoin;
+                else if (nl == L"part") col = cPart; else if (nl == L"notice") col = cNote; else if (nl == L"info") col = cInfo;
+                else if (nl == L"action") col = cAct;
+                else { Show(w, L"* /echo: unknown color name '" + name + L"' (try Normal, Own, Join, Part, Notice, Info, Action).", cPart, 0); return; }
+            }
+            CChatWnd* target = nullptr;
+            { CString tmp = a; CString first = Word(tmp);
+              if (!first.IsEmpty()) { CString tn = first; if (tn[0] == L'=') tn = tn.Mid(1);
+                  if (IsChan(tn) || Find(net, tn)) { target = IsChan(tn) ? Open(net, tn, true) : Find(net, tn); a = tmp; } } }
+            if (!target) target = sFlag ? Status(net) : aFlagSw ? dynamic_cast<CChatWnd*>(MDIGetActive()) : w;
+            if (!target) { Show(w, L"* /echo: no such window.", cPart, 0); return; }
+            CString text = a;
+            if (indentN > 0) { CString pad; pad.Format(L"%*s", indentN, L""); text = pad + text; }
+            if (hFlag) {   // hard-wrap at a fixed width, so it doesn't reflow if the window is resized later
+                CString wrapped; int col2 = 0;
+                for (int i = 0; i < text.GetLength(); i++) { wrapped += text[i]; if (++col2 >= 80 && text[i] == L' ') { wrapped += L"\r\n"; col2 = 0; } }
+                text = wrapped;
+            }
+            if (eFlag) text = L"---- " + text + L" ----";
+            // -q: mIRC suppresses output when /echo is invoked via a ".command" quiet prefix from a script. This
+            // client doesn't have that quiet-prefix mechanism (see the alias/scripting notes), so -q is accepted
+            // for compatibility but doesn't change anything -- there's no "was this quiet-prefixed" state to check.
+            int savedAct = target->m_act;
+            auto savedLog = target->onLog; if (gFlag) target->onLog = nullptr;
+            Show(target, text, col, tFlag ? -1 : 0);
+            if (gFlag) target->onLog = savedLog;
+            if (nFlag) target->m_act = savedAct;
+            if (lFlag) target->m_act = 2;   // -l: apply "highlight" treatment -- the strongest activity level this client has
+            if (bFlag) MessageBeep(MB_OK);
+            if (fFlag) FlashWindow(TRUE);
+        }
         else if (cmd == L"say") { if (inChat) Say(net, w->m_name, arg); else Note(net, L"You're not in a channel or query.", cPart); }   // sends text as-is, even if it starts with a slash
         else if (cmd == L"alias") {   // /alias (list)   /alias name (show)   /alias name commands (define; File > Aliases... edits multi-line ones)
             CString name = Word(arg); arg.Trim();
@@ -3285,6 +3448,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"logging") OnLoggingDialog();
         else if (cmd == L"play") CmdPlay(w, arg);
         else if (cmd == L"playctrl") CmdPlayCtrl(w);
+        else if (cmd == L"dns") CmdDns(w, arg);
         else if (cmd == L"timestamp") {
             CString a = arg; a.Trim();
             if (a.Left(2).CompareNoCase(L"-f") == 0) {
@@ -3343,7 +3507,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3453,6 +3617,22 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"366") {}
         else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cPart); Send(net, L"NICK " + net->nick); }
+        else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
+            CString trailing = P(1); int tp = 0;
+            for (CString entry = trailing.Tokenize(L" ", tp); !entry.IsEmpty(); entry = trailing.Tokenize(L" ", tp)) {
+                int eq = entry.Find(L'='); if (eq < 0) continue;
+                CString nk = entry.Left(eq); if (!nk.IsEmpty() && nk[nk.GetLength() - 1] == L'*') nk = nk.Left(nk.GetLength() - 1);
+                CString rest = entry.Mid(eq + 1); int at = rest.Find(L'@'); if (at < 0) continue;
+                CString host = rest.Mid(at + 1);
+                CString key = nk; key.MakeLower();
+                auto it = m_pendingUserhost.find(key);
+                if (it != m_pendingUserhost.end()) {
+                    int reqId = it->second; m_pendingUserhost.erase(it);
+                    for (auto& r : m_dnsQueue) if (r.id == reqId) { r.isNickname = false; r.resolvedHost = host; r.status = L"queued"; break; }
+                }
+            }
+            StartNextDnsIfIdle();
+        }
         else { CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" "; Note(net, j.IsEmpty() ? raw : j, cText); }
     }
 
@@ -3655,6 +3835,88 @@ class CMainFrame : public CMDIFrameWnd {
         CPlayCtrlDlg dlg(m_playQueue, this);
         dlg.DoModal();
         if (m_playQueue.empty()) StopPlayTimer();
+    }
+
+    // ---- /dns: resolves an address, hostname, or nickname; queued and run one at a time on a worker thread ----
+    void CmdDns(CChatWnd* w, CString arg) {
+        Net* net = w->net; arg.Trim();
+        bool ipv4 = false, ipv6 = false, cFlag = false, hFlag = false, mFlag = false, nFlag = false;
+        if (arg.Left(1) == L"-") {
+            int i = 1; for (; i < arg.GetLength() && arg[i] != L' '; i++) {
+                wchar_t c = arg[i];
+                if (c == L'4') ipv4 = true; else if (c == L'6') ipv6 = true; else if (c == L'c') cFlag = true;
+                else if (c == L'h') hFlag = true; else if (c == L'm') mFlag = true; else if (c == L'n') nFlag = true;
+            }
+            arg = arg.Mid(i); arg.TrimLeft();
+        }
+        if (!ipv4 && !ipv6) { ipv4 = true; ipv6 = true; }   // neither given = both
+        if (cFlag) {
+            if (m_dnsQueue.size() > 1) m_dnsQueue.erase(m_dnsQueue.begin() + 1, m_dnsQueue.end());   // keeps the one in progress (the front), per mIRC's own -c behavior
+            Show(w, L"* DNS queue cleared (the request in progress, if any, keeps going).", cInfo);
+            if (arg.IsEmpty()) return;
+        }
+        if (arg.IsEmpty()) {   // no query given: show the current queue
+            if (m_dnsQueue.empty()) { Show(w, L"* No DNS requests queued.", cInfo); return; }
+            for (size_t i = 0; i < m_dnsQueue.size(); i++) { DnsRequest& r = m_dnsQueue[i]; CString s; s.Format(L"* [%d] %s - %s", (int)i + 1, (LPCWSTR)r.query, (LPCWSTR)r.status); Show(w, s, cInfo); }
+            return;
+        }
+        std::vector<CString> tok = PlayTokenize(arg);
+        CString nsServer;
+        if (nFlag) { if (tok.empty()) { Show(w, L"* -n needs a name server address.", cPart); return; } nsServer = tok.front(); tok.erase(tok.begin()); }
+        if (tok.empty()) { Show(w, L"* Usage: /dns [-46chmn] [name server] [nick|address]", cPart); return; }
+        CString query = tok.front();
+        DnsRequest r; r.id = ++m_dnsSeq; r.net = net; r.winName = w->m_name; r.query = query; r.nsServer = nsServer;
+        r.ipv4 = ipv4; r.ipv6 = ipv6; r.hostForce = hFlag; r.multi = mFlag;
+        IN_ADDR a4; IN6_ADDR a6;
+        bool looksIp = InetPtonW(AF_INET, query, &a4) == 1 || InetPtonW(AF_INET6, query, &a6) == 1;
+        if (looksIp) r.reverse = true;
+        else if (!hFlag && query.Find(L'.') < 0) { r.isNickname = true; r.status = L"waiting for userhost"; }   // no dot, not forced as a hostname: treat as a nick
+        m_dnsQueue.push_back(r);
+        Show(w, L"* Queued DNS request: " + query, cInfo);
+        if (r.isNickname) { m_pendingUserhost[CString(query).MakeLower()] = r.id; Send(net, L"USERHOST " + query); }
+        StartNextDnsIfIdle();
+    }
+    void StartNextDnsIfIdle() {
+        if (m_dnsQueue.empty()) return;
+        DnsRequest& r = m_dnsQueue.front();
+        if (r.status != L"queued") return;   // already resolving, waiting on a userhost reply, done, or errored
+        r.status = L"resolving";
+        auto* job = new DnsJob();
+        job->id = r.id; job->hwnd = m_hWnd;
+        job->query = (LPCWSTR)(r.resolvedHost.IsEmpty() ? r.query : r.resolvedHost);
+        job->nsServer = (LPCWSTR)r.nsServer;
+        job->ipv4 = r.ipv4; job->ipv6 = r.ipv6; job->multi = r.multi; job->reverse = r.reverse;
+        uintptr_t th = _beginthreadex(nullptr, 0, DnsWorkerProc, job, 0, nullptr);
+        if (th) CloseHandle((HANDLE)th); else { delete job; r.status = L"error"; r.error = L"Couldn't start the resolver thread."; ReportDnsResult(r); m_dnsQueue.erase(m_dnsQueue.begin()); StartNextDnsIfIdle(); }
+    }
+    void ReportDnsResult(const DnsRequest& r) {
+        CChatWnd* w = Find(r.net, r.winName); if (!w) w = Status(r.net);
+        if (!r.error.IsEmpty()) { Show(w, L"* DNS: " + r.query + L" - " + r.error, cPart); return; }
+        if (r.multi) {
+            Show(w, L"* DNS records for " + r.query + L":", cInfo);
+            for (auto& rec : r.records) Show(w, L"* " + rec.first + L": " + rec.second, cInfo);
+        } else if (r.reverse) {
+            for (auto& a : r.addrs) Show(w, L"* " + r.query + L" resolved to " + a, cInfo);
+        } else {
+            CString list; for (size_t i = 0; i < r.addrs.size(); i++) { if (i) list += L", "; list += r.addrs[i]; }
+            Show(w, L"* " + (r.resolvedHost.IsEmpty() ? r.query : r.query + L" (" + r.resolvedHost + L")") + L" resolved to " + list, cInfo);
+        }
+    }
+    afx_msg LRESULT OnDnsResult(WPARAM wp, LPARAM lp) {
+        std::unique_ptr<DnsJob> job((DnsJob*)lp);   // always delete it, however this turns out
+        int id = (int)wp;
+        for (auto& r : m_dnsQueue) if (r.id == id) {
+            r.error = job->error.c_str();
+            for (auto& a : job->addrs) r.addrs.push_back(a.c_str());
+            for (auto& rec : job->records) r.records.push_back({ CString(rec.first.c_str()), CString(rec.second.c_str()) });
+            r.status = r.error.IsEmpty() ? L"done" : L"error";
+            if (r.multi && r.error.IsEmpty()) m_lastDnsRecords = r.records;
+            ReportDnsResult(r);
+            break;
+        }
+        if (!m_dnsQueue.empty() && (m_dnsQueue.front().status == L"done" || m_dnsQueue.front().status == L"error")) m_dnsQueue.erase(m_dnsQueue.begin());
+        StartNextDnsIfIdle();
+        return 0;
     }
 
     // ---- Colors dialog: named schemes, stored in IRC.ini as [colors] n0=Name,c1,c2,...,c10 (see CColorsDlg) ----
@@ -4203,6 +4465,7 @@ public:
 };
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
+    ON_MESSAGE(WM_APP + 50, OnDnsResult)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 

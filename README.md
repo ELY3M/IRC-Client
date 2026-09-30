@@ -28,6 +28,8 @@ scripting
 identd server   
 DCC chat/file send/server      
 address book  
+notify 
+tip notify balloon  
 theme  
 ~~logging of status and chat - it will have option to disable and enable logging and location of logs~~  
 more commands  
