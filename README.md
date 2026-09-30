@@ -27,7 +27,7 @@ script editor to let you to edit aliases/vars/scripts
 scripting  
 ~~online timer~~  
 timer - needs more testing        
-identd server   
+~~identd server~~     
 DCC chat/file send/server      
 address book  
 notify  
@@ -40,8 +40,7 @@ many more.....
 
 
 # License
-
-
+```
 
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
@@ -718,4 +717,5 @@ the library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.  But first, please read
 <https://www.gnu.org/licenses/why-not-lgpl.html>.
 
+```
 

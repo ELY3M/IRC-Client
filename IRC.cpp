@@ -3957,23 +3957,24 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"366") {}
         else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cPart); Send(net, L"NICK " + net->nick); }
-        else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" (" + P(5) + L")"), cInfo); }   // RPL_WHOISUSER: nick user host * :realname
-        else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" (" + P(3) + L")"), cInfo); }      // RPL_WHOISSERVER
+        //whois stuff
+        else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)), cText); }   // RPL_WHOISUSER: nick user host * :realname
+        else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)), cText); } // RPL_WHOISSERVER
         else if (cmd == L"317") {   // RPL_WHOISIDLE: nick idle [signon] :seconds idle, signon time
             long idle = _wtol(P(2));
             CString s; s.Format(L"%s has been idle for %ldh %ldm %lds", (LPCWSTR)P(1), idle / 3600, (idle / 60) % 60, idle % 60);
             CString signon = P(3);
             if (!signon.IsEmpty() && IsAllDigits(signon)) { CTime ct((time_t)_wtoi64(signon)); s += L", signed on " + ct.Format(L"%a %b %d %H:%M:%S %Y"); }
-            Note(net, s, cInfo);
+            Note(net, s, cText);
         }
-        else if (cmd == L"318") { Note(net, L"-- End of WHOIS --", cInfo); }              // RPL_ENDOFWHOIS
-        else if (cmd == L"319") { Note(net, P(1) + L" is on channels: " + P(2), cInfo); }  // RPL_WHOISCHANNELS
+        else if (cmd == L"318") { Note(net, P(1) + L" End of /WHOIS list.", cText); }  //End of /WHOIS list. //-- End of WHOIS -- // RPL_ENDOFWHOIS
+        else if (cmd == L"319") { Note(net, P(1) + L" is on channels: " + P(2), cText); }  // RPL_WHOISCHANNELS
         else if (cmd == L"301" || cmd == L"313" || cmd == L"330" || cmd == L"338" || cmd == L"378" || cmd == L"379" || cmd == L"671") {
             // other common WHOIS-block lines (away, IRC operator, logged-in-as, actual host, connecting-from, user modes,
             // secure connection -- numbers and exact wording vary by server); joined the same way the old generic
             // fallback did, just consistently colored with the rest of the WHOIS block instead of falling through to it
             CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
-            Note(net, j.IsEmpty() ? raw : j, cInfo);
+            Note(net, j.IsEmpty() ? raw : j, cText);
         }
         else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
             CString trailing = P(1); int tp = 0;
