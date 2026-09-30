@@ -24,7 +24,9 @@ you may get random bugs, glitches, or crashes.
 ~~popup system~~  
 ~~variables system~~  
 script editor to let you to edit aliases/vars/scripts   
-scripting   
+scripting
+~~online timer~~
+timer - needs more testing      
 identd server   
 DCC chat/file send/server      
 address book  
