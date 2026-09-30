@@ -459,6 +459,19 @@ END_MESSAGE_MAP()
 // ---------------- Channel Favorites: bookmarked channels, stored in channels.ini ----------------
 struct ChanFav { CString chan, key, net; };   // net is just a display hint (where it was added from); joining always uses the active connection
 
+struct Net;   // full definition comes much later in the file; PlayItem only needs the pointer, so a forward declaration is enough here
+// One queued /play request: a set of lines to send out one at a time on a timer. See CMainFrame::CmdPlay / PlayTick.
+struct PlayItem {
+    Net* net = nullptr;
+    CString target, alias, fname, topic;
+    int delay = 1000;
+    bool echo = false, asCmd = false, notice = false, clipTemp = false;
+    std::vector<CString> lines;
+    size_t pos = 0;
+    ULONGLONG dueAt = 0;   // GetTickCount64() value at which the next line may send; 0 = not yet scheduled (send immediately)
+    CString Status() const { return pos == 0 ? CString(L"waiting") : (pos >= lines.size() ? CString(L"done") : CString(L"running")); }
+};
+
 // A named set of colors (the Colors dialog): 7 text colors for message types, plus 3 background colors that apply to
 // the chat log, the input box, and the nick list (CLR_NONE for any of the ten means "use the system default").
 struct ColorScheme {
@@ -655,6 +668,55 @@ public:
 BEGIN_MESSAGE_MAP(CColorPickerDlg, CDialog)
 END_MESSAGE_MAP()
 
+// /playctrl: lists the current /play queue (see CMainFrame::CmdPlayCtrl). Remove takes out just the selected
+// request; Stop All clears the whole queue and halts playback.
+enum { IDC_PC_LIST = 621, IDC_PC_REMOVE, IDC_PC_STOPALL };
+class CPlayCtrlDlg : public CDialog {
+    std::vector<PlayItem>& q; std::vector<WORD> t; int cnt = 0; CListBox m_list;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    void Refill() {
+        m_list.ResetContent();
+        for (auto& it : q) {
+            CString s; s.Format(L"%s -> %s  (%d/%d)  %dms  [%s]", (LPCWSTR)it.fname, (LPCWSTR)it.target, (int)it.pos, (int)it.lines.size(), it.delay, (LPCWSTR)it.Status());
+            m_list.AddString(s);
+        }
+        GetDlgItem(IDC_PC_REMOVE)->EnableWindow(m_list.GetCount() > 0);
+    }
+public:
+    CPlayCtrlDlg(std::vector<PlayItem>& queue, CWnd* parent) : q(queue) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(280); t.push_back(140);
+        t.push_back(0); t.push_back(0); S(L"Play Central"); t.push_back(9); S(DEFAULT_FONT);
+        Item(LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL | WS_BORDER | WS_TABSTOP, 8, 8, 264, 100, IDC_PC_LIST, 0x0083, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 8, 116, 60, 14, IDC_PC_REMOVE, 0x0080, L"Remove");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 72, 116, 60, 14, IDC_PC_STOPALL, 0x0080, L"Stop All");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 212, 116, 60, 14, IDCANCEL, 0x0080, L"Close");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override { CDialog::OnInitDialog(); m_list.SubclassDlgItem(IDC_PC_LIST, this); Refill(); return TRUE; }
+    afx_msg void OnRemove() {
+        int i = m_list.GetCurSel(); if (i < 0 || i >= (int)q.size()) return;
+        if (q[i].clipTemp) ::DeleteFileW(q[i].fname);
+        q.erase(q.begin() + i); Refill();
+    }
+    afx_msg void OnStopAll() {
+        for (auto& it : q) if (it.clipTemp) ::DeleteFileW(it.fname);
+        q.clear(); Refill();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CPlayCtrlDlg, CDialog)
+    ON_BN_CLICKED(IDC_PC_REMOVE, OnRemove) ON_BN_CLICKED(IDC_PC_STOPALL, OnStopAll)
+END_MESSAGE_MAP()
+
 class CAboutDlg : public CDialog {
     std::vector<WORD> t; int cnt = 0;
     CClickableStatic m_banner; 
@@ -797,7 +859,8 @@ protected:
     afx_msg void OnLButtonUp(UINT, CPoint p) {
         Default();
         long s = 0, e = 0; GetSel(s, e);
-        if (s != e || !onLink) return;                         // dragging a selection is not a click
+        if (s != e) { Copy(); return; }                         // a selection was just made: auto-copy it, like a Windows console window
+        if (!onLink) return;
         int idx = CharFromPos(p), li = LineFromChar(idx), st = LineIndex(li);
         CString ln; GetTextRange(st, st + LineLength(idx), ln);
         int q = idx - st, n = ln.GetLength(); if (q > n) q = n;
@@ -2009,6 +2072,7 @@ class CMainFrame : public CMDIFrameWnd {
     CMdiClient m_mdiWrap;   // the MDI workspace, subclassed once m_hWndMDIClient exists (see Start())
     bool m_logEnabled = false; CString m_logFolder;   // chat history logging (see LoadLogging/SaveLogging/WriteLog)
     bool m_tsGlobalOn = true; CString m_tsEventFmt = L"[HH:nn]", m_tsLogFmt = L"[HH:nn:ss]";   // see /timestamp, LoadTimestamp/SaveTimestamp
+    std::vector<PlayItem> m_playQueue; CString m_pnick; UINT_PTR m_playTimerId = 0;   // see /play, /playctrl, PlayTick
     std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
@@ -2229,6 +2293,7 @@ class CMainFrame : public CMDIFrameWnd {
         Net* net = w ? w->net : nullptr;
         CTime now = CTime::GetCurrentTime();
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
+        if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"null") { val.Empty(); return true; }
         if (name == L"server") { val = (net && net->conn) ? net->o.host : CString(); return true; }   // empty ($null) when not connected
         if (name == L"menu" || name == L"menutype" || name == L"menucontext") { val = m_menuType; return true; }   // which popup is being built: status channel query nicklist menubar
@@ -2453,6 +2518,24 @@ class CMainFrame : public CMDIFrameWnd {
             val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
         }
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
+        if (name == L"play") {   // $play(N) or $play(Nick,N): .type .fname .topic .pos .lines .delay .status
+            CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L',');
+            CString who = c < 0 ? CString() : a.Left(c); who.Trim();
+            double nn = 1; if (!ParseNum(c < 0 ? a : a.Mid(c + 1), nn)) return false;
+            std::vector<size_t> hits;
+            for (size_t i = 0; i < m_playQueue.size(); i++) if (who.IsEmpty() || m_playQueue[i].target.CompareNoCase(who) == 0) hits.push_back(i);
+            int idx = (int)nn;
+            if (idx < 1 || idx > (int)hits.size()) { val.Empty(); return true; }
+            PlayItem& it = m_playQueue[hits[idx - 1]];
+            if (prop == L"fname") val = it.fname;
+            else if (prop == L"topic") val = it.topic;
+            else if (prop == L"pos") val.Format(L"%d", (int)it.pos);
+            else if (prop == L"lines") val.Format(L"%d", (int)it.lines.size());
+            else if (prop == L"delay") val.Format(L"%d", it.delay);
+            else if (prop == L"status") val = it.Status();
+            else val = it.asCmd ? L"c" : (!it.alias.IsEmpty() ? L"a" : (it.notice ? L"n" : L"m"));   // .type: c=command, a=alias, n=notice, m=message
+            return true;
+        }
         if (name == L"var") {   // $var(%pattern,N)  N=0 -> how many match;  .value  .local  .secs
             int c = rawArgs.ReverseFind(L',');
             CString pat = c < 0 ? rawArgs : rawArgs.Left(c); pat.Trim();
@@ -3200,6 +3283,8 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"channel") OpenChannelCentral(w, arg);
         else if (cmd == L"colors") OnColorsDialog();
         else if (cmd == L"logging") OnLoggingDialog();
+        else if (cmd == L"play") CmdPlay(w, arg);
+        else if (cmd == L"playctrl") CmdPlayCtrl(w);
         else if (cmd == L"timestamp") {
             CString a = arg; a.Trim();
             if (a.Left(2).CompareNoCase(L"-f") == 0) {
@@ -3258,7 +3343,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3442,6 +3527,134 @@ class CMainFrame : public CMDIFrameWnd {
         CString line = FormatTimestamp(m_tsLogFmt) + L" " + rawLine;   // the log's own timestamp format, independent of what's shown on screen (see /timestamp -g); the space is always added regardless of the format string
         FILE* f = nullptr;
         if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f) { fwprintf(f, L"%s\n", (LPCWSTR)line); fclose(f); }
+    }
+
+    // ---- /play: queues a text file's lines to be sent out one at a time on a timer (see PlayTick) ----
+    static std::vector<CString> PlayTokenize(const CString& s) {   // splits on spaces, honoring "quoted phrases" as one token
+        std::vector<CString> out; CString cur = s; cur.TrimLeft();
+        while (!cur.IsEmpty()) {
+            CString tok;
+            if (cur[0] == L'"') { int e = cur.Find(L'"', 1); if (e > 0) { tok = cur.Mid(1, e - 1); cur = cur.Mid(e + 1); } else { tok = cur.Mid(1); cur.Empty(); } }
+            else { int sp = cur.Find(L' '); if (sp < 0) { tok = cur; cur.Empty(); } else { tok = cur.Left(sp); cur = cur.Mid(sp + 1); } }
+            cur.TrimLeft(); if (!tok.IsEmpty()) out.push_back(tok);
+        }
+        return out;
+    }
+    static bool IsAllDigits(const CString& s) { if (s.IsEmpty()) return false; for (int i = 0; i < s.GetLength(); i++) if (!iswdigit(s[i])) return false; return true; }
+    static std::vector<CString> ReadTextLines(const CString& path) {
+        std::vector<CString> lines; FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f) return lines;
+        wchar_t buf[4096];
+        while (fgetws(buf, 4096, f)) { CString l = buf; l.TrimRight(L"\r\n"); lines.push_back(l); }
+        fclose(f); return lines;
+    }
+    static bool IsSectionHeader(const CString& raw, CString* name) {   // a trimmed line reading exactly "[name]"
+        CString t = raw; t.Trim();
+        if (t.GetLength() < 3 || t[0] != L'[' || t[t.GetLength() - 1] != L']') return false;
+        if (name) *name = t.Mid(1, t.GetLength() - 2);
+        return true;
+    }
+    void CmdPlay(CChatWnd* w, CString arg) {
+        Net* net = w->net; arg.Trim();
+        if (arg.CompareNoCase(L"stop") == 0) { m_playQueue.clear(); StopPlayTimer(); Show(w, L"* Playback stopped and queue cleared.", cInfo); return; }
+        if (arg.IsEmpty()) { Show(w, L"* Usage: /play [-aescpbnrx q# m# l# f# t<topic>] [alias] [channel/nick] <filename> [delay]  or  /play stop  (see /playctrl to manage the queue)", cPart); return; }
+        bool aFlag = false, eFlag = false, sFlag = false, cFlag = false, pFlag = false, bFlag = false, nFlag = false, rFlag = false, xFlag = false;
+        int qMax = -1, mMax = -1, lLine = -1, fFrom = -1; CString topic;
+        if (arg[0] == L'-') {
+            int i = 1; for (; i < arg.GetLength() && arg[i] != L' '; i++) {
+                wchar_t c = arg[i];
+                if (c == L'a') aFlag = true; else if (c == L'e') eFlag = true; else if (c == L's') sFlag = true;
+                else if (c == L'c') cFlag = true; else if (c == L'p') pFlag = true; else if (c == L'b') bFlag = true;
+                else if (c == L'n') nFlag = true; else if (c == L'r') rFlag = true; else if (c == L'x') xFlag = true;
+                else if (c == L'q' || c == L'm' || c == L'l' || c == L'f') {
+                    CString digs; while (i + 1 < arg.GetLength() && iswdigit(arg[i + 1])) digs += arg[++i];
+                    int v = digs.IsEmpty() ? 0 : _wtoi(digs);
+                    if (c == L'q') qMax = v; else if (c == L'm') mMax = v; else if (c == L'l') lLine = v; else fFrom = v;
+                } else if (c == L't') {   // -t consumes the rest of this token as the topic name, e.g. "-thelp1" -> topic "help1"
+                    int sp = arg.Find(L' ', i);
+                    topic = arg.Mid(i + 1, (sp < 0 ? arg.GetLength() : sp) - i - 1);
+                    i = (sp < 0 ? arg.GetLength() : sp) - 1;   // -1 because the for loop's own i++ runs next; leaves i pointing at the space (or end)
+                }
+            }
+            arg = arg.Mid(i); arg.TrimLeft();
+        }
+        std::vector<CString> tok = PlayTokenize(arg);
+        CString aliasName; if (aFlag && !tok.empty()) { aliasName = tok.front(); tok.erase(tok.begin()); }
+        int delay = 1000;
+        if (!tok.empty() && IsAllDigits(tok.back()) && (bFlag ? tok.size() >= 1 : tok.size() >= 2)) { delay = _wtoi(tok.back()); tok.pop_back(); }
+        CString target, fname;
+        if (bFlag) { if (!tok.empty()) target = tok.front(); }
+        else {
+            if (tok.empty()) { Show(w, L"* /play needs a filename.", cPart); return; }
+            fname = tok.back(); tok.pop_back();
+            if (!tok.empty()) target = tok.front();
+        }
+        if (target.IsEmpty()) target = (w->m_name != L"*status*") ? w->m_name : CString();
+        if (target.IsEmpty() || target == L"*status*") { Show(w, L"* /play needs a channel or nick (the current window is Status).", cPart); return; }
+        if (!sFlag && (!net || !net->conn)) { Show(w, L"* Not connected. Use -s to play to a window while offline.", cPart); return; }
+        PlayItem it; it.net = net; it.target = target; it.alias = aliasName; it.topic = topic;
+        it.delay = delay; it.echo = eFlag; it.asCmd = cFlag; it.notice = nFlag;
+        if (bFlag) {
+            CString clip; if (OpenClipboard()) { HANDLE h = GetClipboardData(CF_UNICODETEXT); if (h) clip = (LPCWSTR)GlobalLock(h); if (h) GlobalUnlock(h); CloseClipboard(); }
+            if (clip.IsEmpty()) { Show(w, L"* Clipboard is empty or isn't text.", cPart); return; }
+            fname = IniPath(L"playclip.txt"); FILE* f = nullptr;
+            if (_wfopen_s(&f, fname, L"w, ccs=UTF-8") == 0 && f) { fwprintf(f, L"%s", (LPCWSTR)clip); fclose(f); }
+            it.clipTemp = true;
+        }
+        it.fname = fname;
+        std::vector<CString> all = ReadTextLines(fname);
+        if (all.empty()) { Show(w, L"* Couldn't read (or empty): " + fname, cPart); return; }
+        bool hadCountHint = !all.empty() && IsAllDigits(CString(all[0]).Trim(L" \t"));
+        if (!topic.IsEmpty()) {
+            size_t start = SIZE_MAX; CString hdr;
+            for (size_t i = 0; i < all.size(); i++) if (IsSectionHeader(all[i], &hdr) && hdr.CompareNoCase(topic) == 0) { start = i + 1; break; }
+            if (start == SIZE_MAX) { Show(w, L"* Topic [" + topic + L"] not found in " + fname, cPart); return; }
+            for (size_t i = start; i < all.size() && !IsSectionHeader(all[i], nullptr); i++) it.lines.push_back(all[i]);
+        } else {
+            size_t base = (rFlag || lLine > 0 || fFrom > 0) && !xFlag && hadCountHint ? 1 : 0;   // the optional line-count hint on line 1, per mIRC's spec
+            if (rFlag) {
+                std::vector<CString> nonEmpty; for (size_t i = base; i < all.size(); i++) if (!CString(all[i]).Trim().IsEmpty()) nonEmpty.push_back(all[i]);
+                if (!nonEmpty.empty()) it.lines.push_back(nonEmpty[rand() % nonEmpty.size()]);
+            } else if (lLine > 0) { size_t idx = base + lLine - 1; if (idx < all.size()) it.lines.push_back(all[idx]); }
+            else if (fFrom > 0) { for (size_t i = base + fFrom - 1; i < all.size(); i++) it.lines.push_back(all[i]); }
+            else for (size_t i = 0; i < all.size(); i++) it.lines.push_back(all[i]);
+        }
+        if (it.lines.empty()) { Show(w, L"* Nothing to play from " + fname, cPart); return; }
+        if (qMax >= 0 && (int)m_playQueue.size() >= qMax) { CString msg; msg.Format(L"* Play queue is full (-q%d).", qMax); Show(w, msg, cPart); return; }
+        if (mMax >= 0) { int have = 0; for (auto& q : m_playQueue) if (q.target.CompareNoCase(target) == 0) have++; if (have >= mMax) { Show(w, L"* That target already has enough queued (-m).", cPart); return; } }
+        if (pFlag && !m_playQueue.empty()) m_playQueue.insert(m_playQueue.begin(), it); else m_playQueue.push_back(it);
+        CString msg; msg.Format(L"* Queued %s -> %s (%d line(s), %dms)", (LPCWSTR)fname, (LPCWSTR)target, (int)it.lines.size(), delay);
+        Show(w, msg, cInfo);
+        StartPlayTimer();
+    }
+    void StartPlayTimer() { if (!m_playTimerId && !m_playQueue.empty()) m_playTimerId = SetTimer(2001, 50, nullptr); }
+    void StopPlayTimer() { if (m_playTimerId) { KillTimer(m_playTimerId); m_playTimerId = 0; } }
+    void PlayTick() {   // called every 50ms; the head item only actually sends once its own dueAt has elapsed
+        if (m_playQueue.empty()) { StopPlayTimer(); return; }
+        PlayItem& it = m_playQueue.front();
+        ULONGLONG now = GetTickCount64();
+        if (it.dueAt == 0) it.dueAt = now;
+        if (now < it.dueAt) return;
+        if (it.pos >= it.lines.size()) {
+            if (it.clipTemp) ::DeleteFileW(it.fname);
+            m_playQueue.erase(m_playQueue.begin());
+            if (m_playQueue.empty()) StopPlayTimer();
+            return;
+        }
+        CString line = it.lines[it.pos++]; m_pnick = it.target;
+        CChatWnd* w = Find(it.net, it.target); if (!w && it.net) w = Open(it.net, it.target, IsChan(it.target));   // -s only controls whether a connection is required to start playing at all (checked in CmdPlay); the target window itself always opens normally
+        if (!line.IsEmpty()) {
+            if (it.asCmd) { if (w) Dispatch(w, line); }
+            else if (!it.alias.IsEmpty()) { if (w) { if (AliasDef* ad = FindAlias(it.alias)) RunAlias(w, *ad, it.target + L" " + line); } }
+            else if (it.notice) { if (it.net && it.net->conn) Send(it.net, L"NOTICE " + it.target + L" :" + line); if (it.echo && w) Show(w, L"-> -" + it.target + L"- " + line, cNote); }
+            else { if (it.net && it.net->conn) Say(it.net, it.target, line); }
+        }
+        it.dueAt = now + (ULONGLONG)it.delay;
+    }
+    void CmdPlayCtrl(CChatWnd* w) {
+        CPlayCtrlDlg dlg(m_playQueue, this);
+        dlg.DoModal();
+        if (m_playQueue.empty()) StopPlayTimer();
     }
 
     // ---- Colors dialog: named schemes, stored in IRC.ini as [colors] n0=Name,c1,c2,...,c10 (see CColorsDlg) ----
@@ -3745,7 +3958,10 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnUpdateSwTop(CCmdUI* u) { u->SetCheck(m_swTop); }
     afx_msg void OnUpdateSwBottom(CCmdUI* u) { u->SetCheck(!m_swTop); }
     bool m_menuOpen = false;   // true while a TrackPopupMenu is showing; our timer must not touch layout/bars during that
-    afx_msg void OnTimer(UINT_PTR) { if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); }
+    afx_msg void OnTimer(UINT_PTR id) {
+        if (id == 2001) { PlayTick(); return; }   // /play: ticks independently of the UI-refresh timer below, and even while a menu is open
+        if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars();
+    }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
         *pResult = 0;
         CPoint pt; GetCursorPos(&pt);
