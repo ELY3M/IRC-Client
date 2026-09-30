@@ -25,6 +25,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <vector>
 #include <functional>
 #include <string>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -309,7 +310,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -512,6 +513,57 @@ struct DnsRequest {
 // What actually crosses the thread boundary: plain std::wstring/std::vector only (no CString/MFC heap assumptions
 // across threads). The worker fills in the result fields, then posts this pointer back; the main thread owns
 // deleting it afterward.
+// ---------------- Identd server: a minimal RFC 1413 responder, always answering with the configured userid/system ----------------
+// Like mIRC's own, this doesn't actually look up which local process owns the queried ports -- it just answers every
+// query with the configured identity, which is all a real identd check from an IRC server is looking for anyway.
+struct IdentdState {
+    std::atomic<bool> stop{false}, running{false};
+    std::wstring userId, system;
+    int port = 113;
+    HWND hwnd = nullptr;
+};
+static std::string WToA(const std::wstring& s) {   // ASCII-only narrow conversion: identd's userid/system fields are always plain ASCII (RFC 1413 / mIRC's own field rules), so a per-character truncating cast is correct here, not lossy
+    std::string out; out.reserve(s.size());
+    for (wchar_t c : s) out.push_back(static_cast<char>(c));
+    return out;
+}
+static unsigned __stdcall IdentdThreadProc(void* p) {
+    std::shared_ptr<IdentdState> state = *(std::shared_ptr<IdentdState>*)p; delete (std::shared_ptr<IdentdState>*)p;
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) { state->running = false; return 0; }
+    BOOL reuse = TRUE; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
+    sockaddr_in addr = {}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons((u_short)state->port);
+    if (bind(ls, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR || listen(ls, 5) == SOCKET_ERROR) { closesocket(ls); state->running = false; return 0; }
+    state->running = true;
+    while (!state->stop) {
+        fd_set fds; FD_ZERO(&fds); FD_SET(ls, &fds);
+        timeval tv{ 1, 0 };
+        if (select(0, &fds, nullptr, nullptr, &tv) <= 0) continue;
+        sockaddr_in peer = {}; int peerLen = sizeof(peer);
+        SOCKET c = accept(ls, (sockaddr*)&peer, &peerLen);
+        if (c == INVALID_SOCKET) continue;
+        DWORD rcvTimeoutMs = 5000; setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (char*)&rcvTimeoutMs, sizeof(rcvTimeoutMs));   // Windows wants milliseconds here, not a timeval like POSIX does
+        char buf[256] = {}; int n = recv(c, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            std::string line(buf, n);
+            size_t comma = line.find(',');
+            if (comma != std::string::npos) {
+                auto trim = [](std::string s) { size_t a = 0, b = s.size(); while (a < b && isspace((unsigned char)s[a])) a++; while (b > a && isspace((unsigned char)s[b - 1])) b--; return s.substr(a, b - a); };
+                std::string p1 = trim(line.substr(0, comma)), p2 = trim(line.substr(comma + 1));
+                std::string userIdA = WToA(state->userId), sysA = WToA(state->system);
+                std::string reply = p1 + " , " + p2 + " : USERID : " + sysA + " : " + userIdA + "\r\n";
+                send(c, reply.c_str(), (int)reply.size(), 0);
+                wchar_t ipbuf[64] = {}; InetNtopW(AF_INET, &peer.sin_addr, ipbuf, 64);
+                auto* notice = new std::pair<std::wstring, std::wstring>(ipbuf, std::wstring(reply.begin(), reply.end()));
+                ::PostMessage(state->hwnd, WM_APP + 51, 0, (LPARAM)notice);
+            }
+        }
+        closesocket(c);
+    }
+    closesocket(ls); state->running = false;
+    return 0;
+}
+
 struct DnsJob {
     int id = 0; HWND hwnd = nullptr;
     std::wstring query, nsServer;
@@ -2199,6 +2251,73 @@ BEGIN_MESSAGE_MAP(CLoggingDlg, CDialog)
     ON_BN_CLICKED(IDC_LG_BROWSE, OnBrowse) ON_BN_CLICKED(IDC_LG_HELP, OnHelpBtn)
 END_MESSAGE_MAP()
 
+// ---------------- Identd server settings dialog (File > Identd Server...) ----------------
+enum { IDC_ID_ENABLE = 661, IDC_ID_USERID, IDC_ID_SYSTEM, IDC_ID_PORT, IDC_ID_SHOWREQ, IDC_ID_ONLYCONN, IDC_ID_USEEMAIL, IDC_ID_HELP };
+class CIdentdDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    bool enabled, showReq, onlyConnecting, useEmail; CString userId, system; int port;
+    CIdentdDlg(bool en, const CString& uid, const CString& sys, int prt, bool show, bool onlyConn, bool useE, CWnd* parent)
+        : enabled(en), showReq(show), onlyConnecting(onlyConn), useEmail(useE), userId(uid), system(sys), port(prt) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(240); t.push_back(150);
+        t.push_back(0); t.push_back(0); S(L"Identd Server"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 200, 10, IDC_ID_ENABLE, 0x0080, L"Enable Identd Server");
+        Item(SS_LEFT, 8, 24, 60, 9, 0xFFFF, 0x0082, L"User ID:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 70, 22, 100, 12, IDC_ID_USERID, 0x0081, L"");
+        Item(SS_LEFT, 8, 40, 60, 9, 0xFFFF, 0x0082, L"System:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 70, 38, 100, 12, IDC_ID_SYSTEM, 0x0081, L"");
+        Item(SS_LEFT, 8, 56, 60, 9, 0xFFFF, 0x0082, L"Port:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 70, 54, 50, 12, IDC_ID_PORT, 0x0081, L"");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 72, 220, 10, IDC_ID_SHOWREQ, 0x0080, L"Show Identd requests");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 86, 220, 10, IDC_ID_ONLYCONN, 0x0080, L"Enable only when connecting");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 100, 220, 10, IDC_ID_USEEMAIL, 0x0080, L"Use ID from email address");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 34, 122, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 90, 122, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 146, 122, 50, 14, IDC_ID_HELP, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        CheckDlgButton(IDC_ID_ENABLE, enabled); CheckDlgButton(IDC_ID_SHOWREQ, showReq);
+        CheckDlgButton(IDC_ID_ONLYCONN, onlyConnecting); CheckDlgButton(IDC_ID_USEEMAIL, useEmail);
+        SetDlgItemText(IDC_ID_USERID, userId); SetDlgItemText(IDC_ID_SYSTEM, system);
+        SetDlgItemInt(IDC_ID_PORT, port, FALSE);
+        GetDlgItem(IDC_ID_USERID)->EnableWindow(!useEmail);
+        return TRUE;
+    }
+    afx_msg void OnUseEmail() { GetDlgItem(IDC_ID_USERID)->EnableWindow(!IsDlgButtonChecked(IDC_ID_USEEMAIL)); }
+    afx_msg void OnHelpBtn() {
+        AfxMessageBox(L"When enabled, this answers \"ident\" queries on the given port (normally 113) with the User ID "
+                      L"and System you set below -- some IRC servers refuse a connection without a reply to one.\n\n"
+                      L"\"Use ID from email address\" isn't quite literal here, since this client doesn't have a separate "
+                      L"email field: it uses your connection's Username (ident) field instead.\n\n"
+                      L"\"Enable only when connecting\" starts the server right as you connect and stops it again the "
+                      L"moment a request is answered (or shortly after, if none arrives).", MB_ICONINFORMATION);
+    }
+    void OnOK() override {
+        enabled = IsDlgButtonChecked(IDC_ID_ENABLE) != 0; showReq = IsDlgButtonChecked(IDC_ID_SHOWREQ) != 0;
+        onlyConnecting = IsDlgButtonChecked(IDC_ID_ONLYCONN) != 0; useEmail = IsDlgButtonChecked(IDC_ID_USEEMAIL) != 0;
+        GetDlgItemText(IDC_ID_USERID, userId); GetDlgItemText(IDC_ID_SYSTEM, system);
+        port = (int)GetDlgItemInt(IDC_ID_PORT, nullptr, FALSE);
+        userId.Trim(); system.Trim(); if (system.IsEmpty()) system = L"UNIX"; if (port <= 0) port = 113;
+        CDialog::OnOK();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CIdentdDlg, CDialog)
+    ON_BN_CLICKED(IDC_ID_USEEMAIL, OnUseEmail) ON_BN_CLICKED(IDC_ID_HELP, OnHelpBtn)
+END_MESSAGE_MAP()
+
 // ---------------- Online Timer dialog: current-connection and cumulative connect time (see CMainFrame's OT* members) ----------------
 enum { IDC_OT_ENABLE = 641, IDC_OT_CURTIME, IDC_OT_CURDATE, IDC_OT_CURRESET, IDC_OT_TOTTIME, IDC_OT_TOTDATE, IDC_OT_TOTRESET, IDC_OT_SHOWTOTAL };
 class COnlineTimerDlg : public CDialog {
@@ -2284,6 +2403,12 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<DnsRequest> m_dnsQueue; std::map<CString, int> m_pendingUserhost; int m_dnsSeq = 0;
     std::vector<std::pair<CString, CString>> m_lastDnsRecords;   // the most recently completed -m request's records, for $dns(T,N)
     std::vector<TimerInfo> m_timers; CString m_ltimer; UINT_PTR m_timerTickId = 0;   // see /timer, /timers, TimerTick
+    // ---- Identd server ----
+    bool m_identdEnabled = false, m_identdShowReq = true, m_identdOnlyConnecting = false, m_identdUseEmail = false;
+    CString m_identdUserId = L"user", m_identdSystem = L"UNIX"; int m_identdPort = 113;
+    std::shared_ptr<IdentdState> m_identdState;
+    Net* m_identdTriggerNet = nullptr;   // which network's status window to report requests to, when started via "only when connecting"
+    ULONGLONG m_identdAutoStopAt = 0;    // "only when connecting" fallback: stop even if no request ever arrives
     // ---- Online Timer: current-connection and cumulative connect time (unrelated to the scheduled-command /timer feature above) ----
     bool m_otEnabled = true, m_otShowTotal = true;
     ULONGLONG m_otSessionStart = 0;   // GetTickCount64() when the current unbroken "connected" streak began; 0 = not currently counting
@@ -2465,6 +2590,7 @@ class CMainFrame : public CMDIFrameWnd {
         else        { Send(net, L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + net->nick + L"> " + text, cOwn); }
     }
     void Connect(Net* net, const CString& host, UINT port) {
+        if (m_identdEnabled && m_identdOnlyConnecting) StartIdentd(net);
         if (net->sock.m_hSocket != INVALID_SOCKET) net->sock.Close();
         net->conn = false; net->network.Empty(); net->chanmodes = L"beI,k,l,imnpst"; net->sock.buf.Empty(); net->sock.sendq.clear();
         delete net->sock.tls; net->sock.tls = nullptr;
@@ -3239,8 +3365,14 @@ class CMainFrame : public CMDIFrameWnd {
         static const wchar_t* cp[] = { L"Channel Modes:/channel" };
         static const wchar_t* qp[] = { L"Info:/uwho $$1", L"Whois:/whois $$1", L"Query:/query $$1", L"-", L"Ignore:/ignore $$1 1 | /closemsg $$1", L"-", L"CTCP",
             L".Ping:/ctcp $$1 ping", L".Time:/ctcp $$1 time", L".Version:/ctcp $$1 version", L"DCC", L".Send:/dcc send $$1", L".Chat:/dcc chat $$1" };
-        static const wchar_t* lp[] = { L"Info:/uwho $1", L"Whois:/whois $$1", L"Query:/query $$1", L"-", L"Control", L".Ignore:/ignore $$1 1", L".Unignore:/ignore -r $$1 1",
-            L".Op:/mode # +ooo $$1 $2 $3", L".Deop:/mode # -ooo $$1 $2 $3", L".Voice:/mode # +vvv $$1 $2 $3", L".Devoice:/mode # -vvv $$1 $2 $3", L".Kick:/kick # $$1",
+        static const wchar_t* lp[] = { L"Info:/uwho $1", L"Whois:/whois $$1", L"Query:/query $$1", L"-", L"Control", L".Ignore:/ignore $$1 1", L".Unignore:/ignore -r $$1 1",            
+            L".Op:/mode # +ooo $$1 $2 $3", 
+            L".Deop:/mode # -ooo $$1 $2 $3", 
+            L".Halfop:/mode # +hhh $$1 $2 $3",
+            L".DeHalfop:/mode # -hhh $$1 $2 $3",
+            L".Voice:/mode # +vvv $$1 $2 $3", 
+            L".Devoice:/mode # -vvv $$1 $2 $3", 
+            L".Kick:/kick # $$1",
             L".Kick (why):/kick # $$1 $$?=\"Reason:\"", L".Ban:/ban $$1 2", L".Ban, Kick:/ban $$1 2 | /timer 1 3 /kick # $$1", L".Ban, Kick (why):/ban $$1 2 | /timer 1 3 /kick # $$1 $$?=\"Reason:\"",
             L"CTCP", L".Ping:/ctcp $$1 ping", L".Time:/ctcp $$1 time", L".Version:/ctcp $$1 version", L"DCC", L".Send:/dcc send $$1", L".Chat:/dcc chat $$1", L"-",
             L"Slap!:/me slaps $$1 around a bit with a large trout" };
@@ -3505,6 +3637,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (ad && !OnRunStack(ad->name)) { RunAlias(w, *ad, arg); return; }   // an alias may still call the built-in command of its own name
         }
         if (cmd == L"timers") { CmdTimers(w, arg); return; }   // reserved: "/timers" is always the list/off-all command, never a timer literally named "s"
+        if (cmd == L"identd") { CmdIdentd(w, arg); return; }
         if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
         if (cmd.Left(5) == L"timer" && cmd.GetLength() > 5) { CmdTimer(w, cmdRaw.Mid(5), arg); return; }   // "/timer1", "/timershow", etc: the timer name follows directly, no space
         if (cmd == L"server" || cmd == L"connect") {
@@ -3714,7 +3847,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3824,6 +3957,24 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"366") {}
         else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cPart); Send(net, L"NICK " + net->nick); }
+        else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" (" + P(5) + L")"), cInfo); }   // RPL_WHOISUSER: nick user host * :realname
+        else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" (" + P(3) + L")"), cInfo); }      // RPL_WHOISSERVER
+        else if (cmd == L"317") {   // RPL_WHOISIDLE: nick idle [signon] :seconds idle, signon time
+            long idle = _wtol(P(2));
+            CString s; s.Format(L"%s has been idle for %ldh %ldm %lds", (LPCWSTR)P(1), idle / 3600, (idle / 60) % 60, idle % 60);
+            CString signon = P(3);
+            if (!signon.IsEmpty() && IsAllDigits(signon)) { CTime ct((time_t)_wtoi64(signon)); s += L", signed on " + ct.Format(L"%a %b %d %H:%M:%S %Y"); }
+            Note(net, s, cInfo);
+        }
+        else if (cmd == L"318") { Note(net, L"-- End of WHOIS --", cInfo); }              // RPL_ENDOFWHOIS
+        else if (cmd == L"319") { Note(net, P(1) + L" is on channels: " + P(2), cInfo); }  // RPL_WHOISCHANNELS
+        else if (cmd == L"301" || cmd == L"313" || cmd == L"330" || cmd == L"338" || cmd == L"378" || cmd == L"379" || cmd == L"671") {
+            // other common WHOIS-block lines (away, IRC operator, logged-in-as, actual host, connecting-from, user modes,
+            // secure connection -- numbers and exact wording vary by server); joined the same way the old generic
+            // fallback did, just consistently colored with the rest of the WHOIS block instead of falling through to it
+            CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
+            Note(net, j.IsEmpty() ? raw : j, cInfo);
+        }
         else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
             CString trailing = P(1); int tp = 0;
             for (CString entry = trailing.Tokenize(L" ", tp); !entry.IsEmpty(); entry = trailing.Tokenize(L" ", tp)) {
@@ -3908,7 +4059,7 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- Online Timer: persistence and live state ----
     static CString OtFormatDate(const CTime& t) { return t.GetTime() <= 0 ? CString() : t.Format(L"%a %b %d %H:%M:%S %Y"); }
     static CTime OtParseDate(const CString& s) {
-        int y, mo, d, h, mi, se; wchar_t wk[8] = {}, mn[8] = {};
+        int y, d, h, mi, se; wchar_t wk[8] = {}, mn[8] = {};
         if (swscanf_s(s, L"%3s %3s %d %d:%d:%d %d", wk, (unsigned)_countof(wk), mn, (unsigned)_countof(mn), &d, &h, &mi, &se, &y) != 7) return CTime((time_t)0);
         static const wchar_t* mons[12] = { L"Jan",L"Feb",L"Mar",L"Apr",L"May",L"Jun",L"Jul",L"Aug",L"Sep",L"Oct",L"Nov",L"Dec" };
         int mnum = 1; for (int i = 0; i < 12; i++) if (_wcsicmp(mn, mons[i]) == 0) { mnum = i + 1; break; }
@@ -3950,7 +4101,76 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnClose() {   // banks whatever's left of the current online-timer session before the app actually closes
         if (m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; }
         SaveOnlineTimer();
+        StopIdentd();
         CMDIFrameWnd::OnClose();
+    }
+    void LoadIdentd() {
+        CWinApp* a = AfxGetApp();
+        m_identdEnabled = a->GetProfileInt(L"Identd", L"enabled", 0) != 0;
+        m_identdShowReq = a->GetProfileInt(L"Identd", L"showReq", 1) != 0;
+        m_identdOnlyConnecting = a->GetProfileInt(L"Identd", L"onlyConnecting", 0) != 0;
+        m_identdUseEmail = a->GetProfileInt(L"Identd", L"useEmail", 0) != 0;
+        m_identdUserId = a->GetProfileString(L"Identd", L"userId", L"user");
+        m_identdSystem = a->GetProfileString(L"Identd", L"system", L"UNIX");
+        m_identdPort = a->GetProfileInt(L"Identd", L"port", 113);
+    }
+    void SaveIdentd() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Identd", L"enabled", m_identdEnabled ? 1 : 0);
+        a->WriteProfileInt(L"Identd", L"showReq", m_identdShowReq ? 1 : 0);
+        a->WriteProfileInt(L"Identd", L"onlyConnecting", m_identdOnlyConnecting ? 1 : 0);
+        a->WriteProfileInt(L"Identd", L"useEmail", m_identdUseEmail ? 1 : 0);
+        a->WriteProfileString(L"Identd", L"userId", m_identdUserId);
+        a->WriteProfileString(L"Identd", L"system", m_identdSystem);
+        a->WriteProfileInt(L"Identd", L"port", m_identdPort);
+    }
+    bool IdentdRunning() const { return m_identdState && m_identdState->running; }
+    void StartIdentd(Net* triggerNet = nullptr) {
+        if (IdentdRunning()) return;
+        m_identdTriggerNet = triggerNet;
+        m_identdState = std::make_shared<IdentdState>();
+        CString uid = m_identdUseEmail && triggerNet ? triggerNet->o.user : m_identdUserId;   // "from email address": no email field exists here, so the connection's Username (ident) field is the closest analog
+        m_identdState->userId = (LPCWSTR)uid; m_identdState->system = (LPCWSTR)m_identdSystem;
+        m_identdState->port = m_identdPort; m_identdState->hwnd = m_hWnd;
+        auto* passState = new std::shared_ptr<IdentdState>(m_identdState);
+        uintptr_t th = _beginthreadex(nullptr, 0, IdentdThreadProc, passState, 0, nullptr);
+        if (th) CloseHandle((HANDLE)th); else { delete passState; m_identdState.reset(); }
+        if (m_identdOnlyConnecting) m_identdAutoStopAt = GetTickCount64() + 60000;   // stop after a minute even if nothing ever queries it
+    }
+    void StopIdentd() {
+        if (m_identdState) m_identdState->stop = true;
+        m_identdState.reset(); m_identdTriggerNet = nullptr; m_identdAutoStopAt = 0;
+    }
+    void CmdIdentd(CChatWnd* w, CString arg) {
+        arg.Trim();
+        if (arg.IsEmpty()) { Show(w, IdentdRunning() ? CString(L"* Identd server is running.") : CString(L"* Identd server is off."), cInfo); return; }
+        CString mode = Word(arg); CString modeL = mode; modeL.MakeLower();
+        if (modeL == L"on") { m_identdEnabled = true; if (!arg.IsEmpty()) m_identdUserId = arg; SaveIdentd(); if (!m_identdOnlyConnecting) StartIdentd(); Show(w, L"* Identd server on" + (arg.IsEmpty() ? CString() : L", user id: " + arg) + L".", cInfo); }
+        else if (modeL == L"off") { m_identdEnabled = false; SaveIdentd(); StopIdentd(); Show(w, L"* Identd server off.", cInfo); }
+        else { Show(w, L"* Usage: /identd [on|off] [userid]", cPart); return; }
+    }
+    afx_msg LRESULT OnIdentdRequest(WPARAM, LPARAM lp) {
+        std::unique_ptr<std::pair<std::wstring, std::wstring>> notice((std::pair<std::wstring, std::wstring>*)lp);
+        if (m_identdShowReq) {
+            CString peer = notice->first.c_str(), reply = notice->second.c_str(); reply.TrimRight(L"\r\n");
+            CChatWnd* sw = nullptr;
+            if (m_identdTriggerNet) sw = Status(m_identdTriggerNet);
+            else for (auto& np : m_nets) if (np->conn) { sw = Status(np.get()); break; }
+            if (sw) Show(sw, L"* Identd request from " + peer + L": " + reply, cInfo);
+        }
+        if (m_identdOnlyConnecting) StopIdentd();
+        return 0;
+    }
+    void OnIdentdDialog() {
+        CIdentdDlg dlg(m_identdEnabled, m_identdUserId, m_identdSystem, m_identdPort, m_identdShowReq, m_identdOnlyConnecting, m_identdUseEmail, this);
+        if (dlg.DoModal() != IDOK) return;
+        bool wasContinuous = m_identdEnabled && !m_identdOnlyConnecting;
+        m_identdEnabled = dlg.enabled; m_identdUserId = dlg.userId; m_identdSystem = dlg.system; m_identdPort = dlg.port;
+        m_identdShowReq = dlg.showReq; m_identdOnlyConnecting = dlg.onlyConnecting; m_identdUseEmail = dlg.useEmail;
+        SaveIdentd();
+        bool wantContinuous = m_identdEnabled && !m_identdOnlyConnecting;
+        if (wasContinuous && !wantContinuous) StopIdentd();
+        else if (wantContinuous) { StopIdentd(); StartIdentd(); }   // restart so a changed port/userid/system actually takes effect
     }
     void OnOnlineTimerDialog() {
         COnlineTimerDlg dlg(this);
@@ -4749,6 +4969,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (id == 2001) { PlayTick(); return; }   // /play: ticks independently of the UI-refresh timer below, and even while a menu is open
         if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
+        if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
     }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
         *pResult = 0;
@@ -4849,6 +5070,8 @@ public:
 		LoadLogging();
 		LoadTimestamp();
 		LoadOnlineTimer();
+		LoadIdentd();
+		if (m_identdEnabled && !m_identdOnlyConnecting) StartIdentd();
 		LoadSkinPaths();
 		LoadSkinImages();
 		if (m_hWndMDIClient && m_mdiWrap.SubclassWindow(m_hWndMDIClient)) {
@@ -4874,6 +5097,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_COLORS, L"&Colors...");
         f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
         f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
+        f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -4995,12 +5219,13 @@ public:
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_WM_CLOSE()
     ON_MESSAGE(WM_APP + 50, OnDnsResult)
+    ON_MESSAGE(WM_APP + 51, OnIdentdRequest)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
