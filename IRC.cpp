@@ -2230,7 +2230,7 @@ public:
     COnlineTimerDlg(CWnd* parent) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(300); t.push_back(270);
-        t.push_back(0); t.push_back(0); S(L"mIRC Online Timer"); t.push_back(9); S(DEFAULT_FONT);
+        t.push_back(0); t.push_back(0); S(L"Online Timer"); t.push_back(9); S(DEFAULT_FONT);
         Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 200, 10, IDC_OT_ENABLE, 0x0080, L"Enable online timer");
         Item(BS_GROUPBOX, 8, 22, 284, 100, 0xFFFF, 0x0080, L"Current connection:");
         Item(SS_LEFT, 16, 36, 60, 10, 0xFFFF, 0x0082, L"Time:");
@@ -3231,8 +3231,8 @@ class CMainFrame : public CMDIFrameWnd {
     int m_bpCount = 0; CString m_menuType;                     // how many menu-bar menus were inserted; the value of $menu
 
     void SeedPopups() {   // used when popups.ini doesn't exist yet
-        static const wchar_t* mp[] = { L"Server", L".Lusers:/lusers", L".Motd:/motd", L".Time:/time", L"Names", L".#mIRC:/names #mirc", L".#irchelp: /names #irchelp",
-            L".names ?:/names #$$?=\"Enter a channel name:\"", L"Join", L".#mIRC:/join #mirc", L".#irchelp:/join #irchelp", L".join ?:/join #$$?=\"Enter a channel to join:\"",
+        static const wchar_t* mp[] = { L"Server", L".Lusers:/lusers", L".Motd:/motd", L".Time:/time", L"Names", L".#chan:/names #chan", L".#irchelp: /names #irchelp",
+            L".names ?:/names #$$?=\"Enter a channel name:\"", L"Join", L".#chan:/join #chan", L".#irchelp:/join #irchelp", L".join ?:/join #$$?=\"Enter a channel to join:\"",
             L"Query", L".query ?:/query $$?=\"Enter nickname to talk to:\"", L"Other", L".Whois ?:/whois $$?=\"Enter a nickname:\"", L".Query:/query $$?=\"Enter a nickname:\"",
             L".Nickname:/nick $$?=\"Enter your new nickname:\"", L".Away", L"..Set Away...:/away $$?=\"Enter your away message:\"", L"..Set Back:/away", L".List Channels:/list",
             L"-", L"Edit Notes:/run notepad.exe notes.txt", L"Quit IRC:/quit Leaving" };
