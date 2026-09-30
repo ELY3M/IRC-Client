@@ -309,7 +309,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -474,6 +474,26 @@ struct PlayItem {
     size_t pos = 0;
     ULONGLONG dueAt = 0;   // GetTickCount64() value at which the next line may send; 0 = not yet scheduled (send immediately)
     CString Status() const { return pos == 0 ? CString(L"waiting") : (pos >= lines.size() ? CString(L"done") : CString(L"running")); }
+};
+
+// ---------------- /timer: repeating (or one-shot) scheduled commands ----------------
+// Net+window-name are stored rather than a CChatWnd* directly, resolved fresh via Find() at fire time, since the
+// window could be closed while the timer is still running (the same reasoning as PlayItem's net pointer, but a
+// window is far more likely to be closed mid-flight than a network is to be destroyed).
+struct TimerInfo {
+    CString name;                 // "1", "2", ... or a custom name; shown/matched without the leading "/timer"
+    Net* net = nullptr; CString winName;
+    bool offline = false;         // -o: keeps running across a disconnect (default is "online": stops when net disconnects, unless net was null to begin with)
+    bool msMode = false;          // -m or -h: the given interval is milliseconds, not seconds
+    bool catchUp = false;         // -c: if a tick falls behind, fire repeatedly (roughly) until caught up, instead of just resyncing to now
+    bool dynAssoc = false;        // -i: accepted, not actually implemented (no dynamic re-association to a different connection)
+    bool paused = false;          // -p: skips firing, countdown keeps going
+    bool haltCountdown = false;   // -P: skips firing AND freezes the countdown
+    int totalReps = 0;            // 0 = infinite
+    int repsLeft = 0;
+    double intervalSec = 0;
+    CString command;              // with any $!identifier references already evaluated once, at creation time
+    ULONGLONG nextFire = 0;       // GetTickCount64() value of the next scheduled fire
 };
 
 // ---------------- /dns: background-threaded resolution, one request in flight at a time ----------------
@@ -1156,7 +1176,7 @@ public:
     }
 
 protected:
-    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = L"Consolas"; bool m_baseBold = false, m_baseItalic = false;
+    long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = DEFAULT_FONT; bool m_baseBold = false, m_baseItalic = false;
     std::vector<CString> m_hist; int m_histPos = -1;   // per-window input history; -1 = not currently browsing it
     CLogEdit m_out; CEdit m_in, m_topic; CNickList m_nicks; CFont m_font;
 
@@ -2179,6 +2199,75 @@ BEGIN_MESSAGE_MAP(CLoggingDlg, CDialog)
     ON_BN_CLICKED(IDC_LG_BROWSE, OnBrowse) ON_BN_CLICKED(IDC_LG_HELP, OnHelpBtn)
 END_MESSAGE_MAP()
 
+// ---------------- Online Timer dialog: current-connection and cumulative connect time (see CMainFrame's OT* members) ----------------
+enum { IDC_OT_ENABLE = 641, IDC_OT_CURTIME, IDC_OT_CURDATE, IDC_OT_CURRESET, IDC_OT_TOTTIME, IDC_OT_TOTDATE, IDC_OT_TOTRESET, IDC_OT_SHOWTOTAL };
+class COnlineTimerDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    void RefreshDisplay() {
+        if (getCurrent) SetDlgItemText(IDC_OT_CURTIME, FormatElapsed(getCurrent()));
+        if (getTotal) SetDlgItemText(IDC_OT_TOTTIME, FormatElapsed(getTotal()));
+        if (getCurrentResetDate) SetDlgItemText(IDC_OT_CURDATE, getCurrentResetDate());
+        if (getTotalResetDate) SetDlgItemText(IDC_OT_TOTDATE, getTotalResetDate());
+    }
+public:
+    static CString FormatElapsed(double secs) {
+        if (secs < 0) secs = 0;
+        int h = (int)(secs / 3600), m = (int)secs / 60 % 60, s = (int)secs % 60;
+        CString r; r.Format(L"%02d:%02d:%02d", h, m, s); return r;
+    }
+    bool enabled = true, showTotal = true;
+    std::function<double()> getCurrent, getTotal;
+    std::function<CString()> getCurrentResetDate, getTotalResetDate;
+    std::function<void()> onResetCurrent, onResetTotal;
+    COnlineTimerDlg(CWnd* parent) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(300); t.push_back(270);
+        t.push_back(0); t.push_back(0); S(L"mIRC Online Timer"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 200, 10, IDC_OT_ENABLE, 0x0080, L"Enable online timer");
+        Item(BS_GROUPBOX, 8, 22, 284, 100, 0xFFFF, 0x0080, L"Current connection:");
+        Item(SS_LEFT, 16, 36, 60, 10, 0xFFFF, 0x0082, L"Time:");
+        Item(SS_CENTER, 16, 48, 268, 12, IDC_OT_CURTIME, 0x0082, L"00:00:00");
+        Item(SS_LEFT, 16, 66, 100, 10, 0xFFFF, 0x0082, L"Last reset on:");
+        Item(SS_CENTER, 16, 78, 268, 10, IDC_OT_CURDATE, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 220, 100, 60, 14, IDC_OT_CURRESET, 0x0080, L"Reset");
+        Item(BS_GROUPBOX, 8, 128, 284, 100, 0xFFFF, 0x0080, L"Total online time:");
+        Item(SS_LEFT, 16, 142, 60, 10, 0xFFFF, 0x0082, L"Time:");
+        Item(SS_CENTER, 16, 154, 268, 12, IDC_OT_TOTTIME, 0x0082, L"00:00:00");
+        Item(SS_LEFT, 16, 172, 100, 10, 0xFFFF, 0x0082, L"Last reset on:");
+        Item(SS_CENTER, 16, 184, 268, 10, IDC_OT_TOTDATE, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 220, 206, 60, 14, IDC_OT_TOTRESET, 0x0080, L"Reset");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 236, 284, 10, IDC_OT_SHOWTOTAL, 0x0080, L"Show total online time in status windows");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 158, 250, 60, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 224, 250, 60, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        CheckDlgButton(IDC_OT_ENABLE, enabled); CheckDlgButton(IDC_OT_SHOWTOTAL, showTotal);
+        RefreshDisplay();
+        SetTimer(1, 1000, nullptr);
+        return TRUE;
+    }
+    afx_msg void OnTimer(UINT_PTR) { RefreshDisplay(); }
+    afx_msg void OnResetCur() { if (onResetCurrent) onResetCurrent(); RefreshDisplay(); }
+    afx_msg void OnResetTot() { if (onResetTotal) onResetTotal(); RefreshDisplay(); }
+    void OnOK() override { enabled = IsDlgButtonChecked(IDC_OT_ENABLE) != 0; showTotal = IsDlgButtonChecked(IDC_OT_SHOWTOTAL) != 0; KillTimer(1); CDialog::OnOK(); }
+    void OnCancel() override { KillTimer(1); CDialog::OnCancel(); }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(COnlineTimerDlg, CDialog)
+    ON_WM_TIMER() ON_BN_CLICKED(IDC_OT_CURRESET, OnResetCur) ON_BN_CLICKED(IDC_OT_TOTRESET, OnResetTot)
+END_MESSAGE_MAP()
+
 // ---------------- Main frame: connection, protocol, commands ----------------
 class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
@@ -2194,6 +2283,12 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<PlayItem> m_playQueue; CString m_pnick; UINT_PTR m_playTimerId = 0;   // see /play, /playctrl, PlayTick
     std::vector<DnsRequest> m_dnsQueue; std::map<CString, int> m_pendingUserhost; int m_dnsSeq = 0;
     std::vector<std::pair<CString, CString>> m_lastDnsRecords;   // the most recently completed -m request's records, for $dns(T,N)
+    std::vector<TimerInfo> m_timers; CString m_ltimer; UINT_PTR m_timerTickId = 0;   // see /timer, /timers, TimerTick
+    // ---- Online Timer: current-connection and cumulative connect time (unrelated to the scheduled-command /timer feature above) ----
+    bool m_otEnabled = true, m_otShowTotal = true;
+    ULONGLONG m_otSessionStart = 0;   // GetTickCount64() when the current unbroken "connected" streak began; 0 = not currently counting
+    CTime m_otSessionResetTime = CTime((time_t)0), m_otTotalResetTime = CTime((time_t)0);
+    double m_otTotalBanked = 0;       // accumulated seconds from completed sessions (persisted); the live total also adds the current session on top
     std::vector<ColorScheme> m_schemes; int m_curScheme = 0;   // Colors dialog: named schemes, and which one is active (colors.ini... see LoadColors)
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
@@ -2433,6 +2528,7 @@ class CMainFrame : public CMDIFrameWnd {
         CTime now = CTime::GetCurrentTime();
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
+        if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
         if (name == L"null") { val.Empty(); return true; }
         if (name == L"server") { val = (net && net->conn) ? net->o.host : CString(); return true; }   // empty ($null) when not connected
         if (name == L"menu" || name == L"menutype" || name == L"menucontext") { val = m_menuType; return true; }   // which popup is being built: status channel query nicklist menubar
@@ -3408,6 +3504,9 @@ class CMainFrame : public CMDIFrameWnd {
             AliasDef* ad = FindAlias(cmd);
             if (ad && !OnRunStack(ad->name)) { RunAlias(w, *ad, arg); return; }   // an alias may still call the built-in command of its own name
         }
+        if (cmd == L"timers") { CmdTimers(w, arg); return; }   // reserved: "/timers" is always the list/off-all command, never a timer literally named "s"
+        if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
+        if (cmd.Left(5) == L"timer" && cmd.GetLength() > 5) { CmdTimer(w, cmdRaw.Mid(5), arg); return; }   // "/timer1", "/timershow", etc: the timer name follows directly, no space
         if (cmd == L"server" || cmd == L"connect") {
             bool multi = false; arg.TrimLeft();
             if (arg.Left(2).CompareNoCase(L"-m") == 0) { multi = true; arg = arg.Mid(2); arg.TrimLeft(); }
@@ -3615,7 +3714,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3805,6 +3904,67 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileInt(L"Timestamp", L"global", m_tsGlobalOn ? 1 : 0);
         a->WriteProfileString(L"Timestamp", L"eventfmt", m_tsEventFmt);
         a->WriteProfileString(L"Timestamp", L"logfmt", m_tsLogFmt);
+    }
+    // ---- Online Timer: persistence and live state ----
+    static CString OtFormatDate(const CTime& t) { return t.GetTime() <= 0 ? CString() : t.Format(L"%a %b %d %H:%M:%S %Y"); }
+    static CTime OtParseDate(const CString& s) {
+        int y, mo, d, h, mi, se; wchar_t wk[8] = {}, mn[8] = {};
+        if (swscanf_s(s, L"%3s %3s %d %d:%d:%d %d", wk, (unsigned)_countof(wk), mn, (unsigned)_countof(mn), &d, &h, &mi, &se, &y) != 7) return CTime((time_t)0);
+        static const wchar_t* mons[12] = { L"Jan",L"Feb",L"Mar",L"Apr",L"May",L"Jun",L"Jul",L"Aug",L"Sep",L"Oct",L"Nov",L"Dec" };
+        int mnum = 1; for (int i = 0; i < 12; i++) if (_wcsicmp(mn, mons[i]) == 0) { mnum = i + 1; break; }
+        return CTime(y, mnum, d, h, mi, se);
+    }
+    void LoadOnlineTimer() {
+        CWinApp* a = AfxGetApp();
+        m_otEnabled = a->GetProfileInt(L"OnlineTimer", L"enabled", 1) != 0;
+        m_otShowTotal = a->GetProfileInt(L"OnlineTimer", L"showTotal", 1) != 0;
+        m_otTotalBanked = _wtof(a->GetProfileString(L"OnlineTimer", L"totalSeconds", L"0"));
+        m_otTotalResetTime = OtParseDate(a->GetProfileString(L"OnlineTimer", L"totalResetDate", L""));
+    }
+    void SaveOnlineTimer() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"OnlineTimer", L"enabled", m_otEnabled ? 1 : 0);
+        a->WriteProfileInt(L"OnlineTimer", L"showTotal", m_otShowTotal ? 1 : 0);
+        CString secs; secs.Format(L"%.0f", m_otTotalBanked);
+        a->WriteProfileString(L"OnlineTimer", L"totalSeconds", secs);
+        a->WriteProfileString(L"OnlineTimer", L"totalResetDate", OtFormatDate(m_otTotalResetTime));
+    }
+    double OtCurrentSeconds() const { return m_otSessionStart ? (GetTickCount64() - m_otSessionStart) / 1000.0 : 0; }
+    double OtTotalSeconds() const { return m_otTotalBanked + OtCurrentSeconds(); }
+    void OtResetCurrent() { if (m_otSessionStart) m_otSessionStart = GetTickCount64(); m_otSessionResetTime = CTime::GetCurrentTime(); }
+    void OtResetTotal() { m_otTotalBanked = 0; m_otTotalResetTime = CTime::GetCurrentTime(); SaveOnlineTimer(); }
+    // Called from the regular ~500ms UI tick: banks a finished session into the total the moment every network
+    // disconnects, starts a fresh session the moment any network (re)connects, and keeps the status window
+    // titlebar(s) showing the live time when enabled.
+    void UpdateOnlineTimer() {
+        bool anyConn = false; for (auto& np : m_nets) if (np->conn) { anyConn = true; break; }
+        if (anyConn && !m_otSessionStart) { m_otSessionStart = GetTickCount64(); m_otSessionResetTime = CTime::GetCurrentTime(); }
+        else if (!anyConn && m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; SaveOnlineTimer(); }
+        for (auto& kv : m_w) {
+            CChatWnd* sw = kv.second; if (sw->m_name != L"*status*") continue;
+            if (!m_otEnabled) { sw->SetWindowText(L"Status"); continue; }
+            double secs = m_otShowTotal ? OtTotalSeconds() : OtCurrentSeconds();
+            sw->SetWindowText(L"Status - [" + COnlineTimerDlg::FormatElapsed(secs) + L"]");
+        }
+    }
+    afx_msg void OnClose() {   // banks whatever's left of the current online-timer session before the app actually closes
+        if (m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; }
+        SaveOnlineTimer();
+        CMDIFrameWnd::OnClose();
+    }
+    void OnOnlineTimerDialog() {
+        COnlineTimerDlg dlg(this);
+        dlg.enabled = m_otEnabled; dlg.showTotal = m_otShowTotal;
+        dlg.getCurrent = [this] { return OtCurrentSeconds(); };
+        dlg.getTotal = [this] { return OtTotalSeconds(); };
+        dlg.getCurrentResetDate = [this] { return OtFormatDate(m_otSessionResetTime); };
+        dlg.getTotalResetDate = [this] { return OtFormatDate(m_otTotalResetTime); };
+        dlg.onResetCurrent = [this] { OtResetCurrent(); };
+        dlg.onResetTotal = [this] { OtResetTotal(); };
+        if (dlg.DoModal() != IDOK) return;
+        m_otEnabled = dlg.enabled; m_otShowTotal = dlg.showTotal;
+        SaveOnlineTimer();
+        UpdateOnlineTimer();
     }
     void WriteLog(Net* net, const CString& winName, const CString& rawLine) {
         if (!m_logEnabled || m_logFolder.IsEmpty()) return;
@@ -4065,6 +4225,131 @@ class CMainFrame : public CMDIFrameWnd {
         if (newName.IsEmpty() || newName[0] != L'@') { Show(w, L"* /renwin: the new name must start with @.", cPart); return; }
         m_w.erase(Key(nullptr, cw->m_name)); cw->m_name = newName; m_w[Key(nullptr, newName)] = cw;
         cw->SetWindowText(newName + (a.IsEmpty() ? CString() : L" " + a));
+    }
+
+    // ---- /timer / /timers: scheduled, optionally repeating commands ----
+    // Forces $!identifier (or $!identifier(args)) references to evaluate once, right now, substituting the literal
+    // result into the stored command; every other identifier is left as-is, to be evaluated fresh by the normal
+    // script engine each time the timer actually fires.
+    CString TimerPreEval(CChatWnd* w, const CString& cmd) {
+        CString out; int i = 0, n = cmd.GetLength();
+        while (i < n) {
+            if (cmd[i] == L'$' && i + 1 < n && cmd[i + 1] == L'!') {
+                int j = i + 2; while (j < n && (iswalnum(cmd[j]) || cmd[j] == L'_')) j++;
+                CString ident = cmd.Mid(i + 2, j - (i + 2));
+                CString whole = L"$" + ident;
+                if (j < n && cmd[j] == L'(') { int depth = 1, k = j + 1; while (k < n && depth > 0) { if (cmd[k] == L'(') depth++; else if (cmd[k] == L')') depth--; k++; } whole = cmd.Mid(i + 1, k - (i + 1)); j = k; }
+                out += EvalIds(w, whole, CString()); m_halt = false; i = j;
+            } else { out += cmd[i]; i++; }
+        }
+        return out;
+    }
+    CString TimerId(const TimerInfo& t) { return t.name; }
+    void ShowTimerStatus(CChatWnd* w, const TimerInfo& t) {
+        CString reps = t.totalReps == 0 ? CString(L"*") : CString(std::to_wstring(t.repsLeft).c_str()) + L"/" + CString(std::to_wstring(t.totalReps).c_str());
+        CString s; s.Format(L"* Timer%s: %s %s%s, interval %g%s -> %s", (LPCWSTR)t.name, (LPCWSTR)reps,
+            t.paused ? L"[paused] " : t.haltCountdown ? L"[held] " : L"", t.offline ? L"(offline) " : L"",
+            t.intervalSec, t.msMode ? L"ms" : L"s", (LPCWSTR)t.command);
+        Show(w, s, cInfo);
+    }
+    void CmdTimer(CChatWnd* w, CString tname, CString arg) {
+        Net* net = w->net; arg.Trim();
+        bool oFlag = false, cFlag = false, mFlag = false, dFlag = false, eFlag = false, iFlag = false, pFlag = false, PFlag = false, rFlagSw = false;
+        while (arg.Left(1) == L"-") {
+            CString swTok = Word(arg);
+            for (int i = 1; i < swTok.GetLength(); i++) {
+                wchar_t c = swTok[i];
+                if (c == L'o') oFlag = true; else if (c == L'c') cFlag = true; else if (c == L'm' || c == L'h') mFlag = true;
+                else if (c == L'd') dFlag = true; else if (c == L'e') eFlag = true; else if (c == L'i') iFlag = true;
+                else if (c == L'p') pFlag = true; else if (c == L'P') PFlag = true; else if (c == L'r') rFlagSw = true;
+                else if (c == L'z') while (i + 1 < swTok.GetLength() && iswdigit(swTok[i + 1])) i++;   // -zN: no Online Timer feature exists here to reset
+            }
+            arg.TrimLeft();
+        }
+        if (eFlag) {   // -e: run the matching timer(s) right now, once, without touching their schedule or repeat count
+            bool any = false;
+            for (auto& t : m_timers) if (GlobMatch(tname, t.name)) { any = true; CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : w; if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString()); }
+            if (!any) Show(w, L"* No matching timer: " + tname, cPart);
+            return;
+        }
+        CString first = arg; CString w1 = Word(first); CString w1l = w1; w1l.MakeLower();
+        if (w1l == L"off") {
+            bool wild = tname.Find(L'?') >= 0 || tname.Find(L'*') >= 0;
+            size_t before = m_timers.size();
+            m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return wild ? GlobMatch(tname, t.name) : t.name.CompareNoCase(tname) == 0; }), m_timers.end());
+            Show(w, before == m_timers.size() ? L"* No matching timer: " + tname : L"* Timer(s) turned off: " + tname, before == m_timers.size() ? cPart : cInfo);
+            return;
+        }
+        if (pFlag || PFlag || rFlagSw) {   // pause / hold / resume an existing timer -- no reps/interval/command needed for this
+            bool any = false;
+            for (auto& t : m_timers) if (t.name.CompareNoCase(tname) == 0) {
+                any = true;
+                if (rFlagSw) { t.paused = false; t.haltCountdown = false; t.nextFire = GetTickCount64() + (ULONGLONG)(t.intervalSec * (t.msMode ? 1 : 1000)); }
+                else if (PFlag) t.haltCountdown = true; else if (pFlag) t.paused = true;
+            }
+            if (!any) Show(w, L"* No such timer: " + tname, cPart);
+            return;
+        }
+        if (arg.IsEmpty()) {   // "/timer1" alone: show that timer's settings (or the usage line, if it doesn't exist)
+            for (auto& t : m_timers) if (t.name.CompareNoCase(tname) == 0) { ShowTimerStatus(w, t); return; }
+            Show(w, tname.IsEmpty() ? CString(L"* Usage: /timer[N/name] [-switches] [time] <reps> <interval> <command>") : L"* No such timer: " + tname, cPart);
+            return;
+        }
+        // creating (or replacing) a timer: [time] <repetitions> <interval> <command>
+        CString a2 = arg; CString t1 = Word(a2);
+        bool isClock = t1.Find(L':') >= 0;
+        CString timeStr; if (isClock) { timeStr = t1; t1 = Word(a2); }
+        CString repsStr = t1, intervalStr = Word(a2), command = a2;
+        double intervalVal; 
+        if (!IsAllDigits(repsStr) || intervalStr.IsEmpty() || !ParseNum(intervalStr, intervalVal) || command.IsEmpty()) {
+            Show(w, L"* Usage: /timer[N/name] [-switches] [time] <reps> <interval> <command>", cPart); return;
+        }
+        if (tname.IsEmpty()) { int n = 1; while (true) { CString cand; cand.Format(L"%d", n); bool used = false; for (auto& t : m_timers) if (t.name == cand) { used = true; break; } if (!used) break; n++; } tname.Format(L"%d", n); }
+        m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return t.name.CompareNoCase(tname) == 0; }), m_timers.end());   // replaces any existing timer of the same name
+        TimerInfo t;
+        t.name = tname; t.net = net; t.winName = w->m_name;
+        t.offline = oFlag || !(net && net->conn);   // matches mIRC's own default: online if currently connected, offline otherwise, unless -o forces it
+        t.msMode = mFlag; t.catchUp = cFlag; t.dynAssoc = iFlag;
+        t.totalReps = _wtoi(repsStr); t.repsLeft = t.totalReps;
+        t.intervalSec = t.msMode ? intervalVal / 1000.0 : intervalVal;
+        t.command = TimerPreEval(w, command);
+        ULONGLONG startDelayMs = 0;
+        if (isClock) {
+            int hh = 0, mm = 0, ss = 0; int c1 = timeStr.Find(L':');
+            hh = _wtoi(timeStr.Left(c1)); CString rest = timeStr.Mid(c1 + 1); int c2 = rest.Find(L':');
+            if (c2 >= 0) { mm = _wtoi(rest.Left(c2)); ss = _wtoi(rest.Mid(c2 + 1)); } else mm = _wtoi(rest);
+            CTime now = CTime::GetCurrentTime();
+            CTime target(now.GetYear(), now.GetMonth(), now.GetDay(), hh, mm, ss);
+            if (target <= now) target += CTimeSpan(1, 0, 0, 0);
+            startDelayMs = (ULONGLONG)(target.GetTime() - now.GetTime()) * 1000ULL;
+        }
+        t.nextFire = GetTickCount64() + startDelayMs + (ULONGLONG)(t.intervalSec * 1000);
+        m_timers.push_back(t);
+        m_ltimer = tname;
+        StartTimerTickIfNeeded();
+        Show(w, L"* Timer" + tname + L" activated.", cInfo);
+    }
+    void CmdTimers(CChatWnd* w, CString arg) {
+        arg.Trim(); CString a = arg; a.MakeLower();
+        if (a == L"off") { size_t n = m_timers.size(); m_timers.clear(); CString s; s.Format(L"* %d timer(s) turned off.", (int)n); Show(w, s, cInfo); return; }
+        if (m_timers.empty()) { Show(w, L"* No active timers.", cInfo); return; }
+        for (auto& t : m_timers) ShowTimerStatus(w, t);
+    }
+    void StartTimerTickIfNeeded() { if (!m_timerTickId && !m_timers.empty()) m_timerTickId = SetTimer(2002, 100, nullptr); }
+    void TimerTick() {
+        if (m_timers.empty()) { if (m_timerTickId) { KillTimer(m_timerTickId); m_timerTickId = 0; } return; }
+        ULONGLONG now = GetTickCount64();
+        for (size_t i = 0; i < m_timers.size();) {
+            TimerInfo& t = m_timers[i];
+            if (!t.offline && t.net && !t.net->conn) { m_timers.erase(m_timers.begin() + i); continue; }   // online timer: its network disconnected
+            if (t.paused || t.haltCountdown || now < t.nextFire) { i++; continue; }
+            CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : (m_w.empty() ? nullptr : m_w.begin()->second);
+            if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString());
+            if (t.totalReps > 0 && --t.repsLeft <= 0) { m_timers.erase(m_timers.begin() + i); continue; }
+            t.nextFire = t.catchUp ? t.nextFire + (ULONGLONG)(t.intervalSec * 1000) : now + (ULONGLONG)(t.intervalSec * 1000);
+            i++;
+        }
+        if (m_timers.empty() && m_timerTickId) { KillTimer(m_timerTickId); m_timerTickId = 0; }
     }
 
     void CmdDns(CChatWnd* w, CString arg) {
@@ -4362,14 +4647,23 @@ class CMainFrame : public CMDIFrameWnd {
         };
         sq(0, 0, RGB(220,30,30)); sq(5, 0, RGB(30,160,30)); sq(0, 5, RGB(30,90,220)); sq(5, 5, RGB(230,180,0));
     }
+    static void DrawOnlineTimerGlyph(CDC& mem, int baseX) {   // a small clock face with two hands, for the Online Timer button
+        CPen pn(PS_SOLID, 1, RGB(20, 110, 70)); CPen* op = mem.SelectObject(&pn);
+        CBrush* ob = (CBrush*)mem.SelectStockObject(NULL_BRUSH);
+        mem.Ellipse(CRect(baseX + 2, 2, baseX + 14, 14));
+        int cx = baseX + 8, cy = 8;
+        mem.MoveTo(cx, cy); mem.LineTo(cx, cy - 4);       // minute hand
+        mem.MoveTo(cx, cy); mem.LineTo(cx + 3, cy + 1);   // hour hand
+        mem.SelectObject(op); mem.SelectObject(ob);
+    }
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
-        const int N = 8;
+        const int N = 9;
         CBitmap resBmp;
         bool haveRes = resBmp.LoadBitmap(102) != 0;   // id 102 in MiniIRC.rc ("toolbar.bmp"); absent in the plain one-file build
         int W = haveRes ? 24 : 16, H = W; m_tbIcon = W;
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0);
         if (haveRes) {
-            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, colors (8 icons)
+            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, colors, online timer (9 icons)
         } else {
             CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
             CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
@@ -4397,26 +4691,28 @@ class CMainFrame : public CMDIFrameWnd {
               CPoint pts[10]; for (int k = 0; k < 10; k++) pts[k] = CPoint(cx + off[k][0], cy + off[k][1]);
               mem.Polygon(pts, 10);
               mem.SelectObject(ob); mem.SelectObject(op); }   // star = favorites glyph
-            DrawColorsGlyph(mem, 7 * W);   // 8th cell: the Colors icon
+            DrawOnlineTimerGlyph(mem, 7 * W);   // 8th cell: Online Timer
+            DrawColorsGlyph(mem, 8 * W);        // 9th cell: Colors
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
         m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        TBBUTTON b[12] = {};
+        TBBUTTON b[13] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
         b[3].iBitmap = 2; b[3].idCommand = IDM_SERVERS; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
         b[4].iBitmap = 6; b[4].idCommand = IDM_CHANFAVS; b[4].fsState = TBSTATE_ENABLED; b[4].fsStyle = TBSTYLE_BUTTON;   // channel favorites
-        b[5].iBitmap = 7; b[5].idCommand = IDM_COLORS; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;    // colors
-        b[6].fsStyle = TBSTYLE_SEP;
-        b[7].iBitmap = 3; b[7].idCommand = IDM_CASCADE; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;
-        b[8].iBitmap = 4; b[8].idCommand = IDM_TILE; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;
-        b[9].fsStyle = TBSTYLE_SEP;
-        b[10].iBitmap = 5; b[10].idCommand = IDM_ABOUT; b[10].fsState = TBSTATE_ENABLED; b[10].fsStyle = TBSTYLE_BUTTON;
-        b[11].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(12, b);
+        b[5].iBitmap = 7; b[5].idCommand = IDM_ONLINETIMER; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;   // online timer
+        b[6].iBitmap = 8; b[6].idCommand = IDM_COLORS; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;    // colors
+        b[7].fsStyle = TBSTYLE_SEP;
+        b[8].iBitmap = 3; b[8].idCommand = IDM_CASCADE; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;
+        b[9].iBitmap = 4; b[9].idCommand = IDM_TILE; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;
+        b[10].fsStyle = TBSTYLE_SEP;
+        b[11].iBitmap = 5; b[11].idCommand = IDM_ABOUT; b[11].fsState = TBSTATE_ENABLED; b[11].fsStyle = TBSTYLE_BUTTON;
+        b[12].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(13, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
@@ -4451,7 +4747,8 @@ class CMainFrame : public CMDIFrameWnd {
     bool m_menuOpen = false;   // true while a TrackPopupMenu is showing; our timer must not touch layout/bars during that
     afx_msg void OnTimer(UINT_PTR id) {
         if (id == 2001) { PlayTick(); return; }   // /play: ticks independently of the UI-refresh timer below, and even while a menu is open
-        if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars();
+        if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
+        if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
     }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
         *pResult = 0;
@@ -4551,6 +4848,7 @@ public:
 		LoadColors(); PushSchemeColors(CurScheme());
 		LoadLogging();
 		LoadTimestamp();
+		LoadOnlineTimer();
 		LoadSkinPaths();
 		LoadSkinImages();
 		if (m_hWndMDIClient && m_mdiWrap.SubclassWindow(m_hWndMDIClient)) {
@@ -4575,6 +4873,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
         f.AppendMenu(MF_STRING, IDM_COLORS, L"&Colors...");
         f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
+        f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -4694,13 +4993,14 @@ public:
 };
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
+    ON_WM_CLOSE()
     ON_MESSAGE(WM_APP + 50, OnDnsResult)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
