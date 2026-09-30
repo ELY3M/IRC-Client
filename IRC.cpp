@@ -1009,6 +1009,28 @@ public:
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
     std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped, un-timestamped) text of each new line, for history logging
     int m_tsMode = -1;   // this window's /timestamp override: -1 = follow the global setting, 0 = off, 1 = on
+    // ---- /window: custom @windows reuse this class (net stays null unless -i is used) ----
+    bool m_custom = false;        // true for an @window created via /window
+    bool m_hasEdit = true;        // false = no editbox row at all (mIRC's default for a new custom window, unless -e is given)
+    bool m_cwListMode = false;    // -l: recorded for $window().lb; the display area itself is the same rich-text log either way (see the note in CmdWindow)
+    bool m_cwSort = false;        // -s: keep m_cwLines sorted whenever it's modified
+    int m_cwId = 0;               // stable id for $window(N) / $window().wid
+    bool m_cwAnysc = false;       // -i was given (reported via $window().anysc; the actual dynamic re-association isn't implemented)
+    CString m_cwDefCmd;           // the /command run when the user enters plain text (only reachable if m_hasEdit)
+    std::vector<CString> m_cwPopup;                    // popup.txt's raw lines, parsed fresh each time the popup is shown
+    std::vector<CString> m_cwLines; std::vector<COLORREF> m_cwColors;   // the line store behind /aline /cline /dline /iline /rline /sline
+    int m_cwSelectedLine = -1;    // 1-based; -1 = none (see /sline, $sline) -- shown via the log's own text selection, since there's no separate listbox control
+    void CwRebuild() {   // repaints the display from m_cwLines/m_cwColors after any line-store change
+        m_out.SetWindowText(L"");
+        for (size_t i = 0; i < m_cwLines.size(); i++) AddLine(m_cwLines[i], i < m_cwColors.size() ? m_cwColors[i] : cText, 0);
+        if (m_cwSelectedLine >= 1 && m_cwSelectedLine <= (int)m_cwLines.size()) CwSelectLine(m_cwSelectedLine);
+    }
+    void CwSelectLine(int n) {   // best-effort "selection": highlights that line's text using the log's own text selection
+        if (n < 1 || n > m_out.GetLineCount()) return;
+        int st = m_out.LineIndex(n - 1); if (st < 0) return;
+        int len = m_out.LineLength(st);
+        m_out.SetSel(st, st + len);
+    }
     std::function<bool()> tsEnabled;    // resolves m_tsMode against the global setting (see CMainFrame::Open)
     std::function<CString()> tsFormat;  // the current event timestamp format (e.g. "[HH:nn]"; a separating space is always added after it, see AddLine)
     CChatWnd(CString n, bool c) : m_name(n), m_chan(c) {}
@@ -1158,11 +1180,11 @@ protected:
     afx_msg void OnSize(UINT t, int cx, int cy) {
         CMDIChildWnd::OnSize(t, cx, cy);
         if (!m_in.m_hWnd) return;
-        int h = 22, top = m_chan ? h : 0, nw = m_chan ? 140 : 0;
-        if (m_chan) m_topic.MoveWindow(0, 0, cx, h);
-        m_out.MoveWindow(0, top, cx - nw, cy - top - h);
-        if (m_chan) m_nicks.MoveWindow(cx - nw, top, nw, cy - top - h);
-        m_in.MoveWindow(0, cy - h, cx, h);
+        int topicH = 22, inH = m_hasEdit ? 22 : 0, top = m_chan ? topicH : 0, nw = m_chan ? 140 : 0;
+        if (m_chan) m_topic.MoveWindow(0, 0, cx, topicH);
+        m_out.MoveWindow(0, top, cx - nw, cy - top - inH);
+        if (m_chan) m_nicks.MoveWindow(cx - nw, top, nw, cy - top - inH);
+        if (m_hasEdit) m_in.MoveWindow(0, cy - inH, cx, inH); else m_in.MoveWindow(0, cy, cx, 0);
     }
     afx_msg void OnNickDbl() {   // double-click a nick in the list -> open a query window
         int i = m_nicks.GetCaretIndex(); CString n;   // (GetCurSel doesn't work on a multiple-selection list)
@@ -2306,6 +2328,24 @@ class CMainFrame : public CMDIFrameWnd {
         m_w[Key(net, name)] = w;
         return w;
     }
+    int m_cwSeq = 0;
+    CChatWnd* OpenCustomWindow(const CString& name, bool hidden = false) {   // /window: a separate factory from Open() so status/channel/query windows are never at risk from this
+        if (auto* e = Find(nullptr, name)) return e;
+        auto* w = new CChatWnd(name, false);
+        w->net = nullptr; w->m_custom = true; w->m_hasEdit = false; w->m_cwId = ++m_cwSeq;
+        w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
+        w->onClose = [this](CChatWnd* c) { Forget(c); };
+        w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
+        w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowCustomPopup(c, pt); };
+        w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
+        w->tsFormat = [this]() { return m_tsEventFmt; };
+        w->m_seq = ++m_seqn;
+        w->Create(nullptr, name, WS_CHILD | (hidden ? 0 : WS_VISIBLE) | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        w->ApplyFont(m_chatFont);
+        { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
+        m_w[Key(nullptr, name)] = w;
+        return w;
+    }
     void Forget(CChatWnd* c) {   // user closed the window
         Net* net = c->net;
         for (auto i = m_w.begin(); i != m_w.end(); ++i)
@@ -2617,6 +2657,52 @@ class CMainFrame : public CMDIFrameWnd {
             val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
         }
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
+        if (name == L"window") {   // $window(N) or $window(@name) or $window(@wildcard,N): a reduced property set (see the /window notes for what's not modeled here)
+            CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
+            CString sel = c < 0 ? a : a.Left(c); sel.Trim();
+            double nn = 1; if (c >= 0 && !ParseNum(a.Mid(c + 1), nn)) return false;
+            std::vector<CChatWnd*> customs; for (auto& kv : m_w) if (kv.second->m_custom) customs.push_back(kv.second);
+            CChatWnd* cw = nullptr;
+            if (!sel.IsEmpty() && sel[0] == L'@') { int idx = 0; for (auto* x : customs) if (GlobMatch(sel, x->m_name) && ++idx == (int)nn) { cw = x; break; } }
+            else { double idxD; if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)customs.size()) cw = customs[idx - 1]; } }
+            if (!cw) { val.Empty(); return true; }
+            CRect r; cw->GetWindowRect(r); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&r, 2);
+            if (prop == L"x") val.Format(L"%d", r.left);
+            else if (prop == L"y") val.Format(L"%d", r.top);
+            else if (prop == L"w") val.Format(L"%d", r.Width());
+            else if (prop == L"h") val.Format(L"%d", r.Height());
+            else if (prop == L"title" || prop == L"fulltitle") val = cw->m_name;
+            else if (prop == L"state") val = cw->IsIconic() ? L"minimized" : cw->IsZoomed() ? L"maximized" : cw->IsWindowVisible() ? L"normal" : L"hidden";
+            else if (prop == L"mdi") val = L"$true";
+            else if (prop == L"type") val = cw->m_cwListMode ? L"listbox" : L"text";
+            else if (prop == L"wid") val.Format(L"%d", cw->m_cwId);
+            else if (prop == L"hwnd") val.Format(L"%zu", (size_t)cw->GetSafeHwnd());
+            else if (prop == L"anysc") val = cw->m_cwAnysc ? L"$true" : L"$false";
+            else if (prop == L"lb") val = cw->m_cwListMode ? L"1" : L"0";
+            else val = cw->m_name;   // default: the name itself
+            return true;
+        }
+        if (name == L"line" || name == L"sline") {   // $line(@name,N) / $sline(@name,N): .state .color for $line; .ln for $sline
+            CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
+            if (c < 0) return false;
+            CString wn = a.Left(c); wn.Trim();
+            double nn; if (!ParseNum(a.Mid(c + 1), nn)) return false;
+            CChatWnd* cw = Find(nullptr, wn);
+            if (!cw || !cw->m_custom) { val.Empty(); return true; }
+            int idx = (int)nn;
+            if (name == L"sline") {   // only a single "selected" line exists here (see m_cwSelectedLine), so N must be 1 (or 0 for the count)
+                if (idx == 0) { val = cw->m_cwSelectedLine >= 1 ? L"1" : L"0"; return true; }
+                if (idx != 1 || cw->m_cwSelectedLine < 1) { val.Empty(); return true; }
+                val = prop == L"ln" ? CString(std::to_wstring(cw->m_cwSelectedLine).c_str()) : cw->m_cwLines[cw->m_cwSelectedLine - 1];
+                return true;
+            }
+            if (idx == 0) { val.Format(L"%d", (int)cw->m_cwLines.size()); return true; }
+            if (idx < 1 || idx > (int)cw->m_cwLines.size()) { val.Empty(); return true; }
+            if (prop == L"state") val = cw->m_cwSelectedLine == idx ? L"1" : L"0";
+            else if (prop == L"color") { COLORREF cr = (size_t)idx <= cw->m_cwColors.size() ? cw->m_cwColors[idx - 1] : cText; val.Format(L"%d", (int)cr); }
+            else val = cw->m_cwLines[idx - 1];
+            return true;
+        }
         if (name == L"dns") {   // $dns(T,N): T is a record type (A/AAAA/NS/MX/SOA/SRV/TXT) or * for all, from the last /dns -m request
             CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
             CString T = c < 0 ? a : a.Left(c); T.Trim(); T.MakeUpper();
@@ -3192,6 +3278,18 @@ class CMainFrame : public CMDIFrameWnd {
         CString params; if (sec == 2) params = c->m_name;   // in a query window $1 is the person you're talking to
         return ShowContextPopup(c, sec, params, pt, c->LogHasSelection());
     }
+    bool ShowCustomPopup(CChatWnd* w, CPoint pt) {   // right-click in an @window: its own popup.txt, loaded fresh each time
+        if (w->m_cwPopup.empty()) return false;
+        std::vector<PopupItem> items = ParsePopupItems(w->m_cwPopup);
+        CMenu m; m.CreatePopupMenu(); std::vector<std::vector<CString>> acts; size_t i = 0;
+        BuildPopupLevel(m, items, i, 0, IDP_CTX, acts, w, CString());
+        if (m.GetMenuItemCount() == 0) return false;
+        SetForegroundWindow(); m_menuOpen = true;
+        int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
+        if (cmd >= IDP_CTX && (size_t)(cmd - IDP_CTX) < acts.size()) RunPopupLines(w, acts[cmd - IDP_CTX], CString());
+        return true;
+    }
     void ShowNickMenu(CChatWnd* c, const CString& nicks, CPoint pt) {   // right-click nick(s) in the user list: [lpopup], or the built-in menu if it's empty
         if (ShowContextPopup(c, 3, nicks, pt, false)) return;
         CString rest = nicks, first = Word(rest);
@@ -3288,6 +3386,7 @@ class CMainFrame : public CMDIFrameWnd {
         Net* net = w->net;
         if (s.IsEmpty()) return;
         if (s[0] != L'/') {
+            if (w->m_custom) { if (!w->m_cwDefCmd.IsEmpty()) RunScript(w, std::vector<CString>{ w->m_cwDefCmd }, s); return; }
             if (w->m_name == L"*status*") Note(net, L"You're not in a channel or query.", cPart);
             else Say(net, w->m_name, s);
             return;
@@ -3391,7 +3490,8 @@ class CMainFrame : public CMDIFrameWnd {
             CChatWnd* target = nullptr;
             { CString tmp = a; CString first = Word(tmp);
               if (!first.IsEmpty()) { CString tn = first; if (tn[0] == L'=') tn = tn.Mid(1);
-                  if (IsChan(tn) || Find(net, tn)) { target = IsChan(tn) ? Open(net, tn, true) : Find(net, tn); a = tmp; } } }
+                  CChatWnd* found = tn[0] == L'@' ? Find(nullptr, tn) : Find(net, tn);   // @windows are stored keyed under no network, not the current one
+                  if (IsChan(tn) || found) { target = IsChan(tn) ? Open(net, tn, true) : found; a = tmp; } } }
             if (!target) target = sFlag ? Status(net) : aFlagSw ? dynamic_cast<CChatWnd*>(MDIGetActive()) : w;
             if (!target) { Show(w, L"* /echo: no such window.", cPart, 0); return; }
             CString text = a;
@@ -3449,6 +3549,14 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"play") CmdPlay(w, arg);
         else if (cmd == L"playctrl") CmdPlayCtrl(w);
         else if (cmd == L"dns") CmdDns(w, arg);
+        else if (cmd == L"window") CmdWindow(w, arg);
+        else if (cmd == L"aline") CmdCwLine(w, arg, L'a');
+        else if (cmd == L"cline") CmdCwLine(w, arg, L'c');
+        else if (cmd == L"dline") CmdCwLine(w, arg, L'd');
+        else if (cmd == L"iline") CmdCwLine(w, arg, L'i');
+        else if (cmd == L"rline") CmdCwLine(w, arg, L'r');
+        else if (cmd == L"sline") CmdCwLine(w, arg, L's');
+        else if (cmd == L"renwin") CmdRenwin(w, arg);
         else if (cmd == L"timestamp") {
             CString a = arg; a.Trim();
             if (a.Left(2).CompareNoCase(L"-f") == 0) {
@@ -3475,7 +3583,7 @@ class CMainFrame : public CMDIFrameWnd {
                     if (target == 1) { if (CChatWnd* sw = Status(net)) targets.push_back(sw); }
                     else if (target == 2) { if (auto* aw = dynamic_cast<CChatWnd*>(MDIGetActive())) targets.push_back(aw); }
                     else if (target == 3) { for (auto& kv : m_w) targets.push_back(kv.second); }
-                    else if (!winName.IsEmpty()) { if (CChatWnd* nw = Find(net, winName)) targets.push_back(nw); }
+                    else if (!winName.IsEmpty()) { if (CChatWnd* nw = winName[0] == L'@' ? Find(nullptr, winName) : Find(net, winName)) targets.push_back(nw); }
                     if (targets.empty()) { Show(w, L"* No matching window.", cPart); return; }
                     for (auto* tw : targets) tw->m_tsMode = val;
                     CString state = val == -1 ? CString(L"following the global setting") : (val ? CString(L"on") : CString(L"off"));
@@ -3507,7 +3615,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -3837,7 +3945,128 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_playQueue.empty()) StopPlayTimer();
     }
 
-    // ---- /dns: resolves an address, hostname, or nickname; queued and run one at a time on a worker thread ----
+    // ---- /window: create/manipulate a custom @window. A large chunk of mIRC's own switch list has no equivalent in
+    // this client (desktop windows, treebar, side-listbox, progress bar, picture windows, tab stops, icons,
+    // fullscreen) and is accepted-but-ignored so a script's switch string doesn't error out; see CmdWindow's inline
+    // notes for exactly what each switch does here. ----
+    void CmdWindow(CChatWnd* w, CString arg) {
+        CString a = arg; a.Trim();
+        if (a.IsEmpty()) { Show(w, L"* Usage: /window [switches] <@name> [x y [w h]] [/command] [popup.txt] [font [size]]", cPart); return; }
+        bool aFlag = false, cFlag = false, hFlag = false, eFlag = false, lFlag = false, CFlag = false, sFlagSw = false;
+        bool nFlagSw = false, rFlagSw = false, xFlagSw = false;
+        while (!a.IsEmpty() && (a[0] == L'-' || a[0] == L'+')) {
+            CString swTok = Word(a);
+            if (swTok[0] == L'-') {
+                for (int i = 1; i < swTok.GetLength(); i++) {
+                    wchar_t c = swTok[i];
+                    if (c == L'a') aFlag = true; else if (c == L'c') cFlag = true; else if (c == L'h') hFlag = true;
+                    else if (c == L'e') { eFlag = true; while (i + 1 < swTok.GetLength() && iswdigit(swTok[i + 1])) i++; }
+                    else if (c == L'l') { lFlag = true; while (i + 1 < swTok.GetLength() && iswdigit(swTok[i + 1])) i++; }
+                    else if (c == L'n') { nFlagSw = true; while (i + 1 < swTok.GetLength() && iswdigit(swTok[i + 1])) i++; }
+                    else if (c == L'r') rFlagSw = true; else if (c == L'x') xFlagSw = true; else if (c == L'C') CFlag = true;
+                    else if (c == L's') sFlagSw = true;
+                    else if (c == L't') while (i + 1 < swTok.GetLength() && (iswdigit(swTok[i + 1]) || swTok[i + 1] == L',')) i++;   // -tN,..,N (tab stops): parsed past, not applied
+                    // everything else (b B d D f g[N] G H i j[N] k[N] m M o p q R u v w[N] z, and +switches) is
+                    // accepted for compatibility but has no effect: no desktop-window mode, treebar, side-listbox,
+                    // progress bar, picture windows, custom border styles, or icons in this client.
+                }
+            }
+            a.TrimLeft();
+        }
+        CString name = Word(a);
+        if (name.IsEmpty() || name[0] != L'@') { Show(w, L"* /window: the name must start with @, e.g. @test", cPart); return; }
+        std::vector<CString> tok = PlayTokenize(a);
+        auto isNum = [](const CString& s) { if (s.IsEmpty()) return false; int st = s[0] == L'-' ? 1 : 0; if (st >= s.GetLength()) return false; for (int i = st; i < s.GetLength(); i++) if (!iswdigit(s[i])) return false; return true; };
+        size_t ti = 0; int px = -1, py = -1, pw = -1, ph = -1;
+        if (ti + 1 < tok.size() && isNum(tok[ti]) && isNum(tok[ti + 1])) {
+            px = _wtoi(tok[ti]); py = _wtoi(tok[ti + 1]); ti += 2;
+            if (ti + 1 < tok.size() && isNum(tok[ti]) && isNum(tok[ti + 1])) { pw = _wtoi(tok[ti]); ph = _wtoi(tok[ti + 1]); ti += 2; }
+        }
+        CString defCmd, popupFile, fontName; int fontSize = -1;
+        if (ti < tok.size() && tok[ti][0] == L'/') { defCmd = tok[ti]; ti++; }
+        if (ti < tok.size() && tok[ti].Find(L'.') >= 0) { popupFile = tok[ti]; ti++; }
+        if (ti < tok.size()) { fontName = tok[ti]; ti++; if (ti < tok.size() && isNum(tok[ti])) { fontSize = _wtoi(tok[ti]); ti++; } }
+
+        CChatWnd* cw = Find(nullptr, name);
+        if (cFlag) { if (cw) cw->DestroyWindow(); return; }
+        bool creating = !cw;
+        if (!cw) cw = OpenCustomWindow(name, hFlag);
+        if (eFlag) cw->m_hasEdit = true;
+        if (lFlag) cw->m_cwListMode = true;
+        if (sFlagSw) { cw->m_cwSort = true; CwSort(cw); }
+        if (!defCmd.IsEmpty()) cw->m_cwDefCmd = defCmd;
+        if (!popupFile.IsEmpty()) cw->m_cwPopup = ReadTextLines(popupFile);
+        if (!fontName.IsEmpty()) { LOGFONT lf; MakeFont(lf, fontName, fontSize > 0 ? fontSize : 10, false, false); cw->ApplyFont(lf); }
+        if (CFlag) {   // center on the primary monitor with a sensible default size, unless the caller also gave one
+            CRect scr; ::SystemParametersInfoW(SPI_GETWORKAREA, 0, &scr, 0);
+            if (pw < 0) pw = 400; if (ph < 0) ph = 300;
+            if (px < 0) px = scr.left + ((scr.Width() - pw) / 2); if (py < 0) py = scr.top + ((scr.Height() - ph) / 2);
+        }
+        if (px >= 0 || py >= 0 || pw >= 0 || ph >= 0) {
+            CRect cur; cw->GetWindowRect(cur); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&cur, 2);
+            cw->MoveWindow(px >= 0 ? px : cur.left, py >= 0 ? py : cur.top, pw >= 0 ? pw : cur.Width(), ph >= 0 ? ph : cur.Height());
+        }
+        if (hFlag && !creating) cw->ShowWindow(SW_HIDE);
+        if (nFlagSw) cw->ShowWindow(SW_MINIMIZE);
+        if (rFlagSw) cw->ShowWindow(SW_RESTORE);
+        if (xFlagSw) cw->ShowWindow(SW_MAXIMIZE);
+        if (aFlag) Activate(cw);
+    }
+    static void CwSort(CChatWnd* cw) {   // -s: keeps m_cwLines (and the parallel color array) sorted together
+        std::vector<size_t> order(cw->m_cwLines.size()); for (size_t i = 0; i < order.size(); i++) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cw->m_cwLines[a].CompareNoCase(cw->m_cwLines[b]) < 0; });
+        std::vector<CString> nl; std::vector<COLORREF> nc;
+        for (size_t i : order) { nl.push_back(cw->m_cwLines[i]); nc.push_back(i < cw->m_cwColors.size() ? cw->m_cwColors[i] : cText); }
+        cw->m_cwLines = nl; cw->m_cwColors = nc; cw->CwRebuild();
+    }
+    // ---- /aline /cline /dline /iline /rline /sline: shared parser, since they all start the same way ----
+    // op: 'a' append, 'c' recolor, 'd' delete, 'i' insert, 'r' replace, 's' select
+    void CmdCwLine(CChatWnd* w, CString arg, wchar_t op) {
+        CString a = arg; a.TrimLeft();
+        bool selAdd = false, selClear = false; int colorNum = -1;
+        while (a.Left(1) == L"-") {   // -s/-a (selection mode), -h, -p, -r, -i[N], -n, -m, -l: accepted, only -s/-a/-i are meaningfully used here
+            CString swTok = Word(a);
+            for (int i = 1; i < swTok.GetLength(); i++) { wchar_t c = swTok[i]; if (c == L's') selClear = true; else if (c == L'a') selAdd = true; }
+            a.TrimLeft();
+        }
+        CString first = a; CString maybeColor = Word(first);
+        if (IsAllDigits(maybeColor)) { colorNum = _wtoi(maybeColor); a = first; }
+        CString name = Word(a);
+        CChatWnd* cw = Find(nullptr, name);
+        if (!cw || !cw->m_custom) { Show(w, L"* No such window: " + name, cPart); return; }
+        COLORREF col = colorNum >= 0 ? MircColor(colorNum) : cText;
+        if (op == L'a') {   // /aline [c] <@name> <text>
+            cw->m_cwLines.push_back(a); cw->m_cwColors.push_back(col);
+            if (cw->m_cwSort) CwSort(cw); else cw->CwRebuild();
+            if (selClear || selAdd) cw->m_cwSelectedLine = (int)cw->m_cwLines.size(), cw->CwSelectLine(cw->m_cwSelectedLine);
+            return;
+        }
+        int n1 = 0, n2 = 0; CString rest = a; CString nTok = Word(rest);
+        int dash = nTok.Find(L'-');
+        if (dash > 0) { n1 = _wtoi(nTok.Left(dash)); n2 = _wtoi(nTok.Mid(dash + 1)); } else { n1 = n2 = _wtoi(nTok); }
+        if (n1 < 1 || n1 > (int)cw->m_cwLines.size()) { Show(w, L"* No such line.", cPart); return; }
+        if (op == L'c') { if ((size_t)n1 > cw->m_cwColors.size()) cw->m_cwColors.resize(n1, cText); cw->m_cwColors[n1 - 1] = col; cw->CwRebuild(); }
+        else if (op == L'd') {
+            n2 = (std::min)(n2 < n1 ? n1 : n2, (int)cw->m_cwLines.size());
+            cw->m_cwLines.erase(cw->m_cwLines.begin() + (n1 - 1), cw->m_cwLines.begin() + n2);
+            if ((size_t)n2 <= cw->m_cwColors.size()) cw->m_cwColors.erase(cw->m_cwColors.begin() + (n1 - 1), cw->m_cwColors.begin() + n2);
+            cw->CwRebuild();
+        } else if (op == L'i') {
+            cw->m_cwLines.insert(cw->m_cwLines.begin() + (n1 - 1), rest);
+            cw->m_cwColors.insert(cw->m_cwColors.begin() + (std::min)((size_t)(n1 - 1), cw->m_cwColors.size()), col);
+            cw->CwRebuild();
+        } else if (op == L'r') { cw->m_cwLines[n1 - 1] = rest; if (colorNum >= 0 && (size_t)n1 <= cw->m_cwColors.size()) cw->m_cwColors[n1 - 1] = col; cw->CwRebuild(); }   // only touches the color if one was actually given -- a plain text replace shouldn't silently reset it
+        else if (op == L's') { cw->m_cwSelectedLine = n1; cw->CwSelectLine(n1); }
+    }
+    void CmdRenwin(CChatWnd* w, CString arg) {   // /renwin <@oldname> <@newname> [topic]
+        CString a = arg; CString oldName = Word(a), newName = Word(a);
+        CChatWnd* cw = Find(nullptr, oldName);
+        if (!cw || !cw->m_custom) { Show(w, L"* No such window: " + oldName, cPart); return; }
+        if (newName.IsEmpty() || newName[0] != L'@') { Show(w, L"* /renwin: the new name must start with @.", cPart); return; }
+        m_w.erase(Key(nullptr, cw->m_name)); cw->m_name = newName; m_w[Key(nullptr, newName)] = cw;
+        cw->SetWindowText(newName + (a.IsEmpty() ? CString() : L" " + a));
+    }
+
     void CmdDns(CChatWnd* w, CString arg) {
         Net* net = w->net; arg.Trim();
         bool ipv4 = false, ipv6 = false, cFlag = false, hFlag = false, mFlag = false, nFlag = false;
