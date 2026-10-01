@@ -327,7 +327,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -2420,6 +2420,90 @@ BEGIN_MESSAGE_MAP(CIdentdDlg, CDialog)
     ON_BN_CLICKED(IDC_ID_USEEMAIL, OnUseEmail) ON_BN_CLICKED(IDC_ID_HELP, OnHelpBtn)
 END_MESSAGE_MAP()
 
+// A small square that just draws whatever HICON it's given, centered -- used by the Tray dialog's icon preview.
+class CIconPreview : public CStatic {
+public:
+    HICON icon = nullptr;
+protected:
+    afx_msg void OnPaint() {
+        CPaintDC dc(this); CRect r; GetClientRect(r);
+        dc.FillSolidRect(r, ::GetSysColor(COLOR_WINDOW));
+        dc.Draw3dRect(r, ::GetSysColor(COLOR_BTNSHADOW), ::GetSysColor(COLOR_BTNHIGHLIGHT));
+        if (icon) dc.DrawIcon(r.left + (r.Width() - 32) / 2, r.top + (r.Height() - 32) / 2, icon);
+    }
+    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CIconPreview, CStatic)
+    ON_WM_PAINT() ON_WM_ERASEBKGND()
+END_MESSAGE_MAP()
+
+// ---------------- Tray settings dialog (File > Tray...) ----------------
+enum { IDC_TR_ALWAYS = 681, IDC_TR_STARTMIN, IDC_TR_ONMIN, IDC_TR_ANIMATE, IDC_TR_SINGLECLICK, IDC_TR_PREVIEW, IDC_TR_DEFAULT, IDC_TR_SELECT };
+class CTrayDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0; CIconPreview m_preview;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    bool alwaysShow, startMin, onMin, animate, singleClick; CString iconPath; int iconIndex;
+    std::function<HICON()> getDefaultIcon;   // the app's own icon, for the preview and for "Default"
+    std::function<HICON(const CString&, int)> loadIconFrom;   // extracts an icon from a file at a given index, or nullptr on failure
+    CTrayDlg(bool aw, bool sm, bool om, bool an, bool sc, const CString& ip, int ii, CWnd* parent)
+        : alwaysShow(aw), startMin(sm), onMin(om), animate(an), singleClick(sc), iconPath(ip), iconIndex(ii) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(210);
+        t.push_back(0); t.push_back(0); S(L"Tray"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 214, 10, IDC_TR_ALWAYS, 0x0080, L"Always show icon in tray");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 22, 214, 10, IDC_TR_STARTMIN, 0x0080, L"On startup minimize IRC to tray");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 36, 214, 10, IDC_TR_ONMIN, 0x0080, L"Place IRC in tray when minimized");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 50, 214, 10, IDC_TR_ANIMATE, 0x0080, L"Animate tray icon on activity");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 64, 214, 10, IDC_TR_SINGLECLICK, 0x0080, L"Single click on tray icon to open");
+        Item(SS_CENTER, 8, 86, 90, 9, 0xFFFF, 0x0082, L"Tray icon:");
+        Item(SS_NOTIFY, 8, 98, 64, 64, IDC_TR_PREVIEW, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 98, 70, 14, IDC_TR_DEFAULT, 0x0080, L"Default");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 116, 70, 14, IDC_TR_SELECT, 0x0080, L"Select...");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 62, 186, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 118, 186, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    void RefreshPreview() {
+        m_preview.icon = iconPath.IsEmpty() ? (getDefaultIcon ? getDefaultIcon() : nullptr) : (loadIconFrom ? loadIconFrom(iconPath, iconIndex) : nullptr);
+        if (m_preview.m_hWnd) m_preview.Invalidate();
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        m_preview.SubclassDlgItem(IDC_TR_PREVIEW, this);
+        CheckDlgButton(IDC_TR_ALWAYS, alwaysShow); CheckDlgButton(IDC_TR_STARTMIN, startMin);
+        CheckDlgButton(IDC_TR_ONMIN, onMin); CheckDlgButton(IDC_TR_ANIMATE, animate); CheckDlgButton(IDC_TR_SINGLECLICK, singleClick);
+        RefreshPreview();
+        return TRUE;
+    }
+    afx_msg void OnDefault() { iconPath.Empty(); iconIndex = 0; RefreshPreview(); }
+    afx_msg void OnSelect() {
+        CFileDialog fd(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+            L"Icons and programs (*.ico;*.exe;*.dll)|*.ico;*.exe;*.dll|All Files (*.*)|*.*||", this);
+        if (fd.DoModal() != IDOK) return;
+        iconPath = fd.GetPathName(); iconIndex = 0; RefreshPreview();
+    }
+    void OnOK() override {
+        alwaysShow = IsDlgButtonChecked(IDC_TR_ALWAYS) != 0; startMin = IsDlgButtonChecked(IDC_TR_STARTMIN) != 0;
+        onMin = IsDlgButtonChecked(IDC_TR_ONMIN) != 0; animate = IsDlgButtonChecked(IDC_TR_ANIMATE) != 0;
+        singleClick = IsDlgButtonChecked(IDC_TR_SINGLECLICK) != 0;
+        CDialog::OnOK();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CTrayDlg, CDialog)
+    ON_BN_CLICKED(IDC_TR_DEFAULT, OnDefault) ON_BN_CLICKED(IDC_TR_SELECT, OnSelect)
+END_MESSAGE_MAP()
+
 // ---------------- Online Timer dialog: current-connection and cumulative connect time (see CMainFrame's OT* members) ----------------
 enum { IDC_OT_ENABLE = 641, IDC_OT_CURTIME, IDC_OT_CURDATE, IDC_OT_CURRESET, IDC_OT_TOTTIME, IDC_OT_TOTDATE, IDC_OT_TOTRESET, IDC_OT_SHOWTOTAL };
 class COnlineTimerDlg : public CDialog {
@@ -2511,6 +2595,14 @@ class CMainFrame : public CMDIFrameWnd {
     std::shared_ptr<IdentdState> m_identdState;
     Net* m_identdTriggerNet = nullptr;   // which network's status window to report requests to, when started via "only when connecting"
     ULONGLONG m_identdAutoStopAt = 0;    // "only when connecting" fallback: stop even if no request ever arrives
+    // ---- System tray ----
+    bool m_trayAlwaysShow = false, m_trayMinOnStartup = false, m_trayOnMinimize = false, m_trayAnimate = true, m_traySingleClick = false;
+    CString m_trayIconPath; int m_trayIconIndex = 0;
+    bool m_trayIconAdded = false, m_trayIsCustomIcon = false;
+    HICON m_trayIconHandle = nullptr;      // whatever's currently shown (either an extracted custom icon, owned here, or a shared system/app one)
+    HICON m_trayAlertIcon = nullptr;       // the simple generated "activity" alternate frame (see MakeTrayAlertIcon)
+    bool m_trayFlashOn = false; UINT_PTR m_trayAnimTimerId = 0;
+    NOTIFYICONDATAW m_trayNid = {};
     // ---- Online Timer: current-connection and cumulative connect time (unrelated to the scheduled-command /timer feature above) ----
     bool m_otEnabled = true, m_otShowTotal = true;
     ULONGLONG m_otSessionStart = 0;   // GetTickCount64() when the current unbroken "connected" streak began; 0 = not currently counting
@@ -3740,6 +3832,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (cmd == L"timers") { CmdTimers(w, arg); return; }   // reserved: "/timers" is always the list/off-all command, never a timer literally named "s"
         if (cmd == L"identd") { CmdIdentd(w, arg); return; }
+        if (cmd == L"tray") { CmdTray(w, arg); return; }
         if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
         if (cmd.Left(5) == L"timer" && cmd.GetLength() > 5) { CmdTimer(w, cmdRaw.Mid(5), arg); return; }   // "/timer1", "/timershow", etc: the timer name follows directly, no space
         if (cmd == L"server" || cmd == L"connect") {
@@ -3955,7 +4048,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -4221,7 +4314,179 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; }
         SaveOnlineTimer();
         StopIdentd();
+        // "If you hold down the Shift key when you quit mIRC, the next time you run it, it will be minimized."
+        AfxGetApp()->WriteProfileInt(L"Tray", L"startMinimizedNext", (::GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 0);
+        HideTrayIcon();
         CMDIFrameWnd::OnClose();
+    }
+    // SC_MINIMIZE is intercepted so minimizing can go straight to the tray instead of the taskbar, per the
+    // "Place mIRC in tray when minimized" setting -- and Shift, held during the click, always forces tray-minimize
+    // even when that setting is off, matching mIRC's own described override (the reverse direction -- forcing a
+    // normal taskbar minimize while the setting is on -- isn't described in the Tray help text, so isn't assumed here).
+    afx_msg void OnSysCommand(UINT nID, LPARAM lParam) {
+        if ((nID & 0xFFF0) == SC_MINIMIZE) {
+            bool shiftHeld = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (m_trayOnMinimize || shiftHeld) {
+                ShowWindow(SW_MINIMIZE); ShowWindow(SW_HIDE);
+                if (!m_trayAlwaysShow) ShowTrayIcon();
+                return;
+            }
+        }
+        CMDIFrameWnd::OnSysCommand(nID, lParam);
+    }
+    // ---- System tray ----
+    void LoadTraySettings() {
+        CWinApp* a = AfxGetApp();
+        m_trayAlwaysShow = a->GetProfileInt(L"Tray", L"alwaysShow", 0) != 0;
+        m_trayMinOnStartup = a->GetProfileInt(L"Tray", L"minOnStartup", 0) != 0;
+        m_trayOnMinimize = a->GetProfileInt(L"Tray", L"onMinimize", 0) != 0;
+        m_trayAnimate = a->GetProfileInt(L"Tray", L"animate", 1) != 0;
+        m_traySingleClick = a->GetProfileInt(L"Tray", L"singleClick", 0) != 0;
+        m_trayIconPath = a->GetProfileString(L"Tray", L"iconPath", L"");
+        m_trayIconIndex = a->GetProfileInt(L"Tray", L"iconIndex", 0);
+    }
+    void SaveTraySettings() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Tray", L"alwaysShow", m_trayAlwaysShow ? 1 : 0);
+        a->WriteProfileInt(L"Tray", L"minOnStartup", m_trayMinOnStartup ? 1 : 0);
+        a->WriteProfileInt(L"Tray", L"onMinimize", m_trayOnMinimize ? 1 : 0);
+        a->WriteProfileInt(L"Tray", L"animate", m_trayAnimate ? 1 : 0);
+        a->WriteProfileInt(L"Tray", L"singleClick", m_traySingleClick ? 1 : 0);
+        a->WriteProfileString(L"Tray", L"iconPath", m_trayIconPath);
+        a->WriteProfileInt(L"Tray", L"iconIndex", m_trayIconIndex);
+    }
+    static HICON LoadIconFromFile(const CString& path, int index) {
+        HICON h = ::ExtractIconW(AfxGetInstanceHandle(), path, index);
+        return (h && h != (HICON)1) ? h : nullptr;   // ExtractIcon returns (HICON)1 for "file has icons but not at this index", NULL for "couldn't open it at all"
+    }
+    static HICON AppDefaultIcon() {
+        HICON h = (HICON)::LoadImageW(AfxGetInstanceHandle(), MAKEINTRESOURCE(101), IMAGE_ICON, 16, 16, LR_DEFAULTSIZE);
+        return h ? h : ::LoadIcon(nullptr, IDI_APPLICATION);   // falls back to a generic system icon when IRC.rc wasn't linked in
+    }
+    HICON MakeTrayAlertIcon() {   // a simple, deliberately plain "something happened" alternate frame -- not mIRC's own multi-phase animation (purple when connected, a revolving planet while connecting), which would need several custom-drawn icon frames this client doesn't have
+        if (m_trayAlertIcon) return m_trayAlertIcon;
+        HDC scr = ::GetDC(nullptr);
+        HDC mem = ::CreateCompatibleDC(scr);
+        HBITMAP color = ::CreateCompatibleBitmap(scr, 16, 16);
+        HBITMAP oldBmp = (HBITMAP)::SelectObject(mem, color);
+        RECT r = { 0, 0, 16, 16 };
+        HBRUSH bg = ::CreateSolidBrush(RGB(230, 30, 30)); ::FillRect(mem, &r, bg); ::DeleteObject(bg);
+        HBRUSH dot = ::CreateSolidBrush(RGB(255, 230, 0)); HGDIOBJ oldBr = ::SelectObject(mem, dot);
+        HGDIOBJ oldPen = ::SelectObject(mem, ::GetStockObject(NULL_PEN));
+        ::Ellipse(mem, 3, 3, 13, 13);
+        ::SelectObject(mem, oldPen); ::SelectObject(mem, oldBr); ::DeleteObject(dot);
+        ::SelectObject(mem, oldBmp);
+        HBITMAP mask = ::CreateBitmap(16, 16, 1, 1, nullptr);
+        HDC maskDc = ::CreateCompatibleDC(scr); HBITMAP oldMask = (HBITMAP)::SelectObject(maskDc, mask);
+        ::PatBlt(maskDc, 0, 0, 16, 16, BLACKNESS);   // an all-zero AND-mask: the icon is fully opaque, no transparency needed for a plain square
+        ::SelectObject(maskDc, oldMask);
+        ICONINFO ii = {}; ii.fIcon = TRUE; ii.hbmColor = color; ii.hbmMask = mask;
+        m_trayAlertIcon = ::CreateIconIndirect(&ii);
+        ::DeleteObject(color); ::DeleteObject(mask); ::DeleteDC(mem); ::DeleteDC(maskDc); ::ReleaseDC(nullptr, scr);
+        return m_trayAlertIcon;
+    }
+    bool AnyWindowHasActivity() const { for (auto& kv : m_w) if (kv.second->m_act > 0) return true; return false; }
+    void SetTrayIconHandle(HICON h) {
+        m_trayNid.hIcon = h;
+        if (m_trayIconAdded) ::Shell_NotifyIconW(NIM_MODIFY, &m_trayNid);
+    }
+    void ShowTrayIcon() {
+        if (m_trayIconAdded) return;
+        m_trayIsCustomIcon = !m_trayIconPath.IsEmpty();
+        m_trayIconHandle = m_trayIsCustomIcon ? LoadIconFromFile(m_trayIconPath, m_trayIconIndex) : nullptr;
+        if (!m_trayIconHandle) { m_trayIconHandle = AppDefaultIcon(); m_trayIsCustomIcon = false; }
+        ZeroMemory(&m_trayNid, sizeof(m_trayNid));
+        m_trayNid.cbSize = sizeof(m_trayNid); m_trayNid.hWnd = m_hWnd; m_trayNid.uID = 1;
+        m_trayNid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        m_trayNid.uCallbackMessage = WM_APP + 52;
+        m_trayNid.hIcon = m_trayIconHandle;
+        wcscpy_s(m_trayNid.szTip, L"IRC Client");
+        ::Shell_NotifyIconW(NIM_ADD, &m_trayNid);
+        m_trayIconAdded = true;
+        if (m_trayAnimate && !m_trayIsCustomIcon && !m_trayAnimTimerId) m_trayAnimTimerId = SetTimer(2003, 600, nullptr);   // mIRC's own note: animation doesn't apply when a custom icon is selected
+    }
+    void HideTrayIcon() {
+        if (m_trayAnimTimerId) { KillTimer(m_trayAnimTimerId); m_trayAnimTimerId = 0; }
+        if (!m_trayIconAdded) return;
+        ::Shell_NotifyIconW(NIM_DELETE, &m_trayNid);
+        m_trayIconAdded = false; m_trayFlashOn = false;
+        if (m_trayIsCustomIcon && m_trayIconHandle) { ::DestroyIcon(m_trayIconHandle); m_trayIconHandle = nullptr; }
+    }
+    void TrayAnimTick() {   // alternates the icon between normal and the alert frame, only while something has unread activity
+        if (!m_trayIconAdded) return;
+        if (!AnyWindowHasActivity()) { if (m_trayFlashOn) { SetTrayIconHandle(m_trayIconHandle); m_trayFlashOn = false; } return; }
+        m_trayFlashOn = !m_trayFlashOn;
+        SetTrayIconHandle(m_trayFlashOn ? MakeTrayAlertIcon() : m_trayIconHandle);
+    }
+    void ToggleMainWindowFromTray() {
+        if (IsIconic() || !IsWindowVisible()) {
+            ShowWindow(SW_RESTORE); SetForegroundWindow();
+            if (!m_trayAlwaysShow) HideTrayIcon();
+        } else {
+            ShowWindow(SW_MINIMIZE); ShowWindow(SW_HIDE);
+            if (!m_trayAlwaysShow) ShowTrayIcon();
+        }
+    }
+    void ShowTrayMenu() {
+        enum { ID_OPEN = 25001, ID_EXIT = 25002, ID_WINBASE = 25100 };
+        CMenu m; m.CreatePopupMenu();
+        int id = ID_WINBASE; std::map<int, CChatWnd*> map;
+        for (auto& kv : m_w) {
+            CChatWnd* cw = kv.second;
+            CString label = cw->m_name == L"*status*" ? CString(L"Status") : cw->m_name;
+            m.AppendMenu(MF_STRING | (cw->m_act > 0 ? MF_CHECKED : 0), id, label);
+            map[id] = cw; id++;
+        }
+        if (!m_w.empty()) m.AppendMenu(MF_SEPARATOR);
+        m.AppendMenu(MF_STRING, ID_OPEN, L"Open IRC Client");
+        m.AppendMenu(MF_STRING, ID_EXIT, L"Exit");
+        SetForegroundWindow(); m_menuOpen = true;   // SetForegroundWindow here is required for the popup to dismiss correctly on an outside click, per the standard tray-menu pattern
+        CPoint pt; GetCursorPos(&pt);
+        int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, this);
+        m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
+        if (cmd == ID_OPEN) { ShowWindow(SW_RESTORE); SetForegroundWindow(); if (!m_trayAlwaysShow) HideTrayIcon(); }
+        else if (cmd == ID_EXIT) PostMessage(WM_CLOSE);
+        else if (map.count(cmd)) { ShowWindow(SW_RESTORE); SetForegroundWindow(); if (!m_trayAlwaysShow) HideTrayIcon(); Activate(map[cmd]); }
+    }
+    afx_msg LRESULT OnTrayNotify(WPARAM, LPARAM lp) {
+        UINT msg = (UINT)lp;
+        if (msg == WM_LBUTTONDOWN && m_traySingleClick) ToggleMainWindowFromTray();
+        else if (msg == WM_LBUTTONDBLCLK && !m_traySingleClick) ToggleMainWindowFromTray();
+        else if (msg == WM_RBUTTONUP) ShowTrayMenu();
+        return 0;
+    }
+    void OnTrayDialog() {
+        CTrayDlg dlg(m_trayAlwaysShow, m_trayMinOnStartup, m_trayOnMinimize, m_trayAnimate, m_traySingleClick, m_trayIconPath, m_trayIconIndex, this);
+        dlg.getDefaultIcon = [] { return AppDefaultIcon(); };
+        dlg.loadIconFrom = [](const CString& p, int i) { return LoadIconFromFile(p, i); };
+        if (dlg.DoModal() != IDOK) return;
+        m_trayAlwaysShow = dlg.alwaysShow; m_trayMinOnStartup = dlg.startMin; m_trayOnMinimize = dlg.onMin;
+        m_trayAnimate = dlg.animate; m_traySingleClick = dlg.singleClick; m_trayIconPath = dlg.iconPath; m_trayIconIndex = dlg.iconIndex;
+        SaveTraySettings();
+        if (m_trayIconAdded) { HideTrayIcon(); ShowTrayIcon(); }   // picks up a changed icon/animate setting immediately
+        else if (m_trayAlwaysShow) ShowTrayIcon();
+    }
+    void CmdTray(CChatWnd* w, CString arg) {   // /tray -iNmNsNtNaN <filename>: -i sets the icon index, -m/-s/-t/-a toggle the same four dialog settings a /tray-only switch can reach
+        arg.Trim();
+        if (arg.Left(1) == L"-") {
+            int i = 1; for (; i < arg.GetLength() && arg[i] != L' '; i++) {
+                wchar_t c = arg[i];
+                if (c == L'i' || c == L'm' || c == L's' || c == L't' || c == L'a') {
+                    CString digs; while (i + 1 < arg.GetLength() && iswdigit(arg[i + 1])) digs += arg[++i];
+                    int v = digs.IsEmpty() ? 0 : _wtoi(digs);
+                    if (c == L'i') m_trayIconIndex = v;
+                    else if (c == L'm') m_trayAlwaysShow = v != 0;
+                    else if (c == L's') m_traySingleClick = v != 0;
+                    else if (c == L't') m_trayOnMinimize = v != 0;
+                    else if (c == L'a') m_trayAnimate = v != 0;
+                }
+            }
+            arg = arg.Mid(i); arg.TrimLeft();
+        }
+        if (!arg.IsEmpty()) m_trayIconPath = arg;
+        SaveTraySettings();
+        if (m_trayIconAdded) { HideTrayIcon(); ShowTrayIcon(); } else if (m_trayAlwaysShow) ShowTrayIcon();
+        Show(w, L"* Tray settings updated.", cInfo);
     }
     void LoadIdentd() {
         CWinApp* a = AfxGetApp();
@@ -5154,6 +5419,7 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnTimer(UINT_PTR id) {
         if (id == 2001) { PlayTick(); return; }   // /play: ticks independently of the UI-refresh timer below, and even while a menu is open
         if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
+        if (id == 2003) { TrayAnimTick(); return; }   // tray icon activity flash: same reasoning
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
         if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
     }
@@ -5258,6 +5524,13 @@ public:
 		LoadOnlineTimer();
 		LoadIdentd();
 		if (m_identdEnabled && !m_identdOnlyConnecting) StartIdentd();
+		LoadTraySettings();
+		{
+			bool shiftQuitMin = AfxGetApp()->GetProfileInt(L"Tray", L"startMinimizedNext", 0) != 0;
+			AfxGetApp()->WriteProfileInt(L"Tray", L"startMinimizedNext", 0);   // one-shot: only applies to the very next startup
+			if (m_trayAlwaysShow) ShowTrayIcon();
+			if (m_trayMinOnStartup || shiftQuitMin) { ShowWindow(SW_MINIMIZE); ShowWindow(SW_HIDE); if (!m_trayAlwaysShow) ShowTrayIcon(); }
+		}
 		LoadSkinPaths();
 		LoadSkinImages();
 		if (m_hWndMDIClient && m_mdiWrap.SubclassWindow(m_hWndMDIClient)) {
@@ -5284,6 +5557,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
         f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
         f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
+        f.AppendMenu(MF_STRING, IDM_TRAY, L"&Tray...");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -5404,14 +5678,16 @@ public:
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_WM_CLOSE()
+    ON_WM_SYSCOMMAND()
     ON_MESSAGE(WM_APP + 50, OnDnsResult)
     ON_MESSAGE(WM_APP + 51, OnIdentdRequest)
+    ON_MESSAGE(WM_APP + 52, OnTrayNotify)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
