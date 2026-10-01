@@ -3763,7 +3763,13 @@ class CMainFrame : public CMDIFrameWnd {
             Send(net, L"PRIVMSG " + t + L" :" + CString(wchar_t(1)) + payload + CString(wchar_t(1)));
             Note(net, L"[CTCP " + type + L" to " + t + L"]", cCTCP);
         }
-        else if (cmd == L"topic" && w->m_chan) Send(net, arg.IsEmpty() ? L"TOPIC " + w->m_name : L"TOPIC " + w->m_name + L" :" + arg);
+        else if (cmd == L"topic") {   // /topic [#channel] [new topic]: a named channel is optional (defaults to the current one); no topic text means query, not set
+            CString a = arg; CString first = Word(a);
+            CString chan = IsChan(first) ? first : (w->m_chan ? w->m_name : CString());
+            CString topicText = IsChan(first) ? a : arg;
+            if (chan.IsEmpty()) { Show(w, L"* Usage: /topic [#channel] [new topic]", cTopic); return; }
+            Send(net, topicText.IsEmpty() ? L"TOPIC " + chan : L"TOPIC " + chan + L" :" + topicText);
+        }
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
         else if (cmd == L"clear") w->Clear();
         else if (cmd == L"echo") {   // /echo [color] [-switches] [-c color name] [#channel|nick] <text>  (local only: never sent to the server)
@@ -4023,7 +4029,13 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cInfo); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
             if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
-        else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic: " + P(2), cInfo); } }
+        else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic is " + P(2), cTopic); } }
+        else if (cmd == L"333") {   // RPL_TOPICWHOTIME: channel setter unixtimestamp -- who set the topic and when, shown right after the topic itself
+            CString chan = P(1), who = P(2), ts = P(3), when;
+            if (IsAllDigits(ts)) { CTime ct((time_t)_wtoi64(ts)); when = ct.Format(L"%a %b %d %H:%M:%S %Y"); }
+            CChatWnd* w = Find(net, chan);
+            Show(w ? w : Status(net), L"* Set by " + who + (when.IsEmpty() ? CString() : L" on " + when), cTopic);
+        }
         else if (cmd == L"321") { /* RPL_LISTSTART header ("Channel Users Name"): nothing to do, our list window has its own column headers */ }
         else if (cmd == L"322") {   // RPL_LIST: <chan> <#users> :<topic> (topic may have a leading "[+modes]" prefix)
             if (net->listWnd) { CString modes, topic; ParseListModes(P(3), modes, topic); net->listWnd->AddRow(P(1), _wtoi(P(2)), modes, topic); }
