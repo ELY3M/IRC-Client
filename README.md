@@ -27,12 +27,13 @@ you may get random bugs, glitches, or crashes.
 script editor to let you to edit aliases/vars/scripts   
 scripting  
 ~~online timer~~  
-timer - needs more testing        
+~~timer~~  
+~~tray icon~~ 
 ~~identd server~~     
 DCC chat/file send/server      
 address book  
 notify  
-tip notify balloon    
+~~tip notify balloon~~      
 theme  
 ~~logging of status and chat - it will have option to disable and enable logging and location of logs~~  
 more commands  
