@@ -3972,8 +3972,11 @@ class CMainFrame : public CMDIFrameWnd {
                     if (txt == L"VERSION") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
                     else if (txt.Left(4) == L"PING") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + txt + CString(wchar_t(1)));   // echo the payload back, standard CTCP PING reply
                     else if (txt == L"TIME") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"TIME " + CTime::GetCurrentTime().Format(L"%a %b %d %H:%M:%S %Y") + CString(wchar_t(1)));
+                    else if (txt == L"FINGER") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"FINGER " + CString(VERSION) + CString(wchar_t(1)));
                 }
-                Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cPart);
+                //this is to let you know that someone CTCPed you.    
+                //might we should reply to unknown CTCPs
+                Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cCTCP);
                 return;
             }
             CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
@@ -3981,6 +3984,8 @@ class CMainFrame : public CMDIFrameWnd {
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
             else Show(w, L"<" + nick + L"> " + txt);
         }
+        //* Someone (user@hostname) invites you to join #chan
+        else if (cmd == L"INVITE") { Note(net, P(1) + " " + L" ", cInvite); }
         else if (cmd == L"JOIN") {
             CString ch = P(0); CChatWnd* w = me ? Open(net, ch, true) : Find(net, ch); if (!w) return;
             if (!me) w->AddNick(nick);
@@ -3991,8 +3996,8 @@ class CMainFrame : public CMDIFrameWnd {
             if (CChatWnd* w = Find(net, P(0))) { w->DelNick(nick); Show(w, L"* " + nick + L" has left " + P(0) + L" (" + P(1) + L")", cPart); }
         }
         else if (cmd == L"KICK") {
-            if (P(1).CompareNoCase(net->nick) == 0) { Note(net, L"You were kicked from " + P(0) + L" by " + nick + L" (" + P(2) + L")", cPart); Drop(net, P(0)); return; }
-            if (CChatWnd* w = Find(net, P(0))) { w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cPart); }
+            if (P(1).CompareNoCase(net->nick) == 0) { Note(net, L"You were kicked from " + P(0) + L" by " + nick + L" (" + P(2) + L")", cKick); Drop(net, P(0)); return; }
+            if (CChatWnd* w = Find(net, P(0))) { w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cKick); }
         }
         else if (cmd == L"QUIT") {
             for (auto& kv : m_w) {
@@ -4032,7 +4037,7 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         else if (cmd == L"366") {}
-        else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cPart); Send(net, L"NICK " + net->nick); }
+        else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cText); Send(net, L"NICK " + net->nick); }
         //whois stuff
         else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)), cWhois); }   // RPL_WHOISUSER: nick user host * :realname
         else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)), cWhois); } // RPL_WHOISSERVER
@@ -4068,9 +4073,8 @@ class CMainFrame : public CMDIFrameWnd {
             }
             StartNextDnsIfIdle();
         }
-        else { CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" "; Note(net, j.IsEmpty() ? raw : j, cText); }
+        else { CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" "; Note(net, j.IsEmpty() ? raw : cmd + ": " + j, cText); }
     }
-
     BOOL OnCreateClient(LPCREATESTRUCT lpcs, CCreateContext*) override { return CreateClient(lpcs, nullptr); }
     void MakeFont(LOGFONT& lf, const CString& face, int pt, bool bold, bool italic) {
         ZeroMemory(&lf, sizeof lf);
@@ -4761,7 +4765,7 @@ class CMainFrame : public CMDIFrameWnd {
                 s.info2,
                 s.action,
                 s.wallops,
-                s.wallops,
+                s.whois,
                 s.chatBg, 
                 s.editBg, 
                 s.nickBg 
@@ -4800,7 +4804,7 @@ class CMainFrame : public CMDIFrameWnd {
                 &s.info2,
                 &s.action,
                 &s.wallops,
-                &s.wallops,
+                &s.whois,
                 &s.chatBg,
                 &s.editBg,
                 &s.nickBg
@@ -4836,7 +4840,7 @@ class CMainFrame : public CMDIFrameWnd {
         cInfo2 = s.info2;
         cAction = s.action; 
         cWallops = s.wallops; 
-        cWhois = s.wallops;
+        cWhois = s.whois;
     }
     void ApplyColorScheme(int idx) {   // pushes the scheme's colors into the global text-color variables and every open window
         if (idx < 0 || idx >= (int)m_schemes.size()) return;
