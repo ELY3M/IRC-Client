@@ -1010,6 +1010,28 @@ public:
         }
     }
     void OnSend(int) override { Flush(); }
+    // Replaces plain Create()+Connect(host,port): that pair resolves via MFC's legacy, IPv4-only path (gethostbyname /
+    // inet_addr under the hood), which can't parse an IPv6 literal (e.g. "2001:6b0:78::30") at all and fails
+    // immediately. GetAddrInfoW is the modern, dual-stack-aware resolver -- it handles IPv4 literals, IPv6 literals,
+    // and regular hostnames (picking whichever family the OS resolves/prefers), and the socket is then (re)created
+    // with the matching address family before connecting.
+    bool ConnectSmart(const CString& host, UINT port) {
+        ADDRINFOW hints = {}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP;
+        CString portStr; portStr.Format(L"%u", port);
+        PADDRINFOW result = nullptr;
+        if (::GetAddrInfoW(host, portStr, &hints, &result) != 0 || !result) return false;
+        if (m_hSocket != INVALID_SOCKET) Close();
+        bool ok = false;
+        SOCKET s = ::socket(result->ai_family, SOCK_STREAM, IPPROTO_TCP);   // created manually with the resolved family, since CAsyncSocket::Create itself has no family parameter to pick IPv6 with
+        if (s != INVALID_SOCKET) {
+            if (Attach(s, FD_READ | FD_WRITE | FD_OOB | FD_ACCEPT | FD_CONNECT | FD_CLOSE)) {   // Attach wires up the same async notifications Create would have, and puts the socket in non-blocking mode as a side effect
+                int rc = ::connect(m_hSocket, result->ai_addr, (int)result->ai_addrlen);
+                ok = (rc == 0) || (::WSAGetLastError() == WSAEWOULDBLOCK);
+            } else ::closesocket(s);
+        }
+        ::FreeAddrInfoW(result);
+        return ok;
+    }
     void OnConnect(int e) override {
         if (e || !tls) { if (onConn) onConn(e); return; }
         if (!tls->Handshake()) { if (onConn) onConn((int)tls->lastStatus); return; }
@@ -2860,7 +2882,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L"...");
         SetState(net, L"Connecting to " + host + L"...");
-        if (!net->sock.Create() || (!net->sock.Connect(host, port) && GetLastError() != WSAEWOULDBLOCK))
+        if (!net->sock.ConnectSmart(host, port))
             Note(net, L"Connect failed", cPart);
     }
     void ShowNickMenuLegacy(CChatWnd* c, const CString& nick, CPoint pt) {   // the built-in Whois / Query / Notice menu, used when [lpopup] is empty
@@ -2916,6 +2938,11 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
         if (name == L"tips") { val = m_tipsOn ? L"$true" : L"$false"; return true; }
+        if (name == L"titlebar") {   // the active chat window's own title (not the main app titlebar)
+            CMDIChildWnd* act = MDIGetActive();
+            if (act) act->GetWindowText(val); else val.Empty();
+            return true;
+        }
         if (name == L"null") { val.Empty(); return true; }
         if (name == L"server") { val = (net && net->conn) ? net->o.host : CString(); return true; }   // empty ($null) when not connected
         if (name == L"menu" || name == L"menutype" || name == L"menucontext") { val = m_menuType; return true; }   // which popup is being built: status channel query nicklist menubar
@@ -2934,6 +2961,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"fulldate") { val = now.Format(L"%a %b %d %H:%M:%S %Y"); return true; }
         if (name == L"time") { val = now.Format(L"%H:%M:%S"); return true; }
         if (name == L"gmt") { val.Format(L"%I64d", (__int64)now.GetTime()); return true; }   // seconds since 1970, UTC-based
+        if (name == L"version") { val.Format(VERSION); return true; }
         if (name == L"daylight") {
             TIME_ZONE_INFORMATION tz = {}; DWORD id = GetTimeZoneInformation(&tz);
             val.Format(L"%ld", id == TIME_ZONE_ID_DAYLIGHT ? -tz.DaylightBias * 60 : 0L);   // seconds of DST offset, 0 when not in effect
@@ -3932,6 +3960,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (cmd == L"tray") { CmdTray(w, arg); return; }
         if (cmd == L"tips") { CmdTips(w, arg); return; }
         if (cmd == L"tip") { CmdTip(w, arg); return; }
+        if (cmd == L"titlebar") { CmdTitlebar(w, arg); return; }
         if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
         if (cmd.Left(5) == L"timer" && cmd.GetLength() > 5) { CmdTimer(w, cmdRaw.Mid(5), arg); return; }   // "/timer1", "/timershow", etc: the timer name follows directly, no space
         if (cmd == L"server" || cmd == L"connect") {
@@ -4147,7 +4176,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -4705,6 +4734,19 @@ class CMainFrame : public CMDIFrameWnd {
         if (it == m_tipQueue.end()) { Show(w, L"* No such tip: " + sel, cPart); return; }
         if (closeFlag) { if (it == m_tipQueue.begin() && it->shownAt != 0) ClearTipBalloon(); m_tipQueue.erase(it); }
         else if (textFlag) it->text = text;
+    }
+    void CmdTitlebar(CChatWnd* w, CString arg) {   // /titlebar [@window] <text>: no @window given -> the main app titlebar; otherwise that custom window's own
+        arg.Trim();
+        if (arg.IsEmpty()) { Show(w, L"* Usage: /titlebar [@window] <text>", cPart); return; }
+        CString first = arg; CString w1 = Word(first);
+        if (!w1.IsEmpty() && w1[0] == L'@') {
+            if (first.IsEmpty()) { Show(w, L"* Usage: /titlebar [@window] <text>", cPart); return; }
+            CChatWnd* target = Find(nullptr, w1);
+            if (!target) { Show(w, L"* No such window: " + w1, cPart); return; }
+            target->SetWindowText(first);
+            return;
+        }
+        SetWindowText(arg);
     }
     void LoadIdentd() {
         CWinApp* a = AfxGetApp();
