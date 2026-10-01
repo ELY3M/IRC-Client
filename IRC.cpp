@@ -53,22 +53,22 @@ along with this program.  If not, see <https://gnu.org>.
 // These are plain (non-const) globals rather than compile-time constants so the Colors dialog can change them at
 // runtime; every existing call site that uses one as a default parameter value still works unchanged, since C++
 // re-reads a default argument's current value at each call rather than requiring it to be a compile-time constant.
-static COLORREF cText = RGB(0,0,0), 
+static COLORREF cText = RGB(0, 0, 0), 
                 cCTCP = RGB(255, 0, 0),
                 cHighlight = RGB(127, 0, 0),
                 cInvite = RGB(0, 147, 0),
-                cJoin = RGB(0,147,0),
-                cPart = RGB(0,147,0),
+                cJoin = RGB(0, 147,0),
+                cPart = RGB(0, 147,0),
                 cQuit = RGB(0, 0, 127),
                 cMode = RGB(0, 147, 0),
                 cTopic = RGB(0, 147, 0),
                 cKick = RGB(0, 147, 0),
                 cNickname = RGB(0, 147, 0),
-                cOwn = RGB(0,0,0),
-                cNotice = RGB(200,110,0), 
-                cAction = RGB(156,0,156),
+                cOwn = RGB(0, 0, 0),
+                cNotice = RGB(127, 0, 0), 
+                cAction = RGB(156, 0, 156),
                 cOther = RGB(156, 0, 156),
-                cInfo = RGB(0,0,127),
+                cInfo = RGB(0, 0, 127),
                 cInfo2 = RGB(0, 147, 0),
                 cWallops = RGB(127, 0, 0),
                 cWhois = RGB(0, 0, 0);
@@ -327,7 +327,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -493,11 +493,19 @@ struct PlayItem {
     ULONGLONG dueAt = 0;   // GetTickCount64() value at which the next line may send; 0 = not yet scheduled (send immediately)
     CString Status() const { return pos == 0 ? CString(L"waiting") : (pos >= lines.size() ? CString(L"done") : CString(L"running")); }
 };
-
-// ---------------- /timer: repeating (or one-shot) scheduled commands ----------------
 // Net+window-name are stored rather than a CChatWnd* directly, resolved fresh via Find() at fire time, since the
 // window could be closed while the timer is still running (the same reasoning as PlayItem's net pointer, but a
 // window is far more likely to be closed mid-flight than a network is to be destroyed).
+struct TipInfo {   // see /tips, /tip, $tips, $tip -- a queued balloon tip, either from an automatic event or scripted via $tip()
+    CString name, title, text;
+    int delaySec = 10;    // -1 = permanent (stays until closed or dismissed)
+    CString iconFn; int iconPos = 0;   // accepted for $tip() compatibility; native balloon tips can't render an arbitrary file's icon, only a fixed info/warning/error glyph -- see ShowTipBalloon
+    CString alias;         // run (via RunScript) if the tip is clicked without Shift held
+    int wid = 0;           // the owning window's CChatWnd::m_seq; 0 = none/unassigned
+    ULONGLONG shownAt = 0; // 0 = still queued, not yet shown
+    int seq = 0;           // creation order, for $tip(N)
+};
+// ---------------- /timer: repeating (or one-shot) scheduled commands ----------------
 struct TimerInfo {
     CString name;                 // "1", "2", ... or a custom name; shown/matched without the leading "/timer"
     Net* net = nullptr; CString winName;
@@ -2459,7 +2467,7 @@ public:
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(210);
         t.push_back(0); t.push_back(0); S(L"Tray"); t.push_back(9); S(DEFAULT_FONT);
-        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 214, 10, IDC_TR_ALWAYS, 0x0080, L"Always show icon in tray");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 214, 10, IDC_TR_ALWAYS, 0x0080, L"Always show IRC icon in tray");
         Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 22, 214, 10, IDC_TR_STARTMIN, 0x0080, L"On startup minimize IRC to tray");
         Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 36, 214, 10, IDC_TR_ONMIN, 0x0080, L"Place IRC in tray when minimized");
         Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 50, 214, 10, IDC_TR_ANIMATE, 0x0080, L"Animate tray icon on activity");
@@ -2503,6 +2511,55 @@ public:
 BEGIN_MESSAGE_MAP(CTrayDlg, CDialog)
     ON_BN_CLICKED(IDC_TR_DEFAULT, OnDefault) ON_BN_CLICKED(IDC_TR_SELECT, OnSelect)
 END_MESSAGE_MAP()
+
+// ---------------- Tips settings dialog (File > Tips...) ----------------
+enum { IDC_TP_CHAN = 701, IDC_TP_PRIV, IDC_TP_OTHER, IDC_TP_QSIZE, IDC_TP_DTIME, IDC_TP_FULLSCREEN };
+class CTipsDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    bool chanOn, privOn, otherOn, hideFullscreen; int queueSize, displayTime;
+    CTipsDlg(bool c, bool p, bool o, int qs, int dt, bool hf, CWnd* parent)
+        : chanOn(c), privOn(p), otherOn(o), hideFullscreen(hf), queueSize(qs), displayTime(dt) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(220); t.push_back(150);
+        t.push_back(0); t.push_back(0); S(L"Tips"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_GROUPBOX, 8, 6, 204, 48, 0xFFFF, 0x0080, L"Events");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 16, 18, 90, 10, IDC_TP_CHAN, 0x0080, L"Channel");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 16, 32, 90, 10, IDC_TP_PRIV, 0x0080, L"Private");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 112, 18, 90, 10, IDC_TP_OTHER, 0x0080, L"Other");
+        Item(SS_LEFT, 8, 62, 90, 9, 0xFFFF, 0x0082, L"Queue size:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 110, 60, 50, 12, IDC_TP_QSIZE, 0x0081, L"");
+        Item(SS_LEFT, 8, 78, 90, 9, 0xFFFF, 0x0082, L"Display time (sec):");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 110, 76, 50, 12, IDC_TP_DTIME, 0x0081, L"");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 8, 96, 204, 20, IDC_TP_FULLSCREEN, 0x0080, L"Hide tips when full screen application is active");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 52, 126, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 108, 126, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        CheckDlgButton(IDC_TP_CHAN, chanOn); CheckDlgButton(IDC_TP_PRIV, privOn); CheckDlgButton(IDC_TP_OTHER, otherOn);
+        CheckDlgButton(IDC_TP_FULLSCREEN, hideFullscreen);
+        SetDlgItemInt(IDC_TP_QSIZE, queueSize, FALSE); SetDlgItemInt(IDC_TP_DTIME, displayTime, FALSE);
+        return TRUE;
+    }
+    void OnOK() override {
+        chanOn = IsDlgButtonChecked(IDC_TP_CHAN) != 0; privOn = IsDlgButtonChecked(IDC_TP_PRIV) != 0;
+        otherOn = IsDlgButtonChecked(IDC_TP_OTHER) != 0; hideFullscreen = IsDlgButtonChecked(IDC_TP_FULLSCREEN) != 0;
+        queueSize = (int)GetDlgItemInt(IDC_TP_QSIZE, nullptr, FALSE); displayTime = (int)GetDlgItemInt(IDC_TP_DTIME, nullptr, FALSE);
+        if (queueSize < 1) queueSize = 1; if (displayTime < 3) displayTime = 3; if (displayTime > 60) displayTime = 60;
+        CDialog::OnOK();
+    }
+};
 
 // ---------------- Online Timer dialog: current-connection and cumulative connect time (see CMainFrame's OT* members) ----------------
 enum { IDC_OT_ENABLE = 641, IDC_OT_CURTIME, IDC_OT_CURDATE, IDC_OT_CURRESET, IDC_OT_TOTTIME, IDC_OT_TOTDATE, IDC_OT_TOTRESET, IDC_OT_SHOWTOTAL };
@@ -2603,6 +2660,11 @@ class CMainFrame : public CMDIFrameWnd {
     HICON m_trayAlertIcon = nullptr;       // the simple generated "activity" alternate frame (see MakeTrayAlertIcon)
     bool m_trayFlashOn = false; UINT_PTR m_trayAnimTimerId = 0;
     NOTIFYICONDATAW m_trayNid = {};
+    // ---- Tips: balloon notifications near the tray icon (built on the same NOTIFYICONDATAW/tray icon above) ----
+    bool m_tipsOn = true, m_tipsChannel = true, m_tipsPrivate = true, m_tipsOther = true, m_tipsHideFullscreen = true;
+    int m_tipsQueueSize = 5, m_tipsDisplayTime = 10;
+    std::vector<TipInfo> m_tipQueue; int m_tipSeq = 0;
+    bool m_tipsAppWasActive = true;
     // ---- Online Timer: current-connection and cumulative connect time (unrelated to the scheduled-command /timer feature above) ----
     bool m_otEnabled = true, m_otShowTotal = true;
     ULONGLONG m_otSessionStart = 0;   // GetTickCount64() when the current unbroken "connected" streak began; 0 = not currently counting
@@ -2725,6 +2787,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     CChatWnd* Open(Net* net, const CString& name, bool chan) {
         if (auto* e = Find(net, name)) return e;
+        BOOL wasMax = FALSE; MDIGetActive(&wasMax);   // a new window should open maximized too, if whatever you're currently looking at already is
         auto* w = new CChatWnd(name, chan);
         w->net = net;
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
@@ -2737,6 +2800,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->tsFormat = [this]() { return m_tsEventFmt; };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        if (wasMax) w->ShowWindow(SW_SHOWMAXIMIZED);
         w->ApplyFont(m_chatFont);
         { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
         m_w[Key(net, name)] = w;
@@ -2745,6 +2809,7 @@ class CMainFrame : public CMDIFrameWnd {
     int m_cwSeq = 0;
     CChatWnd* OpenCustomWindow(const CString& name, bool hidden = false) {   // /window: a separate factory from Open() so status/channel/query windows are never at risk from this
         if (auto* e = Find(nullptr, name)) return e;
+        BOOL wasMax = FALSE; MDIGetActive(&wasMax);
         auto* w = new CChatWnd(name, false);
         w->net = nullptr; w->m_custom = true; w->m_hasEdit = false; w->m_cwId = ++m_cwSeq;
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
@@ -2755,6 +2820,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->tsFormat = [this]() { return m_tsEventFmt; };
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | (hidden ? 0 : WS_VISIBLE) | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        if (wasMax && !hidden) w->ShowWindow(SW_SHOWMAXIMIZED);
         w->ApplyFont(m_chatFont);
         { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
         m_w[Key(nullptr, name)] = w;
@@ -2849,6 +2915,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
+        if (name == L"tips") { val = m_tipsOn ? L"$true" : L"$false"; return true; }
         if (name == L"null") { val.Empty(); return true; }
         if (name == L"server") { val = (net && net->conn) ? net->o.host : CString(); return true; }   // empty ($null) when not connected
         if (name == L"menu" || name == L"menutype" || name == L"menucontext") { val = m_menuType; return true; }   // which popup is being built: status channel query nicklist menubar
@@ -3073,6 +3140,36 @@ class CMainFrame : public CMDIFrameWnd {
             val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
         }
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
+        if (name == L"tip") {   // $tip(name,title,text[,delay,iconfn,iconpos,alias,wid]) creates/replaces a tip; $tip(name/N) queries one
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { parts.push_back(a.Mid(start)); break; } parts.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            for (auto& p : parts) p.Trim();
+            if (parts.size() >= 3 && !parts[0].IsEmpty() && !parts[1].IsEmpty() && !parts[2].IsEmpty()) {   // the CREATE form
+                TipInfo t; t.seq = ++m_tipSeq;
+                t.name = parts[0]; t.title = parts[1]; t.text = parts[2];
+                t.delaySec = parts.size() > 3 && !parts[3].IsEmpty() ? _wtoi(parts[3]) : m_tipsDisplayTime;
+                t.iconFn = parts.size() > 4 ? parts[4] : CString();
+                t.iconPos = parts.size() > 5 && !parts[5].IsEmpty() ? _wtoi(parts[5]) : 0;
+                t.alias = parts.size() > 6 ? parts[6] : CString();
+                t.wid = parts.size() > 7 && !parts[7].IsEmpty() ? _wtoi(parts[7]) : (w ? w->m_seq : 0);
+                m_tipQueue.erase(std::remove_if(m_tipQueue.begin(), m_tipQueue.end(), [&](const TipInfo& x) { return x.name.CompareNoCase(t.name) == 0; }), m_tipQueue.end());
+                AddTipToQueue(t);
+                int pos = 0; for (size_t i = 0; i < m_tipQueue.size(); i++) if (m_tipQueue[i].name.CompareNoCase(t.name) == 0) { pos = (int)i + 1; break; }
+                val.Format(L"%d", pos);
+                return true;
+            }
+            // the QUERY form: $tip(name/N)
+            TipInfo* found = nullptr;
+            double idxD;
+            if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_tipQueue.size()) found = &m_tipQueue[idx - 1]; }
+            else for (auto& x : m_tipQueue) if (x.name.CompareNoCase(a) == 0) { found = &x; break; }
+            if (!found) { val.Empty(); return true; }
+            if (prop == L"name") val = found->name; else if (prop == L"title") val = found->title; else if (prop == L"text") val = found->text;
+            else if (prop == L"delay") val.Format(L"%d", found->delaySec); else if (prop == L"iconfn") val = found->iconFn;
+            else if (prop == L"iconpos") val.Format(L"%d", found->iconPos); else if (prop == L"alias") val = found->alias;
+            else if (prop == L"wid") val.Format(L"%d", found->wid); else val = found->name;
+            return true;
+        }
         if (name == L"window") {   // $window(N) or $window(@name) or $window(@wildcard,N): a reduced property set (see the /window notes for what's not modeled here)
             CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
             CString sel = c < 0 ? a : a.Left(c); sel.Trim();
@@ -3833,6 +3930,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (cmd == L"timers") { CmdTimers(w, arg); return; }   // reserved: "/timers" is always the list/off-all command, never a timer literally named "s"
         if (cmd == L"identd") { CmdIdentd(w, arg); return; }
         if (cmd == L"tray") { CmdTray(w, arg); return; }
+        if (cmd == L"tips") { CmdTips(w, arg); return; }
+        if (cmd == L"tip") { CmdTip(w, arg); return; }
         if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
         if (cmd.Left(5) == L"timer" && cmd.GetLength() > 5) { CmdTimer(w, cmdRaw.Mid(5), arg); return; }   // "/timer1", "/timershow", etc: the timer name follows directly, no space
         if (cmd == L"server" || cmd == L"connect") {
@@ -4048,7 +4147,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -4108,6 +4207,11 @@ class CMainFrame : public CMDIFrameWnd {
             if (ctcp) Show(w, L"* " + nick + txt.Mid(6), cAction);   // ACTION (/me): a real chat message, so it still uses the normal window
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
             else Show(w, L"<" + nick + L"> " + txt);
+            if (!notice) {   // see Tips: only real messages (including /me) trigger a balloon, never notices/CTCP noise
+                CString tipText = ctcp ? (nick + L" " + txt.Mid(6)) : (L"<" + nick + L"> " + txt);
+                if (priv && m_tipsPrivate) QueueEventTip(nick, tipText, w);
+                else if (!priv && IsChan(tgt) && m_tipsChannel) QueueEventTip(tgt, tipText, w);
+            }
         }
         //* Someone (user@hostname) invites you to join #chan
         else if (cmd == L"INVITE") { Note(net, nick + L" invites you to join " + P(1), cInvite); }
@@ -4453,6 +4557,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (msg == WM_LBUTTONDOWN && m_traySingleClick) ToggleMainWindowFromTray();
         else if (msg == WM_LBUTTONDBLCLK && !m_traySingleClick) ToggleMainWindowFromTray();
         else if (msg == WM_RBUTTONUP) ShowTrayMenu();
+        else if (msg == NIN_BALLOONUSERCLICK) OnTipClicked();
+        else if (msg == NIN_BALLOONTIMEOUT) { if (!m_tipQueue.empty()) m_tipQueue.erase(m_tipQueue.begin()); }
         return 0;
     }
     void OnTrayDialog() {
@@ -4487,6 +4593,118 @@ class CMainFrame : public CMDIFrameWnd {
         SaveTraySettings();
         if (m_trayIconAdded) { HideTrayIcon(); ShowTrayIcon(); } else if (m_trayAlwaysShow) ShowTrayIcon();
         Show(w, L"* Tray settings updated.", cInfo);
+    }
+    // ---- Tips ----
+    void LoadTipsSettings() {
+        CWinApp* a = AfxGetApp();
+        m_tipsOn = a->GetProfileInt(L"Tips", L"on", 1) != 0;
+        m_tipsChannel = a->GetProfileInt(L"Tips", L"channel", 1) != 0;
+        m_tipsPrivate = a->GetProfileInt(L"Tips", L"private", 1) != 0;
+        m_tipsOther = a->GetProfileInt(L"Tips", L"other", 1) != 0;
+        m_tipsHideFullscreen = a->GetProfileInt(L"Tips", L"hideFullscreen", 1) != 0;
+        m_tipsQueueSize = a->GetProfileInt(L"Tips", L"queueSize", 5);
+        m_tipsDisplayTime = a->GetProfileInt(L"Tips", L"displayTime", 10);
+    }
+    void SaveTipsSettings() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Tips", L"on", m_tipsOn ? 1 : 0);
+        a->WriteProfileInt(L"Tips", L"channel", m_tipsChannel ? 1 : 0);
+        a->WriteProfileInt(L"Tips", L"private", m_tipsPrivate ? 1 : 0);
+        a->WriteProfileInt(L"Tips", L"other", m_tipsOther ? 1 : 0);
+        a->WriteProfileInt(L"Tips", L"hideFullscreen", m_tipsHideFullscreen ? 1 : 0);
+        a->WriteProfileInt(L"Tips", L"queueSize", m_tipsQueueSize);
+        a->WriteProfileInt(L"Tips", L"displayTime", m_tipsDisplayTime);
+    }
+    bool IsAppActive() const { HWND fg = ::GetForegroundWindow(); return fg == m_hWnd || ::IsChild(m_hWnd, fg); }
+    bool IsOtherAppFullscreen() const {   // a simple, standard heuristic: some other app's foreground window exactly covers its monitor
+        HWND fg = ::GetForegroundWindow();
+        if (!fg || fg == m_hWnd || ::IsChild(m_hWnd, fg)) return false;
+        RECT wr; if (!::GetWindowRect(fg, &wr)) return false;
+        HMONITOR mon = ::MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) }; if (!::GetMonitorInfo(mon, &mi)) return false;
+        return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top && wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+    }
+    CChatWnd* FindWindowBySeq(int wid) { if (!wid) return nullptr; for (auto& kv : m_w) if (kv.second->m_seq == wid) return kv.second; return nullptr; }
+    void ClearTipBalloon() {   // an empty info text is the standard way to dismiss/hide whatever balloon is currently shown
+        if (!m_trayIconAdded) return;
+        NOTIFYICONDATAW nid = m_trayNid; nid.uFlags = NIF_INFO; nid.szInfo[0] = 0; nid.szInfoTitle[0] = 0;
+        ::Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    void ShowTipBalloon(const TipInfo& t) {
+        if (!m_trayIconAdded) ShowTrayIcon();
+        NOTIFYICONDATAW nid = m_trayNid;
+        nid.uFlags = NIF_INFO;
+        wcsncpy_s(nid.szInfoTitle, t.title, _TRUNCATE); wcsncpy_s(nid.szInfo, t.text, _TRUNCATE);
+        nid.dwInfoFlags = NIIF_INFO;
+        nid.uTimeout = 10000;   // modern Windows ignores this and manages its own balloon lifetime -- TipTick (below) is what actually enforces the configured display time
+        ::Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    void TipTick() {   // advances the queue: shows the head tip once mIRC isn't active, and pops it once its time is up
+        if (m_tipQueue.empty()) return;
+        if (m_tipsHideFullscreen && IsOtherAppFullscreen()) return;
+        TipInfo& head = m_tipQueue.front();
+        if (head.shownAt == 0) {
+            if (!m_tipsOn || IsAppActive()) return;   // "tips only appear when mIRC is not the active application"
+            ShowTipBalloon(head); head.shownAt = GetTickCount64();
+            return;
+        }
+        if (head.delaySec >= 0 && (GetTickCount64() - head.shownAt) >= (ULONGLONG)head.delaySec * 1000) {
+            m_tipQueue.erase(m_tipQueue.begin());
+            TipTick();   // try the next one immediately, in the same tick
+        }
+    }
+    void TipCheckActivation() {   // "hidden the moment mIRC becomes active"
+        bool active = IsAppActive();
+        if (active && !m_tipsAppWasActive && !m_tipQueue.empty() && m_tipQueue.front().shownAt != 0) {
+            ClearTipBalloon(); m_tipQueue.erase(m_tipQueue.begin());
+        }
+        m_tipsAppWasActive = active;
+    }
+    void AddTipToQueue(TipInfo t) {
+        if ((int)m_tipQueue.size() >= m_tipsQueueSize && !m_tipQueue.empty()) {
+            if (m_tipQueue.front().shownAt != 0) ClearTipBalloon();
+            m_tipQueue.erase(m_tipQueue.begin());   // "the oldest tip is removed" to make room
+        }
+        m_tipQueue.push_back(t);
+        TipTick();
+    }
+    void QueueEventTip(const CString& title, const CString& text, CChatWnd* w) {
+        if (!m_tipsOn) return;
+        TipInfo t; t.seq = ++m_tipSeq; t.name.Format(L"auto%d", t.seq);
+        t.title = title; t.text = text; t.delaySec = m_tipsDisplayTime; t.wid = w ? w->m_seq : 0;
+        AddTipToQueue(t);
+    }
+    void OnTipClicked() {
+        if (m_tipQueue.empty()) return;
+        TipInfo t = m_tipQueue.front(); m_tipQueue.erase(m_tipQueue.begin());
+        if ((::GetKeyState(VK_SHIFT) & 0x8000) != 0) return;   // Shift-click: dismiss only, already removed above
+        CChatWnd* w = FindWindowBySeq(t.wid);
+        if (!t.alias.IsEmpty()) { if (!w) w = m_w.empty() ? nullptr : m_w.begin()->second; if (w) RunScript(w, std::vector<CString>{ t.alias }, CString()); }
+        else if (w) { ShowWindow(SW_RESTORE); SetForegroundWindow(); if (!m_trayAlwaysShow) HideTrayIcon(); Activate(w); }
+    }
+    void OnTipsDialog() {
+        CTipsDlg dlg(m_tipsChannel, m_tipsPrivate, m_tipsOther, m_tipsQueueSize, m_tipsDisplayTime, m_tipsHideFullscreen, this);
+        if (dlg.DoModal() != IDOK) return;
+        m_tipsChannel = dlg.chanOn; m_tipsPrivate = dlg.privOn; m_tipsOther = dlg.otherOn;
+        m_tipsQueueSize = dlg.queueSize; m_tipsDisplayTime = dlg.displayTime; m_tipsHideFullscreen = dlg.hideFullscreen;
+        SaveTipsSettings();
+    }
+    void CmdTips(CChatWnd* w, CString arg) {
+        arg.Trim(); CString a = arg; a.MakeLower();
+        if (a == L"on") { m_tipsOn = true; SaveTipsSettings(); Show(w, L"* Tips on.", cInfo); }
+        else if (a == L"off") { m_tipsOn = false; SaveTipsSettings(); Show(w, L"* Tips off.", cInfo); }
+        else Show(w, m_tipsOn ? L"* Tips are on." : L"* Tips are off.", cInfo);
+    }
+    void CmdTip(CChatWnd* w, CString arg) {   // /tip <-ct> <name/N> [text]
+        arg.Trim(); bool closeFlag = false, textFlag = false;
+        while (arg.Left(1) == L"-") { CString sw = Word(arg); for (int i = 1; i < sw.GetLength(); i++) { if (sw[i] == L'c') closeFlag = true; else if (sw[i] == L't') textFlag = true; } arg.TrimLeft(); }
+        CString sel = Word(arg), text = arg;
+        auto it = m_tipQueue.end();
+        double idxD; if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_tipQueue.size()) it = m_tipQueue.begin() + (idx - 1); }
+        if (it == m_tipQueue.end()) for (auto i2 = m_tipQueue.begin(); i2 != m_tipQueue.end(); ++i2) if (i2->name.CompareNoCase(sel) == 0) { it = i2; break; }
+        if (it == m_tipQueue.end()) { Show(w, L"* No such tip: " + sel, cPart); return; }
+        if (closeFlag) { if (it == m_tipQueue.begin() && it->shownAt != 0) ClearTipBalloon(); m_tipQueue.erase(it); }
+        else if (textFlag) it->text = text;
     }
     void LoadIdentd() {
         CWinApp* a = AfxGetApp();
@@ -5421,6 +5639,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
         if (id == 2003) { TrayAnimTick(); return; }   // tray icon activity flash: same reasoning
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
+        TipTick(); TipCheckActivation();
         if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
     }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
@@ -5525,6 +5744,7 @@ public:
 		LoadIdentd();
 		if (m_identdEnabled && !m_identdOnlyConnecting) StartIdentd();
 		LoadTraySettings();
+		LoadTipsSettings();
 		{
 			bool shiftQuitMin = AfxGetApp()->GetProfileInt(L"Tray", L"startMinimizedNext", 0) != 0;
 			AfxGetApp()->WriteProfileInt(L"Tray", L"startMinimizedNext", 0);   // one-shot: only applies to the very next startup
@@ -5558,6 +5778,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
         f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
         f.AppendMenu(MF_STRING, IDM_TRAY, L"&Tray...");
+        f.AppendMenu(MF_STRING, IDM_TIPS, L"T&ips...");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -5687,7 +5908,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
