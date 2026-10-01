@@ -1056,11 +1056,9 @@ protected:
         CPoint sp = p; ClientToScreen(&sp);
         if (!onContext || !onContext(sp)) Default();   // Default() here still lets Windows show its own Copy/Paste menu when we decline
     }
-    afx_msg void OnLButtonUp(UINT, CPoint p) {
-        Default();
-        long s = 0, e = 0; GetSel(s, e);
-        if (s != e) { Copy(); return; }                         // a selection was just made: auto-copy it, like a Windows console window
-        if (!onLink) return;
+    // Shared by the click handler and the hover-cursor check below: the trimmed "word" at a given client point (the
+    // same word-boundary logic either way, so a click and the hand cursor always agree on what counts as a link).
+    CString WordAtPoint(CPoint p) {
         int idx = CharFromPos(p), li = LineFromChar(idx), st = LineIndex(li);
         CString ln; GetTextRange(st, st + LineLength(idx), ln);
         int q = idx - st, n = ln.GetLength(); if (q > n) q = n;
@@ -1068,9 +1066,36 @@ protected:
         while (a > 0 && !iswspace(ln[a - 1])) a--;
         while (b < n && !iswspace(ln[b])) b++;
         CPoint pa = PosFromChar(st + a), pb = PosFromChar(st + b);
-        if (p.x < pa.x || p.x > pb.x) return;                  // clicked blank space, not the word
+        if (p.x < pa.x || p.x > pb.x) return CString();   // clicked/hovered blank space, not the word itself
         CString w = ln.Mid(a, b - a); w.Trim(L",.;:!?()<>[]'\"");
-        if (w.GetLength() > 1 && (w[0] == L'#' || w[0] == L'&')) onLink(w);
+        return w;
+    }
+    static bool IsUrlWord(const CString& w) {
+        CString wl = w; wl.MakeLower();
+        return wl.Left(7) == L"http://" || wl.Left(8) == L"https://" || wl.Left(6) == L"ftp://" || wl.Left(4) == L"www.";
+    }
+    bool IsLinkWord(const CString& w) const { return (w.GetLength() > 1 && (w[0] == L'#' || w[0] == L'&')) || IsUrlWord(w); }
+    afx_msg void OnLButtonUp(UINT, CPoint p) {
+        Default();
+        long s = 0, e = 0; GetSel(s, e);
+        if (s != e) { Copy(); return; }                         // a selection was just made: auto-copy it, like a Windows console window
+        CString w = WordAtPoint(p);
+        if (IsUrlWord(w)) {   // opened directly, independent of onLink: this is a generic action, not something that needs app-specific channel/nick context
+            CString url = w;
+            if (url.Left(4).CompareNoCase(L"www.") == 0) url = L"https://" + url;   // a bare "www." word needs a scheme before ShellExecute will treat it as a URL
+            ::ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        else if (onLink && w.GetLength() > 1 && (w[0] == L'#' || w[0] == L'&')) onLink(w);
+    }
+    // Shows a hand cursor over a clickable #channel/&channel name, like mIRC (and every browser) does for a link --
+    // this fires on essentially every mouse movement over the control, so it reuses WordAtPoint rather than anything
+    // heavier.
+    afx_msg BOOL OnSetCursor(CWnd* w, UINT nHitTest, UINT message) {
+        if (nHitTest == HTCLIENT) {
+            CPoint p; GetCursorPos(&p); ScreenToClient(&p);
+            if (IsLinkWord(WordAtPoint(p))) { ::SetCursor(::LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+        }
+        return CRichEditCtrl::OnSetCursor(w, nHitTest, message);
     }
     DECLARE_MESSAGE_MAP()
 };
@@ -1078,6 +1103,7 @@ BEGIN_MESSAGE_MAP(CLogEdit, CRichEditCtrl)
     ON_WM_CONTEXTMENU()
     ON_WM_RBUTTONUP()
     ON_WM_LBUTTONUP()
+    ON_WM_SETCURSOR()
 END_MESSAGE_MAP()
 
 // ---------------- MDI child: status / channel / query window ----------------
@@ -3991,7 +4017,7 @@ class CMainFrame : public CMDIFrameWnd {
             else Show(w, L"<" + nick + L"> " + txt);
         }
         //* Someone (user@hostname) invites you to join #chan
-        else if (cmd == L"INVITE") { Note(net, P(1) + " " + L" ", cInvite); }
+        else if (cmd == L"INVITE") { Note(net, nick + L" invites you to join " + P(1), cInvite); }
         else if (cmd == L"JOIN") {
             CString ch = P(0); CChatWnd* w = me ? Open(net, ch, true) : Find(net, ch); if (!w) return;
             if (!me) w->AddNick(nick);
@@ -4027,7 +4053,7 @@ class CMainFrame : public CMDIFrameWnd {
             Show(w ? w : Status(net), L"* " + nick + L" sets mode " + m, cMode);
             if (w && p.size() > 2) { w->m_refresh = true; Send(net, L"NAMES " + P(0)); }
         }
-        else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cInfo); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
+        else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
             if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
         else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic is " + P(2), cTopic); } }
         else if (cmd == L"333") {   // RPL_TOPICWHOTIME: channel setter unixtimestamp -- who set the topic and when, shown right after the topic itself
@@ -4759,7 +4785,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (size_t i = 0; i < m_schemes.size(); i++) {
             const ColorScheme& s = m_schemes[i];
             CString line = s.name;
-            const COLORREF vals[21] = { 
+            const COLORREF vals[22] = { 
                 s.normal,
                 s.ctcp,
                 s.highlight,
@@ -4773,16 +4799,17 @@ class CMainFrame : public CMDIFrameWnd {
                 s.nickname,
                 s.own,
                 s.notice,
+                s.action,
+                s.other,
                 s.info,
                 s.info2,
-                s.action,
                 s.wallops,
                 s.whois,
                 s.chatBg, 
                 s.editBg, 
                 s.nickBg 
             };
-            for (int k = 0; k < 21; k++) line += L"," + PackColor(vals[k]);
+            for (int k = 0; k < 22; k++) line += L"," + PackColor(vals[k]);
             CString key; key.Format(L"n%d", (int)i);
             a->WriteProfileString(L"colors", key, line);
         }
@@ -4798,7 +4825,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString key = line.Left(eq), val = line.Mid(eq + 1);
             if (key.Left(1).CompareNoCase(L"n") != 0 || !iswdigit(key[1])) continue;   // skips the separate "active" key
             ColorScheme s; int pos = 0; s.name = val.Tokenize(L",", pos);
-            COLORREF* slots[21] = {             
+            COLORREF* slots[22] = {             
                 &s.normal,
                 &s.ctcp,
                 &s.highlight,
@@ -4812,16 +4839,17 @@ class CMainFrame : public CMDIFrameWnd {
                 &s.nickname,
                 &s.own,
                 &s.notice,
+                &s.action,
+                &s.other,
                 &s.info,
                 &s.info2,
-                &s.action,
                 &s.wallops,
                 &s.whois,
                 &s.chatBg,
                 &s.editBg,
                 &s.nickBg
             };
-            for (int k = 0; k < 21 && pos != -1; k++) *slots[k] = UnpackColor(val.Tokenize(L",", pos));
+            for (int k = 0; k < 22 && pos != -1; k++) *slots[k] = UnpackColor(val.Tokenize(L",", pos));
             if (!s.name.IsEmpty()) m_schemes.push_back(s);
         }
         if (m_schemes.empty()) { SeedColorSchemes(); SaveColors(); return; }
@@ -4851,6 +4879,7 @@ class CMainFrame : public CMDIFrameWnd {
         cInfo = s.info;
         cInfo2 = s.info2;
         cAction = s.action; 
+        cOther = s.other;
         cWallops = s.wallops; 
         cWhois = s.whois;
     }
