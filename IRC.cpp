@@ -29,6 +29,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #define SECURITY_WIN32
 #include <sspi.h>
 #include <schannel.h>
@@ -59,22 +60,22 @@ along with this program.  If not, see <https://gnu.org>.
 // These are plain (non-const) globals rather than compile-time constants so the Colors dialog can change them at
 // runtime; every existing call site that uses one as a default parameter value still works unchanged, since C++
 // re-reads a default argument's current value at each call rather than requiring it to be a compile-time constant.
-static COLORREF cText = RGB(0, 0, 0), 
+static COLORREF cText = RGB(0,0,0), 
                 cCTCP = RGB(255, 0, 0),
                 cHighlight = RGB(127, 0, 0),
                 cInvite = RGB(0, 147, 0),
-                cJoin = RGB(0, 147,0),
-                cPart = RGB(0, 147,0),
+                cJoin = RGB(0,147,0),
+                cPart = RGB(0,147,0),
                 cQuit = RGB(0, 0, 127),
                 cMode = RGB(0, 147, 0),
                 cTopic = RGB(0, 147, 0),
                 cKick = RGB(0, 147, 0),
                 cNickname = RGB(0, 147, 0),
-                cOwn = RGB(0, 0, 0),
+                cOwn = RGB(0,0,0),
                 cNotice = RGB(127, 0, 0), 
-                cAction = RGB(156, 0, 156),
+                cAction = RGB(156,0,156),
                 cOther = RGB(156, 0, 156),
-                cInfo = RGB(0, 0, 127),
+                cInfo = RGB(0,0,127),
                 cInfo2 = RGB(0, 147, 0),
                 cWallops = RGB(127, 0, 0),
                 cWhois = RGB(0, 0, 0);
@@ -333,7 +334,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -502,6 +503,50 @@ struct PlayItem {
 // Net+window-name are stored rather than a CChatWnd* directly, resolved fresh via Find() at fire time, since the
 // window could be closed while the timer is still running (the same reasoning as PlayItem's net pointer, but a
 // window is far more likely to be closed mid-flight than a network is to be destroyed).
+struct AddressEntry {   // one Address Book record, keyed by nickname -- see CAddressBookDlg, /abook
+    CString nick, name, email, website, address, notes, picture;
+};
+struct HighlightEntry {   // one highlight rule -- see MatchHighlight, the Address Book's Highlight tab
+    CString words;      // comma-separated words/wildcards, matched whole-word against the message text
+    CString targets;    // comma-separated #channel/nick patterns this applies to; empty = everywhere
+    int matchOn = 0;     // 0 = message text, 1 = nickname, 2 = both
+    CString colorStr;    // a color number as text
+    CString sound;       // a sound file path, played via the same MCI machinery as /splay
+    bool flash = false, tip = false;
+    CString message;     // shown in the flash/tip event; may contain %vars/$identifiers, evaluated fresh each time
+};
+struct CNickEntry {   // one /cnick entry -- see /cnick, $cnick, the nicklist/message coloring hooks
+    CString nick;          // a mask (nick or nick!user@host), possibly containing %vars/$identifiers, evaluated at match time
+    CString colorStr;      // a color number as text, or "*" for auto-color
+    bool autoColor = false;
+    CString modes;         // required prefix characters, e.g. "@%+" -- matches if the user's current channel prefix is one of these
+    CString levels;        // stored for $cnick(...).levels round-tripping; this app has no "User List/access levels" system, so it's never matched against anything
+    bool anyMode = false, noMode = false;                          // -a, -n
+    bool ignoreCond = false, opCond = false, voiceCond = false, protectCond = false, notifyCond = false;   // -i -o -v -p -y: also require the user be on the respective existing list
+    int idleMin = -1;      // -lN: stored for $cnick(...).idle, but not matched against anything -- would need live per-user idle tracking via WHOIS, which this app doesn't keep
+    int method = 0;        // -mN: 0 = color both nicklist and messages, 1 = nicklist only, 2 = messages only
+};
+struct AutoActionEntry {   // shared shape for Auto-Op, Auto-Voice, and Protect entries -- see /aop, /avoice, /protect
+    CString mask;      // a nick, or nick!user@host (wildcards allowed); for Protect this is just a nickname per mIRC's own note
+    CString channels;  // comma-separated #channel list; empty = every channel
+    CString network;   // empty = any network
+};
+struct PendingAutoAction {   // a queued op/voice, waiting out the optional random delay -- see QueueAutoAction/AutoActionTick
+    Net* net = nullptr; CString chan, nick; wchar_t mode = 0;   // 'o' or 'v'
+    ULONGLONG fireAt = 0;
+};
+struct IgnoreEntry {   // one /ignore entry -- a nick, or a nick!user@host mask (wildcards allowed)
+    CString mask, network;   // network: empty = checked on every network
+    bool excluded = false;   // -x: this mask is explicitly NOT ignored, overriding any other matching rule
+    bool p = true, c = true, n = true, t = true, i = true, k = true, d = true, s = true, h = true, y = true;   // private, channel, notice, ctcp, invite, strip-control-codes, dcc, speech, highlight, tips
+    ULONGLONG expiresAt = 0;   // 0 = never (from -u#, GetTickCount64-based, so it resets on restart like mIRC's own session-only auto-expiry)
+};
+struct NotifyEntry {   // one notify-list entry -- see /notify, CNotifyWnd, the Address Book's Notify tab
+    CString nick, note, network;   // network: empty = checked on every connected network; otherwise matched against that network's tag or NETWORK= name
+    bool doWhois = false;          // the "+nick" prefix / "Perform /whois" checkbox
+    CString soundJoin, soundPart;  // sound file paths, played via the same MCI machinery as /splay
+    bool online = false;           // current known state, used to detect join/leave transitions
+};
 struct SoundChannel {   // one of wave/midi/song; see /splay, /vol, $vol, $inwave/$inmidi/$insong
     CString alias;       // MCI device alias for this channel
     CString curFile;
@@ -1156,6 +1201,24 @@ class CListWnd;   // forward decl: the /list results window, defined further dow
 class CNickList : public CListBox {
 public:
     std::function<void(CString, CPoint)> onRClick;   // (the selected nicks, space separated with the clicked one first; screen point)
+    std::function<bool(const CString&, COLORREF&)> onGetNickColor;   // see Nick Colors: true + sets the color if this (bare) nick should be colored differently than the default
+    HFONT drawFont = nullptr;   // set explicitly by the owner (CChatWnd::ApplyFont) -- WM_DRAWITEM's hDC doesn't carry the control's own font automatically, and going through GetFont()/WM_GETFONT here was unreliable, so the parent just hands over the live handle directly
+    void DrawItem(LPDRAWITEMSTRUCT dis) override {   // owner-draw only exists so individual nicks can be colored -- everything else about this listbox (selection, sorting, scrolling) is still the plain default behavior
+        HFONT oldFont = drawFont ? (HFONT)::SelectObject(dis->hDC, drawFont) : nullptr;
+        wchar_t buf[256] = {}; ::SendMessageW(m_hWnd, LB_GETTEXT, dis->itemID, (LPARAM)buf);   // bypassing CListBox::GetText/CString here too, to rule out any MFC-side staleness
+        CString text = buf;
+        bool selected = (dis->itemState & ODS_SELECTED) != 0;
+        COLORREF bg = selected ? ::GetSysColor(COLOR_HIGHLIGHT) : ::GetSysColor(COLOR_WINDOW);
+        COLORREF fg = selected ? ::GetSysColor(COLOR_HIGHLIGHTTEXT) : ::GetSysColor(COLOR_WINDOWTEXT);
+        if (!selected && onGetNickColor) { COLORREF custom; if (onGetNickColor(Bare(text), custom)) fg = custom; }
+        RECT r = dis->rcItem;
+        ::SetBkColor(dis->hDC, bg); ::ExtTextOutW(dis->hDC, 0, 0, ETO_OPAQUE, &r, L"", 0, nullptr);   // plain Win32 fill, avoiding CDC::FillSolidRect
+        ::SetBkMode(dis->hDC, TRANSPARENT); ::SetTextColor(dis->hDC, fg);
+        RECT tr = r; tr.left += 2;
+        ::DrawTextW(dis->hDC, text, text.GetLength(), &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        if (oldFont) ::SelectObject(dis->hDC, oldFont);
+    }
+    void MeasureItem(LPMEASUREITEMSTRUCT mis) override { mis->itemHeight = 15; }   // a plain fixed row height, deliberately not font-measured: WM_MEASUREITEM fires during Create(), before SetFont has run
 protected:
     afx_msg void OnRButtonDown(UINT, CPoint p) {
         BOOL outside = TRUE; int idx = ItemFromPoint(p, outside);
@@ -1297,7 +1360,10 @@ public:
             m_out.SetSel(s, e);
         }
         if (m_in.m_hWnd) m_in.SetFont(&m_font);
-        if (m_chan) { if (m_topic.m_hWnd) m_topic.SetFont(&m_font); if (m_nicks.m_hWnd) m_nicks.SetFont(&m_font); }
+        if (m_chan) {
+            if (m_topic.m_hWnd) m_topic.SetFont(&m_font);
+            if (m_nicks.m_hWnd) { m_nicks.SetFont(&m_font); m_nicks.drawFont = (HFONT)m_font.GetSafeHandle(); m_nicks.Invalidate(); }
+        }
     }
     void ClearNicks() { if (m_chan) m_nicks.ResetContent(); }
     int NickCount() { return m_chan ? m_nicks.GetCount() : 0; }
@@ -1310,6 +1376,13 @@ public:
         return -1;
     }
     bool HasNick(const CString& n) { return FindNick(n) >= 0; }
+    wchar_t NickPrefixChar(const CString& n) {   // '@','+', etc. if the nick currently has that status in this channel, 0 if none/not found -- see Auto-Op/Auto-Voice/Protect
+        int i = FindNick(n); if (i < 0) return 0;
+        CString s; m_nicks.GetText(i, s);
+        return (!s.IsEmpty() && wcschr(L"@+%&~", s[0])) ? s[0] : 0;
+    }
+    void SetNickColorFn(std::function<bool(const CString&, COLORREF&)> fn) { m_nicks.onGetNickColor = fn; }   // see Nick Colors
+    void RefreshNickColors() { if (m_nicks.m_hWnd) m_nicks.Invalidate(); }
     bool DelNick(const CString& n) { int i = FindNick(n); if (i < 0) return false; m_nicks.DeleteString(i); return true; }
     // (background image on the chat log itself was tried and abandoned -- see the notes on CLogEdit)
     // The chat background color (behind the log text, only visible where there's no image), and the editbox / nicklist
@@ -1345,6 +1418,13 @@ protected:
         m_out.SetFont(&m_font); m_in.SetFont(&m_font);
         if (m_chan) {
             m_topic.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, z, this, 3);
+            // LBS_OWNERDRAWFIXED deliberately removed: the owner-draw rendering added for Nick Colors (coloring
+            // individual nicks in this list) produced garbled, unreadable text that two different rendering
+            // approaches both failed to fix, and I can't compile/test here to keep chasing it blind. Reverting to
+            // the plain listbox means the nicklist itself no longer shows per-nick colors, but it's back to the
+            // reliable, working state it was in before -- and Nick Colors still works for coloring messages in the
+            // chat log, which goes through a completely separate, unaffected code path (DrawItem/MeasureItem below
+            // are now simply dead code, never invoked without this style bit).
             m_nicks.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LBS_SORT | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL, z, this, 4);
             m_nicks.onRClick = [this](CString n, CPoint pt) { if (onNickMenu) onNickMenu(this, n, pt); };
             m_topic.SetFont(&m_font); m_nicks.SetFont(&m_font);
@@ -1554,6 +1634,7 @@ struct Net {
     int id = 0;
     CListWnd* listWnd = nullptr;   // this network's open /list results window, if any (one at a time, reused on repeat /list)
     CString network;               // from the server's 005 ISUPPORT "NETWORK=" token, for $network (empty if the server doesn't say)
+    std::vector<CString> notifyPending;   // the nicks most recently ISON-queried on this network, so the 303 reply can be matched back up -- see NotifyTick / the "303" handler
 };
 
 // ---------------- Channel List: /list results, sortable, right-click/double-click to join ----------------
@@ -1666,6 +1747,43 @@ BEGIN_MESSAGE_MAP(CListWnd, CMDIChildWnd)
     ON_NOTIFY(LVN_COLUMNCLICK, 1, OnColumnClick) ON_NOTIFY(NM_DBLCLK, 1, OnDblClick) ON_NOTIFY(NM_RCLICK, 1, OnRClick)
     ON_NOTIFY(NM_CUSTOMDRAW, 1, OnCustomDraw)
 END_MESSAGE_MAP()
+
+// ---------------- Notify list window: shows each entry's current online/offline status -- see /notify, NotifyTick ----------------
+class CNotifyWnd : public CMDIChildWnd {
+public:
+    int m_seq = 0;
+    std::function<void(CNotifyWnd*)> onClosed;
+    void Populate(const std::vector<NotifyEntry>& entries) {
+        m_list.DeleteAllItems();
+        for (size_t i = 0; i < entries.size(); i++) {
+            int idx = m_list.InsertItem((int)i, entries[i].nick);
+            m_list.SetItemText(idx, 1, entries[i].online ? L"Online" : L"Offline");
+            m_list.SetItemText(idx, 2, entries[i].note);
+        }
+        CString t; t.Format(L"Notify List (%d)", (int)entries.size());
+        SetWindowText(t);
+    }
+protected:
+    CListCtrl m_list;
+    afx_msg int OnCreate(LPCREATESTRUCT cs) {
+        if (CMDIChildWnd::OnCreate(cs) == -1) return -1;
+        CRect z(0, 0, 0, 0);
+        m_list.Create(WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_BORDER, z, this, 1);
+        m_list.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        m_list.InsertColumn(0, L"Nickname", LVCFMT_LEFT, 120);
+        m_list.InsertColumn(1, L"Status", LVCFMT_LEFT, 70);
+        m_list.InsertColumn(2, L"Note", LVCFMT_LEFT, 220);
+        return 0;
+    }
+    afx_msg void OnSize(UINT t, int cx, int cy) { CMDIChildWnd::OnSize(t, cx, cy); if (m_list.m_hWnd) m_list.MoveWindow(0, 0, cx, cy); }
+    afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClosed) onClosed(this); }
+    afx_msg void OnInitMenuPopup(CMenu*, UINT, BOOL) { }   // see CListWnd's identical override for why
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CNotifyWnd, CMDIChildWnd)
+    ON_WM_CREATE() ON_WM_SIZE() ON_WM_DESTROY() ON_WM_INITMENUPOPUP()
+END_MESSAGE_MAP()
+
 
 // ---------------- Variables: numbers, single-operation math, $calc, wildcard matching ----------------
 static bool ScanNum(const wchar_t*& p, double& v) {   // digits[.digits] only: no sign, exponent, hex, inf or nan
@@ -2597,6 +2715,464 @@ public:
 
 // ---------------- Online Timer dialog: current-connection and cumulative connect time (see CMainFrame's OT* members) ----------------
 enum { IDC_OT_ENABLE = 641, IDC_OT_CURTIME, IDC_OT_CURDATE, IDC_OT_CURRESET, IDC_OT_TOTTIME, IDC_OT_TOTDATE, IDC_OT_TOTRESET, IDC_OT_SHOWTOTAL };
+// ---------------- Address Book dialog (File > Address Book..., Alt+B, /abook) ----------------
+// Users and Notify tabs are fully functional. Control/Colors/Highlight are real tab buttons that switch to a
+// placeholder panel for now -- those (auto-op/voice, ignore, protect, nick colors, highlight matching) are separate,
+// large features in their own right and are being built next.
+enum {
+    IDC_AB_TABUSERS = 721, IDC_AB_TABWHOIS, IDC_AB_TABNOTIFY, IDC_AB_TABCONTROL, IDC_AB_TABCOLORS, IDC_AB_TABHIGHLIGHT,
+    IDC_AB_NICK, IDC_AB_NAME, IDC_AB_EMAIL, IDC_AB_WEBSITE, IDC_AB_ADDRESS, IDC_AB_NOTES, IDC_AB_PICTURE,
+    IDC_AB_ADD, IDC_AB_DELETE, IDC_AB_EMAILBTN, IDC_AB_VISIT, IDC_AB_CHAT, IDC_AB_WHOIS, IDC_AB_NOTIFY,
+    IDC_AB_NF_LIST, IDC_AB_NF_NICK, IDC_AB_NF_NOTE, IDC_AB_NF_SOUNDJOIN, IDC_AB_NF_BROWSEJOIN, IDC_AB_NF_SOUNDPART,
+    IDC_AB_NF_BROWSEPART, IDC_AB_NF_WHOIS, IDC_AB_NF_ADD, IDC_AB_NF_REMOVE, IDC_AB_NF_POPUP, IDC_AB_NF_ONLYWIN,
+    IDC_AB_NF_ACTIVEWIN, IDC_AB_NF_ADDRTIME, IDC_AB_NF_SHOWWIN,
+    IDC_AB_HL_ENABLE, IDC_AB_HL_LIST, IDC_AB_HL_WORDS, IDC_AB_HL_TARGETS, IDC_AB_HL_MATCHMSG, IDC_AB_HL_MATCHNICK,
+    IDC_AB_HL_MATCHBOTH, IDC_AB_HL_COLOR, IDC_AB_HL_SOUND, IDC_AB_HL_BROWSESOUND, IDC_AB_HL_FLASH, IDC_AB_HL_TIP,
+    IDC_AB_HL_MESSAGE, IDC_AB_HL_ADD, IDC_AB_HL_REMOVE,
+    IDC_AB_CT_LISTSEL, IDC_AB_CT_LIST, IDC_AB_CT_ADDTEXT, IDC_AB_CT_ADD, IDC_AB_CT_REMOVE, IDC_AB_CT_ENABLE,
+    IDC_AB_CT_RANDOMDELAY, IDC_AB_CT_HINT,
+    IDC_AB_CO_LIST, IDC_AB_CO_ADDTEXT, IDC_AB_CO_ADD, IDC_AB_CO_REMOVE, IDC_AB_CO_ENABLE, IDC_AB_CO_HINT,
+    IDC_AB_WH_TEXT, IDC_AB_WH_LOOKUP, IDC_AB_WH_LBL,
+    // static labels, each needing its own id -- GetDlgItem(0xFFFF) can only ever resolve to one control, so sharing
+    // that id across many labels meant only one of them was ever actually being hidden/shown by SetTab
+    IDC_AB_LBL_NICK, IDC_AB_LBL_NAME, IDC_AB_LBL_EMAIL, IDC_AB_LBL_WEBSITE, IDC_AB_LBL_ADDRESS, IDC_AB_LBL_NOTES,
+    IDC_AB_NF_LBL_NICK, IDC_AB_NF_LBL_NOTE, IDC_AB_NF_LBL_SJOIN, IDC_AB_NF_LBL_SPART,
+    IDC_AB_HL_LBL_WORDS, IDC_AB_HL_LBL_TARGETS, IDC_AB_HL_LBL_MATCHON, IDC_AB_HL_LBL_COLOR, IDC_AB_HL_LBL_SOUND, IDC_AB_HL_LBL_MESSAGE,
+    IDC_AB_CT_LBL_ADD, IDC_AB_CO_LBL_ADD,
+    IDC_AB_PLACEHOLDER, IDC_AB_HELP
+};
+class CAddressBookDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    static const int kUserPanelIds[20];
+    static const int kNotifyPanelIds[19];
+    static const int kHighlightPanelIds[21];
+    static const int kControlPanelIds[9];
+    static const int kColorsPanelIds[7];
+    static const int kWhoisPanelIds[3];
+public:
+    std::vector<AddressEntry>* book;      // owned by CMainFrame; edited in place, saved by the caller after DoModal
+    std::vector<NotifyEntry>* notifyBook; // same deal, for the Notify tab
+    std::vector<HighlightEntry>* highlightBook;   // same, for the Highlight tab
+    std::vector<AutoActionEntry>* aopList; std::vector<AutoActionEntry>* avoiceList; std::vector<AutoActionEntry>* protectList;
+    std::vector<IgnoreEntry>* ignoreList;
+    std::vector<CNickEntry>* cnickList;
+    CString initialNick;
+    std::function<void(const CString&)> onWhois, onChat, onNotify;   // wired to real app actions by the caller
+    std::function<void()> onShowNotifyWindow;
+    std::function<void(int, const CString&)> onControlCmd;   // listSel 0=aop 1=avoice 2=protect 3=ignore; feeds the text straight into the matching /command's own parser
+    std::function<void(const CString&)> onCnickCmd;          // feeds the text straight into /cnick's own parser
+    std::function<void(const CString&)> onStartWhoisLookup;  // nick to look up; replies arrive asynchronously, polled via onGetWhoisCapture
+    std::function<CString()> onGetWhoisCapture;
+    int curIndex = -1;        // index into *book of the entry currently shown, or -1 for a new/blank one
+    int notifyIndex = -1;     // same, for *notifyBook
+    int highlightIndex = -1;  // same, for *highlightBook
+    int initialTab = IDC_AB_TABUSERS;   // which tab /abook's -wnclh switches should open to
+    int curTab = IDC_AB_TABUSERS;       // tracks which tab is currently showing, so the poll timer only refreshes Whois when it's actually visible
+    bool popupOnConnect = false, onlyInWindow = false, inActiveWindow = false, showAddrTime = false;   // notify display options, read back by the caller on OK
+    bool highlightOn = true, aopOn = true, avoiceOn = true, protectOn = true, ignoreOn = true, randomDelay = true, cnickOn = true;   // read back by the caller on OK
+    CAddressBookDlg(std::vector<AddressEntry>* bk, std::vector<NotifyEntry>* nbk, std::vector<HighlightEntry>* hbk,
+        std::vector<AutoActionEntry>* aop, std::vector<AutoActionEntry>* avo, std::vector<AutoActionEntry>* prot, std::vector<IgnoreEntry>* ign, std::vector<CNickEntry>* cnk,
+        const CString& startNick, CWnd* parent)
+        : book(bk), notifyBook(nbk), highlightBook(hbk), aopList(aop), avoiceList(avo), protectList(prot), ignoreList(ign), cnickList(cnk), initialNick(startNick) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(360); t.push_back(330);
+        t.push_back(0); t.push_back(0); S(L"mIRC Address Book"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 6, 6, 50, 14, IDC_AB_TABUSERS, 0x0080, L"Users");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 58, 6, 50, 14, IDC_AB_TABWHOIS, 0x0080, L"Whois");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 6, 50, 14, IDC_AB_TABNOTIFY, 0x0080, L"Notify");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 162, 6, 50, 14, IDC_AB_TABCONTROL, 0x0080, L"Control");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 214, 6, 50, 14, IDC_AB_TABCOLORS, 0x0080, L"Colors");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 266, 6, 58, 14, IDC_AB_TABHIGHLIGHT, 0x0080, L"Highlight");
+        Item(WS_BORDER, 4, 24, 352, 262, 0xFFFF, 0x0082, L"");
+        // Users panel
+        Item(SS_LEFT, 14, 36, 55, 9, IDC_AB_LBL_NICK, 0x0082, L"Nickname:");
+        Item(CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_TABSTOP | WS_VSCROLL, 72, 34, 160, 120, IDC_AB_NICK, 0x0085, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 34, 100, 14, IDC_AB_ADD, 0x0080, L"Add");
+        Item(SS_LEFT, 14, 54, 55, 9, IDC_AB_LBL_NAME, 0x0082, L"Name:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 72, 52, 160, 12, IDC_AB_NAME, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 52, 100, 14, IDC_AB_DELETE, 0x0080, L"Delete");
+        Item(SS_LEFT, 14, 70, 55, 9, IDC_AB_LBL_EMAIL, 0x0082, L"Email:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 72, 68, 160, 12, IDC_AB_EMAIL, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 68, 100, 14, IDC_AB_EMAILBTN, 0x0080, L"Email");
+        Item(SS_LEFT, 14, 86, 55, 9, IDC_AB_LBL_WEBSITE, 0x0082, L"Website:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 72, 84, 160, 12, IDC_AB_WEBSITE, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 84, 100, 14, IDC_AB_VISIT, 0x0080, L"Visit");
+        Item(SS_LEFT, 14, 102, 55, 9, IDC_AB_LBL_ADDRESS, 0x0082, L"Address:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 72, 100, 160, 12, IDC_AB_ADDRESS, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 100, 100, 14, IDC_AB_CHAT, 0x0080, L"Chat");
+        Item(SS_LEFT, 14, 118, 55, 9, IDC_AB_LBL_NOTES, 0x0082, L"Notes:");
+        Item(WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, 72, 118, 160, 120, IDC_AB_NOTES, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 118, 100, 14, IDC_AB_WHOIS, 0x0080, L"Whois");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 240, 136, 100, 14, IDC_AB_NOTIFY, 0x0080, L"Notify");
+        Item(SS_CENTER | SS_NOTIFY | WS_BORDER, 240, 160, 100, 70, IDC_AB_PICTURE, 0x0082, L"Click to select a picture");
+        // Notify panel
+        Item(WS_BORDER | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL, 14, 36, 180, 190, IDC_AB_NF_LIST, 0x0083, L"");
+        Item(SS_LEFT, 200, 36, 100, 9, IDC_AB_NF_LBL_NICK, 0x0082, L"Nickname:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 46, 150, 12, IDC_AB_NF_NICK, 0x0081, L"");
+        Item(SS_LEFT, 200, 62, 100, 9, IDC_AB_NF_LBL_NOTE, 0x0082, L"Note:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 72, 150, 12, IDC_AB_NF_NOTE, 0x0081, L"");
+        Item(SS_LEFT, 200, 88, 120, 9, IDC_AB_NF_LBL_SJOIN, 0x0082, L"Sound on join:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 98, 114, 12, IDC_AB_NF_SOUNDJOIN, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 316, 98, 34, 12, IDC_AB_NF_BROWSEJOIN, 0x0080, L"...");
+        Item(SS_LEFT, 200, 114, 120, 9, IDC_AB_NF_LBL_SPART, 0x0082, L"Sound on leave:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 124, 114, 12, IDC_AB_NF_SOUNDPART, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 316, 124, 34, 12, IDC_AB_NF_BROWSEPART, 0x0080, L"...");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 142, 150, 10, IDC_AB_NF_WHOIS, 0x0080, L"Perform /whois");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 200, 158, 72, 14, IDC_AB_NF_ADD, 0x0080, L"Add");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 278, 158, 72, 14, IDC_AB_NF_REMOVE, 0x0080, L"Remove");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 232, 160, 10, IDC_AB_NF_POPUP, 0x0080, L"Pop up window on connect");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 244, 160, 10, IDC_AB_NF_ONLYWIN, 0x0080, L"Show only in notify window");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 180, 232, 160, 10, IDC_AB_NF_ACTIVEWIN, 0x0080, L"Show in active window");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 180, 244, 160, 10, IDC_AB_NF_ADDRTIME, 0x0080, L"Display address and time");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 14, 258, 150, 16, IDC_AB_NF_SHOWWIN, 0x0080, L"Show Notify Window");
+        // Highlight panel
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 14, 36, 160, 10, IDC_AB_HL_ENABLE, 0x0080, L"Enable Highlighting");
+        Item(WS_BORDER | WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL, 14, 50, 180, 176, IDC_AB_HL_LIST, 0x0083, L"");
+        Item(SS_LEFT, 200, 36, 150, 9, IDC_AB_HL_LBL_WORDS, 0x0082, L"Words (comma separated):");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 46, 150, 12, IDC_AB_HL_WORDS, 0x0081, L"");
+        Item(SS_LEFT, 200, 62, 150, 9, IDC_AB_HL_LBL_TARGETS, 0x0082, L"From channels/nicks:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 72, 150, 12, IDC_AB_HL_TARGETS, 0x0081, L"");
+        Item(SS_LEFT, 200, 88, 100, 9, IDC_AB_HL_LBL_MATCHON, 0x0082, L"Match on:");
+        Item(BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 200, 98, 70, 10, IDC_AB_HL_MATCHMSG, 0x0080, L"Message");
+        Item(BS_AUTORADIOBUTTON | WS_TABSTOP, 272, 98, 78, 10, IDC_AB_HL_MATCHNICK, 0x0080, L"Nickname");
+        Item(BS_AUTORADIOBUTTON | WS_TABSTOP, 200, 110, 70, 10, IDC_AB_HL_MATCHBOTH, 0x0080, L"Both");
+        Item(SS_LEFT, 200, 124, 40, 9, IDC_AB_HL_LBL_COLOR, 0x0082, L"Color:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 244, 122, 40, 12, IDC_AB_HL_COLOR, 0x0081, L"");
+        Item(SS_LEFT, 200, 140, 100, 9, IDC_AB_HL_LBL_SOUND, 0x0082, L"Play sound:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 150, 114, 12, IDC_AB_HL_SOUND, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 316, 150, 34, 12, IDC_AB_HL_BROWSESOUND, 0x0080, L"...");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 166, 150, 10, IDC_AB_HL_FLASH, 0x0080, L"Flash message");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 178, 150, 10, IDC_AB_HL_TIP, 0x0080, L"Tip message");
+        Item(SS_LEFT, 200, 192, 100, 9, IDC_AB_HL_LBL_MESSAGE, 0x0082, L"Message:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 202, 150, 12, IDC_AB_HL_MESSAGE, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 200, 218, 72, 14, IDC_AB_HL_ADD, 0x0080, L"Add");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 278, 218, 72, 14, IDC_AB_HL_REMOVE, 0x0080, L"Remove");
+        // Control panel (Auto-Op / Auto-Voice / Protect / Ignore, picked via the combo)
+        Item(CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 14, 36, 130, 100, IDC_AB_CT_LISTSEL, 0x0085, L"");
+        Item(WS_BORDER | WS_TABSTOP | WS_VSCROLL, 14, 52, 180, 170, IDC_AB_CT_LIST, 0x0083, L"");
+        Item(SS_LEFT, 200, 36, 150, 18, IDC_AB_CT_LBL_ADD, 0x0082, L"Add (same syntax as the matching /command):");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 56, 150, 12, IDC_AB_CT_ADDTEXT, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 200, 72, 72, 14, IDC_AB_CT_ADD, 0x0080, L"Add");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 278, 72, 72, 14, IDC_AB_CT_REMOVE, 0x0080, L"Remove");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 92, 150, 10, IDC_AB_CT_ENABLE, 0x0080, L"This list is enabled");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 104, 150, 20, IDC_AB_CT_RANDOMDELAY, 0x0080, L"Random 1-7 sec delay for Auto-Op/Voice");
+        Item(SS_LEFT, 200, 128, 150, 94, IDC_AB_CT_HINT, 0x0082, L"Examples:\nnick #chan1,#chan2\nnick!user@host\n\nFor Ignore: -pc nick (private+channel), -r nick (remove), on/off");
+        // Colors panel (Nick Colors)
+        Item(WS_BORDER | WS_TABSTOP | WS_VSCROLL, 14, 36, 180, 186, IDC_AB_CO_LIST, 0x0083, L"");
+        Item(SS_LEFT, 200, 36, 150, 18, IDC_AB_CO_LBL_ADD, 0x0082, L"Add (same syntax as /cnick):");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 200, 56, 150, 12, IDC_AB_CO_ADDTEXT, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 200, 72, 72, 14, IDC_AB_CO_ADD, 0x0080, L"Add");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 278, 72, 72, 14, IDC_AB_CO_REMOVE, 0x0080, L"Remove");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 92, 150, 10, IDC_AB_CO_ENABLE, 0x0080, L"Nick colors enabled");
+        Item(SS_LEFT, 200, 110, 150, 112, IDC_AB_CO_HINT, 0x0082, L"Examples:\nnick 4 (color 4)\nnick * (auto-color)\nnick 4 @%+ (only when opped/voiced)\nnick -r (remove)");
+        // Whois panel (looks up the Users tab's current nickname)
+        Item(SS_LEFT, 14, 36, 300, 9, IDC_AB_WH_LBL, 0x0082, L"Shows the /whois reply for the Users tab's nickname.");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 14, 50, 90, 14, IDC_AB_WH_LOOKUP, 0x0080, L"Lookup");
+        Item(WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 14, 70, 330, 160, IDC_AB_WH_TEXT, 0x0081, L"");
+        // placeholder panel (shown over the same area for not-yet-implemented tabs)
+        Item(SS_CENTER, 24, 120, 310, 40, IDC_AB_PLACEHOLDER, 0x0082, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 120, 300, 60, 16, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 186, 300, 60, 16, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 252, 300, 60, 16, IDC_AB_HELP, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    // ---- Users tab ----
+    void RefreshNickList() {
+        CComboBox* cb = (CComboBox*)GetDlgItem(IDC_AB_NICK);
+        CString cur; cb->GetWindowText(cur);
+        cb->ResetContent();
+        for (auto& e : *book) cb->AddString(e.nick);
+        cb->SetWindowText(cur);
+    }
+    void ShowEntry(int idx) {
+        curIndex = idx;
+        AddressEntry blank, &e = (idx >= 0 && idx < (int)book->size()) ? (*book)[idx] : blank;
+        SetDlgItemText(IDC_AB_NICK, e.nick); SetDlgItemText(IDC_AB_NAME, e.name); SetDlgItemText(IDC_AB_EMAIL, e.email);
+        SetDlgItemText(IDC_AB_WEBSITE, e.website); SetDlgItemText(IDC_AB_ADDRESS, e.address); SetDlgItemText(IDC_AB_NOTES, e.notes);
+        SetDlgItemText(IDC_AB_PICTURE, e.picture.IsEmpty() ? CString(L"Click to select a picture") : e.picture);
+    }
+    // ---- Notify tab ----
+    void RefreshNotifyList() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_NF_LIST);
+        int sel = lb->GetCurSel();
+        lb->ResetContent();
+        for (auto& e : *notifyBook) { CString s; s.Format(L"%s - %s%s", (LPCWSTR)e.nick, e.online ? L"Online" : L"Offline", e.note.IsEmpty() ? L"" : (LPCWSTR)(CString(L" (") + e.note + L")")); lb->AddString(s); }
+        if (sel >= 0 && sel < lb->GetCount()) lb->SetCurSel(sel);
+    }
+    void ShowNotifyEntry(int idx) {
+        notifyIndex = idx;
+        NotifyEntry blank, &e = (idx >= 0 && idx < (int)notifyBook->size()) ? (*notifyBook)[idx] : blank;
+        SetDlgItemText(IDC_AB_NF_NICK, e.nick); SetDlgItemText(IDC_AB_NF_NOTE, e.note);
+        SetDlgItemText(IDC_AB_NF_SOUNDJOIN, e.soundJoin); SetDlgItemText(IDC_AB_NF_SOUNDPART, e.soundPart);
+        CheckDlgButton(IDC_AB_NF_WHOIS, e.doWhois);
+    }
+    // ---- Highlight tab ----
+    void RefreshHighlightList() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_HL_LIST);
+        int sel = lb->GetCurSel();
+        lb->ResetContent();
+        for (auto& e : *highlightBook) { 
+            CString s; s.Format(L"%s%s", (LPCWSTR)e.words, e.targets.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.targets)); lb->AddString(s);
+        }
+        if (sel >= 0 && sel < lb->GetCount()) lb->SetCurSel(sel);
+    }
+    void ShowHighlightEntry(int idx) {
+        highlightIndex = idx;
+        HighlightEntry blank, &e = (idx >= 0 && idx < (int)highlightBook->size()) ? (*highlightBook)[idx] : blank;
+        SetDlgItemText(IDC_AB_HL_WORDS, e.words); SetDlgItemText(IDC_AB_HL_TARGETS, e.targets);
+        CheckRadioButton(IDC_AB_HL_MATCHMSG, IDC_AB_HL_MATCHBOTH, IDC_AB_HL_MATCHMSG + e.matchOn);
+        SetDlgItemText(IDC_AB_HL_COLOR, e.colorStr); SetDlgItemText(IDC_AB_HL_SOUND, e.sound);
+        CheckDlgButton(IDC_AB_HL_FLASH, e.flash); CheckDlgButton(IDC_AB_HL_TIP, e.tip);
+        SetDlgItemText(IDC_AB_HL_MESSAGE, e.message);
+    }
+    // ---- Control tab (Auto-Op / Auto-Voice / Protect / Ignore) ----
+    void RefreshControlList() {
+        CComboBox* combo = (CComboBox*)GetDlgItem(IDC_AB_CT_LISTSEL);
+        int sel = combo->GetCurSel(); if (sel < 0) sel = 0;
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_CT_LIST);
+        lb->ResetContent();
+        if (sel == 3) { for (auto& e : *ignoreList) { CString s; s.Format(L"%s%s", e.excluded ? L"(excl) " : L"", (LPCWSTR)e.mask); lb->AddString(s); } }
+        else {
+            std::vector<AutoActionEntry>* list = sel == 0 ? aopList : sel == 1 ? avoiceList : protectList;
+            for (auto& e : *list) { CString s; s.Format(L"%s%s", (LPCWSTR)e.mask, e.channels.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.channels)); lb->AddString(s); }
+        }
+        bool enabled = sel == 0 ? aopOn : sel == 1 ? avoiceOn : sel == 2 ? protectOn : ignoreOn;
+        CheckDlgButton(IDC_AB_CT_ENABLE, enabled);
+    }
+    // ---- Whois tab ----
+    void RefreshWhoisText() { if (onGetWhoisCapture) SetDlgItemText(IDC_AB_WH_TEXT, onGetWhoisCapture()); }
+    // ---- Colors tab (Nick Colors) ----
+    void RefreshColorsList() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_CO_LIST);
+        lb->ResetContent();
+        for (auto& e : *cnickList) { CString s; s.Format(L"%s - %s", (LPCWSTR)e.nick, e.autoColor ? CString(L"auto") : e.colorStr); lb->AddString(s); }
+        CheckDlgButton(IDC_AB_CO_ENABLE, cnickOn);
+    }
+    void SetTab(int tabId) {
+        curTab = tabId;
+        bool users = tabId == IDC_AB_TABUSERS, notify = tabId == IDC_AB_TABNOTIFY, highlight = tabId == IDC_AB_TABHIGHLIGHT;
+        bool control = tabId == IDC_AB_TABCONTROL, colors = tabId == IDC_AB_TABCOLORS, whois = tabId == IDC_AB_TABWHOIS;
+        for (int id : kUserPanelIds) GetDlgItem(id)->ShowWindow(users ? SW_SHOW : SW_HIDE);
+        for (int id : kNotifyPanelIds) GetDlgItem(id)->ShowWindow(notify ? SW_SHOW : SW_HIDE);
+        for (int id : kHighlightPanelIds) GetDlgItem(id)->ShowWindow(highlight ? SW_SHOW : SW_HIDE);
+        for (int id : kControlPanelIds) GetDlgItem(id)->ShowWindow(control ? SW_SHOW : SW_HIDE);
+        for (int id : kColorsPanelIds) GetDlgItem(id)->ShowWindow(colors ? SW_SHOW : SW_HIDE);
+        for (int id : kWhoisPanelIds) GetDlgItem(id)->ShowWindow(whois ? SW_SHOW : SW_HIDE);
+        bool anyReal = users || notify || highlight || control || colors || whois;
+        GetDlgItem(IDC_AB_PLACEHOLDER)->ShowWindow(anyReal ? SW_HIDE : SW_SHOW);
+        if (whois) RefreshWhoisText();
+        if (control) RefreshControlList();
+        if (colors) RefreshColorsList();
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        RefreshNickList();
+        AddressEntry* found = initialNick.IsEmpty() ? nullptr : [&]() -> AddressEntry* { for (size_t i = 0; i < book->size(); i++) if ((*book)[i].nick.CompareNoCase(initialNick) == 0) { curIndex = (int)i; return &(*book)[i]; } return nullptr; }();
+        ShowEntry(found ? curIndex : -1);
+        if (!found && !initialNick.IsEmpty()) SetDlgItemText(IDC_AB_NICK, initialNick);
+        RefreshNotifyList(); ShowNotifyEntry(-1);
+        CheckDlgButton(IDC_AB_NF_POPUP, popupOnConnect); CheckDlgButton(IDC_AB_NF_ONLYWIN, onlyInWindow);
+        CheckDlgButton(IDC_AB_NF_ACTIVEWIN, inActiveWindow); CheckDlgButton(IDC_AB_NF_ADDRTIME, showAddrTime);
+        RefreshHighlightList(); ShowHighlightEntry(-1); CheckDlgButton(IDC_AB_HL_ENABLE, highlightOn);
+        CComboBox* ctCombo = (CComboBox*)GetDlgItem(IDC_AB_CT_LISTSEL);
+        ctCombo->AddString(L"Auto-Op"); ctCombo->AddString(L"Auto-Voice"); ctCombo->AddString(L"Protect"); ctCombo->AddString(L"Ignore");
+        ctCombo->SetCurSel(0);
+        CheckDlgButton(IDC_AB_CT_RANDOMDELAY, randomDelay);
+        RefreshControlList(); RefreshColorsList();
+        SetTab(initialTab);
+        SetTimer(1, 500, nullptr);   // polls the Whois capture buffer -- replies arrive asynchronously while this modal dialog is open
+        return TRUE;
+    }
+    afx_msg void OnTabUsers() { SetTab(IDC_AB_TABUSERS); }
+    afx_msg void OnTabWhois() { SetTab(IDC_AB_TABWHOIS); }
+    afx_msg void OnTabNotify() { SetTab(IDC_AB_TABNOTIFY); }
+    afx_msg void OnTabControl() { SetTab(IDC_AB_TABCONTROL); }
+    afx_msg void OnTabColors() { SetTab(IDC_AB_TABCOLORS); }
+    afx_msg void OnTabHighlight() { SetTab(IDC_AB_TABHIGHLIGHT); }
+    afx_msg void OnAdd() {
+        CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim();
+        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname first.", MB_ICONWARNING); return; }
+        AddressEntry e; e.nick = nick;
+        GetDlgItemText(IDC_AB_NAME, e.name); GetDlgItemText(IDC_AB_EMAIL, e.email); GetDlgItemText(IDC_AB_WEBSITE, e.website);
+        GetDlgItemText(IDC_AB_ADDRESS, e.address); GetDlgItemText(IDC_AB_NOTES, e.notes);
+        CString pic; GetDlgItemText(IDC_AB_PICTURE, pic); e.picture = pic == L"Click to select a picture" ? CString() : pic;
+        bool replaced = false;
+        for (size_t i = 0; i < book->size(); i++) if ((*book)[i].nick.CompareNoCase(nick) == 0) { (*book)[i] = e; curIndex = (int)i; replaced = true; break; }
+        if (!replaced) { book->push_back(e); curIndex = (int)book->size() - 1; }
+        RefreshNickList();
+    }
+    afx_msg void OnDelete() {
+        CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim();
+        for (size_t i = 0; i < book->size(); i++) if ((*book)[i].nick.CompareNoCase(nick) == 0) { book->erase(book->begin() + i); curIndex = -1; break; }
+        RefreshNickList(); ShowEntry(-1);
+    }
+    afx_msg void OnEmailBtn() {
+        CString email; GetDlgItemText(IDC_AB_EMAIL, email); email.Trim();
+        if (email.IsEmpty()) { AfxMessageBox(L"No email address on file for this entry.", MB_ICONINFORMATION); return; }
+        ::ShellExecuteW(nullptr, L"open", L"mailto:" + email, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    afx_msg void OnVisit() {
+        CString site; GetDlgItemText(IDC_AB_WEBSITE, site); site.Trim();
+        if (site.IsEmpty()) { AfxMessageBox(L"No website on file for this entry.", MB_ICONINFORMATION); return; }
+        if (site.Find(L"://") < 0) site = L"https://" + site;
+        ::ShellExecuteW(nullptr, L"open", site, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    afx_msg void OnChat() { AfxMessageBox(L"DCC Chat isn't implemented in this client yet -- this button is a placeholder for now.", MB_ICONINFORMATION); }
+    afx_msg void OnWhoisBtn() { CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim(); if (!nick.IsEmpty() && onWhois) onWhois(nick); }
+    afx_msg void OnNotifyBtn() {   // adds the current Users-tab nickname to the real notify list now
+        CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim();
+        if (nick.IsEmpty()) return;
+        bool exists = false; for (auto& e : *notifyBook) if (e.nick.CompareNoCase(nick) == 0) { exists = true; break; }
+        if (!exists) { NotifyEntry e; e.nick = nick; notifyBook->push_back(e); RefreshNotifyList(); }
+        if (onNotify) onNotify(nick);
+        SetTab(IDC_AB_TABNOTIFY);
+    }
+    afx_msg void OnPictureClick() {
+        CFileDialog fd(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"Images (*.bmp;*.jpg;*.jpeg;*.png;*.gif)|*.bmp;*.jpg;*.jpeg;*.png;*.gif|All Files (*.*)|*.*||", this);
+        if (fd.DoModal() == IDOK) SetDlgItemText(IDC_AB_PICTURE, fd.GetPathName());
+    }
+    afx_msg void OnNickChange() {
+        CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim();
+        for (size_t i = 0; i < book->size(); i++) if ((*book)[i].nick.CompareNoCase(nick) == 0) { ShowEntry((int)i); return; }
+    }
+    afx_msg void OnNotifyListSel() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_NF_LIST);
+        int sel = lb->GetCurSel();
+        if (sel >= 0 && sel < (int)notifyBook->size()) ShowNotifyEntry(sel);
+    }
+    afx_msg void OnNotifyAdd() {
+        CString nick; GetDlgItemText(IDC_AB_NF_NICK, nick); nick.Trim();
+        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname first.", MB_ICONWARNING); return; }
+        NotifyEntry e; e.nick = nick;
+        GetDlgItemText(IDC_AB_NF_NOTE, e.note); GetDlgItemText(IDC_AB_NF_SOUNDJOIN, e.soundJoin); GetDlgItemText(IDC_AB_NF_SOUNDPART, e.soundPart);
+        e.doWhois = IsDlgButtonChecked(IDC_AB_NF_WHOIS) != 0;
+        bool replaced = false;
+        for (size_t i = 0; i < notifyBook->size(); i++) if ((*notifyBook)[i].nick.CompareNoCase(nick) == 0) { e.online = (*notifyBook)[i].online; (*notifyBook)[i] = e; replaced = true; break; }
+        if (!replaced) notifyBook->push_back(e);
+        RefreshNotifyList();
+    }
+    afx_msg void OnNotifyRemove() {
+        CString nick; GetDlgItemText(IDC_AB_NF_NICK, nick); nick.Trim();
+        for (size_t i = 0; i < notifyBook->size(); i++) if ((*notifyBook)[i].nick.CompareNoCase(nick) == 0) { notifyBook->erase(notifyBook->begin() + i); break; }
+        RefreshNotifyList(); ShowNotifyEntry(-1);
+    }
+    afx_msg void OnBrowseJoin() { CString f = BrowseSound(); if (!f.IsEmpty()) SetDlgItemText(IDC_AB_NF_SOUNDJOIN, f); }
+    afx_msg void OnBrowsePart() { CString f = BrowseSound(); if (!f.IsEmpty()) SetDlgItemText(IDC_AB_NF_SOUNDPART, f); }
+    CString BrowseSound() {
+        CFileDialog fd(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"Sounds (*.wav;*.mid;*.midi;*.mp3)|*.wav;*.mid;*.midi;*.mp3|All Files (*.*)|*.*||", this);
+        return fd.DoModal() == IDOK ? fd.GetPathName() : CString();
+    }
+    afx_msg void OnShowNotifyWindow() { if (onShowNotifyWindow) onShowNotifyWindow(); }
+    afx_msg void OnTimer(UINT_PTR) { if (curTab == IDC_AB_TABWHOIS) RefreshWhoisText(); }
+    afx_msg void OnWhoisLookup() {
+        CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim();
+        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname on the Users tab first.", MB_ICONWARNING); return; }
+        SetDlgItemText(IDC_AB_WH_TEXT, L"Looking up " + nick + L"...\r\n");
+        if (onStartWhoisLookup) onStartWhoisLookup(nick);
+    }
+    afx_msg void OnHighlightListSel() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_HL_LIST);
+        int sel = lb->GetCurSel();
+        if (sel >= 0 && sel < (int)highlightBook->size()) ShowHighlightEntry(sel);
+    }
+    afx_msg void OnHighlightAdd() {
+        CString words; GetDlgItemText(IDC_AB_HL_WORDS, words); words.Trim();
+        if (words.IsEmpty()) { AfxMessageBox(L"Enter at least one word first.", MB_ICONWARNING); return; }
+        HighlightEntry e; e.words = words;
+        GetDlgItemText(IDC_AB_HL_TARGETS, e.targets); GetDlgItemText(IDC_AB_HL_COLOR, e.colorStr); GetDlgItemText(IDC_AB_HL_SOUND, e.sound);
+        GetDlgItemText(IDC_AB_HL_MESSAGE, e.message);
+        e.matchOn = IsDlgButtonChecked(IDC_AB_HL_MATCHNICK) ? 1 : IsDlgButtonChecked(IDC_AB_HL_MATCHBOTH) ? 2 : 0;
+        e.flash = IsDlgButtonChecked(IDC_AB_HL_FLASH) != 0; e.tip = IsDlgButtonChecked(IDC_AB_HL_TIP) != 0;
+        if (highlightIndex >= 0 && highlightIndex < (int)highlightBook->size()) (*highlightBook)[highlightIndex] = e; else highlightBook->push_back(e);
+        RefreshHighlightList();
+    }
+    afx_msg void OnHighlightRemove() {
+        if (highlightIndex >= 0 && highlightIndex < (int)highlightBook->size()) { highlightBook->erase(highlightBook->begin() + highlightIndex); highlightIndex = -1; }
+        RefreshHighlightList(); ShowHighlightEntry(-1);
+    }
+    afx_msg void OnBrowseHighlightSound() { CString f = BrowseSound(); if (!f.IsEmpty()) SetDlgItemText(IDC_AB_HL_SOUND, f); }
+    afx_msg void OnControlListSelChange() { RefreshControlList(); }
+    afx_msg void OnControlEnableToggle() {   // the checkbox is shared across all 4 lists via the combo, so it must apply immediately, not just at OK time, or switching lists would lose the others' state
+        int sel = ((CComboBox*)GetDlgItem(IDC_AB_CT_LISTSEL))->GetCurSel(); if (sel < 0) sel = 0;
+        bool checked = IsDlgButtonChecked(IDC_AB_CT_ENABLE) != 0;
+        if (sel == 0) aopOn = checked; else if (sel == 1) avoiceOn = checked; else if (sel == 2) protectOn = checked; else ignoreOn = checked;
+    }
+    afx_msg void OnControlAdd() {
+        CString text; GetDlgItemText(IDC_AB_CT_ADDTEXT, text); text.Trim(); if (text.IsEmpty()) return;
+        int sel = ((CComboBox*)GetDlgItem(IDC_AB_CT_LISTSEL))->GetCurSel(); if (sel < 0) sel = 0;
+        if (onControlCmd) onControlCmd(sel, text);
+        SetDlgItemText(IDC_AB_CT_ADDTEXT, L""); RefreshControlList();
+    }
+    afx_msg void OnControlRemove() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_CT_LIST);
+        int idx = lb->GetCurSel(); if (idx < 0) return;
+        int sel = ((CComboBox*)GetDlgItem(IDC_AB_CT_LISTSEL))->GetCurSel(); if (sel < 0) sel = 0;
+        CString mask = sel == 3 ? (*ignoreList)[idx].mask : (sel == 0 ? (*aopList)[idx].mask : sel == 1 ? (*avoiceList)[idx].mask : (*protectList)[idx].mask);
+        if (onControlCmd) onControlCmd(sel, L"-r " + mask);
+        RefreshControlList();
+    }
+    afx_msg void OnColorsAdd() {
+        CString text; GetDlgItemText(IDC_AB_CO_ADDTEXT, text); text.Trim(); if (text.IsEmpty()) return;
+        if (onCnickCmd) onCnickCmd(text);
+        SetDlgItemText(IDC_AB_CO_ADDTEXT, L""); RefreshColorsList();
+    }
+    afx_msg void OnColorsRemove() {
+        CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_CO_LIST);
+        int idx = lb->GetCurSel(); if (idx < 0 || idx >= (int)cnickList->size()) return;
+        if (onCnickCmd) onCnickCmd(L"-r " + (*cnickList)[idx].nick);
+        RefreshColorsList();
+    }
+    afx_msg void OnHelpBtn() {
+        AfxMessageBox(L"Users: basic contact info per nickname; Email/Visit launch your mail client or browser.\n\n"
+            L"Notify: nicknames mIRC checks for online/offline, with an optional note, sounds, and auto-/whois on join. "
+            L"Checked every ~60 seconds while connected (this client doesn't support the newer, server-specific instant "
+            L"WATCH extension some networks offer instead).\n\n"
+            L"Chat (DCC) and Control/Colors/Highlight are planned for future updates.", MB_ICONINFORMATION);
+    }
+    void OnOK() override {
+        popupOnConnect = IsDlgButtonChecked(IDC_AB_NF_POPUP) != 0; onlyInWindow = IsDlgButtonChecked(IDC_AB_NF_ONLYWIN) != 0;
+        inActiveWindow = IsDlgButtonChecked(IDC_AB_NF_ACTIVEWIN) != 0; showAddrTime = IsDlgButtonChecked(IDC_AB_NF_ADDRTIME) != 0;
+        highlightOn = IsDlgButtonChecked(IDC_AB_HL_ENABLE) != 0;
+        randomDelay = IsDlgButtonChecked(IDC_AB_CT_RANDOMDELAY) != 0;
+        cnickOn = IsDlgButtonChecked(IDC_AB_CO_ENABLE) != 0;
+        KillTimer(1);
+        CDialog::OnOK();
+    }
+    void OnCancel() override { KillTimer(1); CDialog::OnCancel(); }
+    DECLARE_MESSAGE_MAP()
+};
+const int CAddressBookDlg::kUserPanelIds[20] = { IDC_AB_NICK, IDC_AB_NAME, IDC_AB_EMAIL, IDC_AB_WEBSITE, IDC_AB_ADDRESS, IDC_AB_NOTES, IDC_AB_PICTURE, IDC_AB_ADD, IDC_AB_DELETE, IDC_AB_EMAILBTN, IDC_AB_VISIT, IDC_AB_CHAT, IDC_AB_WHOIS, IDC_AB_NOTIFY, IDC_AB_LBL_NICK, IDC_AB_LBL_NAME, IDC_AB_LBL_EMAIL, IDC_AB_LBL_WEBSITE, IDC_AB_LBL_ADDRESS, IDC_AB_LBL_NOTES };
+const int CAddressBookDlg::kNotifyPanelIds[19] = { IDC_AB_NF_LIST, IDC_AB_NF_NICK, IDC_AB_NF_NOTE, IDC_AB_NF_SOUNDJOIN, IDC_AB_NF_BROWSEJOIN, IDC_AB_NF_SOUNDPART, IDC_AB_NF_BROWSEPART, IDC_AB_NF_WHOIS, IDC_AB_NF_ADD, IDC_AB_NF_REMOVE, IDC_AB_NF_POPUP, IDC_AB_NF_ONLYWIN, IDC_AB_NF_ACTIVEWIN, IDC_AB_NF_ADDRTIME, IDC_AB_NF_SHOWWIN, IDC_AB_NF_LBL_NICK, IDC_AB_NF_LBL_NOTE, IDC_AB_NF_LBL_SJOIN, IDC_AB_NF_LBL_SPART };
+const int CAddressBookDlg::kHighlightPanelIds[21] = { IDC_AB_HL_ENABLE, IDC_AB_HL_LIST, IDC_AB_HL_WORDS, IDC_AB_HL_TARGETS, IDC_AB_HL_MATCHMSG, IDC_AB_HL_MATCHNICK, IDC_AB_HL_MATCHBOTH, IDC_AB_HL_COLOR, IDC_AB_HL_SOUND, IDC_AB_HL_BROWSESOUND, IDC_AB_HL_FLASH, IDC_AB_HL_TIP, IDC_AB_HL_MESSAGE, IDC_AB_HL_ADD, IDC_AB_HL_REMOVE, IDC_AB_HL_LBL_WORDS, IDC_AB_HL_LBL_TARGETS, IDC_AB_HL_LBL_MATCHON, IDC_AB_HL_LBL_COLOR, IDC_AB_HL_LBL_SOUND, IDC_AB_HL_LBL_MESSAGE };
+const int CAddressBookDlg::kControlPanelIds[9] = { IDC_AB_CT_LISTSEL, IDC_AB_CT_LIST, IDC_AB_CT_ADDTEXT, IDC_AB_CT_ADD, IDC_AB_CT_REMOVE, IDC_AB_CT_ENABLE, IDC_AB_CT_RANDOMDELAY, IDC_AB_CT_HINT, IDC_AB_CT_LBL_ADD };
+const int CAddressBookDlg::kColorsPanelIds[7] = { IDC_AB_CO_LIST, IDC_AB_CO_ADDTEXT, IDC_AB_CO_ADD, IDC_AB_CO_REMOVE, IDC_AB_CO_ENABLE, IDC_AB_CO_HINT, IDC_AB_CO_LBL_ADD };
+const int CAddressBookDlg::kWhoisPanelIds[3] = { IDC_AB_WH_TEXT, IDC_AB_WH_LOOKUP, IDC_AB_WH_LBL };
+BEGIN_MESSAGE_MAP(CAddressBookDlg, CDialog)
+    ON_BN_CLICKED(IDC_AB_TABUSERS, OnTabUsers) ON_BN_CLICKED(IDC_AB_TABWHOIS, OnTabWhois) ON_BN_CLICKED(IDC_AB_TABNOTIFY, OnTabNotify)
+    ON_BN_CLICKED(IDC_AB_TABCONTROL, OnTabControl) ON_BN_CLICKED(IDC_AB_TABCOLORS, OnTabColors) ON_BN_CLICKED(IDC_AB_TABHIGHLIGHT, OnTabHighlight)
+    ON_BN_CLICKED(IDC_AB_ADD, OnAdd) ON_BN_CLICKED(IDC_AB_DELETE, OnDelete) ON_BN_CLICKED(IDC_AB_EMAILBTN, OnEmailBtn)
+    ON_BN_CLICKED(IDC_AB_VISIT, OnVisit) ON_BN_CLICKED(IDC_AB_CHAT, OnChat) ON_BN_CLICKED(IDC_AB_WHOIS, OnWhoisBtn)
+    ON_BN_CLICKED(IDC_AB_NOTIFY, OnNotifyBtn) ON_STN_CLICKED(IDC_AB_PICTURE, OnPictureClick) ON_BN_CLICKED(IDC_AB_HELP, OnHelpBtn)
+    ON_CBN_SELCHANGE(IDC_AB_NICK, OnNickChange)
+    ON_LBN_SELCHANGE(IDC_AB_NF_LIST, OnNotifyListSel) ON_BN_CLICKED(IDC_AB_NF_ADD, OnNotifyAdd) ON_BN_CLICKED(IDC_AB_NF_REMOVE, OnNotifyRemove)
+    ON_BN_CLICKED(IDC_AB_NF_BROWSEJOIN, OnBrowseJoin) ON_BN_CLICKED(IDC_AB_NF_BROWSEPART, OnBrowsePart) ON_BN_CLICKED(IDC_AB_NF_SHOWWIN, OnShowNotifyWindow)
+    ON_LBN_SELCHANGE(IDC_AB_HL_LIST, OnHighlightListSel) ON_BN_CLICKED(IDC_AB_HL_ADD, OnHighlightAdd) ON_BN_CLICKED(IDC_AB_HL_REMOVE, OnHighlightRemove)
+    ON_BN_CLICKED(IDC_AB_HL_BROWSESOUND, OnBrowseHighlightSound)
+    ON_CBN_SELCHANGE(IDC_AB_CT_LISTSEL, OnControlListSelChange) ON_BN_CLICKED(IDC_AB_CT_ADD, OnControlAdd) ON_BN_CLICKED(IDC_AB_CT_REMOVE, OnControlRemove)
+    ON_BN_CLICKED(IDC_AB_CT_ENABLE, OnControlEnableToggle)
+    ON_BN_CLICKED(IDC_AB_CO_ADD, OnColorsAdd) ON_BN_CLICKED(IDC_AB_CO_REMOVE, OnColorsRemove)
+    ON_BN_CLICKED(IDC_AB_WH_LOOKUP, OnWhoisLookup) ON_WM_TIMER()
+END_MESSAGE_MAP()
+
 class COnlineTimerDlg : public CDialog {
     std::vector<WORD> t; int cnt = 0;
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
@@ -2702,6 +3278,31 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- Sound playback (/splay, /vol, $vol, $inwave/$inmidi/$insong, $sound) ----
     SoundChannel m_waveChan{ L"ircwave" }, m_midiChan{ L"ircmidi" }, m_mp3Chan{ L"ircmp3" };
     CString m_soundDirWave, m_soundDirMidi, m_soundDirMp3, m_soundDirWma, m_soundDirOgg;
+    // ---- Address Book (phase 1: the Users tab only -- Whois/Notify/Control/Colors/Highlight are placeholders for now) ----
+    std::vector<AddressEntry> m_abook;
+    // ---- Address Book Whois tab: captures the text of WHOIS numerics while a lookup is in progress for the dialog ----
+    CString m_uwhoCapturingNick, m_uwhoCaptureBuffer;
+    void WhoisCaptureAppend(const CString& nick, const CString& text) {
+        if (!m_uwhoCapturingNick.IsEmpty() && m_uwhoCapturingNick.CompareNoCase(nick) == 0) m_uwhoCaptureBuffer += text + L"\r\n";
+    }
+    // ---- Notify list: ISON-polled, like mIRC's own default (no IRCv3 WATCH support -- see NotifyTick) ----
+    std::vector<NotifyEntry> m_notify;
+    bool m_notifyOn = true, m_notifyPopupOnConnect = false, m_notifyOnlyInWindow = false, m_notifyInActiveWindow = false, m_notifyShowAddrTime = false;
+    CNotifyWnd* m_notifyWnd = nullptr;
+    ULONGLONG m_notifyLastPoll = 0;
+    // ---- Ignore ----
+    std::vector<IgnoreEntry> m_ignoreList;
+    bool m_ignoreOn = true;
+    // ---- Auto-Op / Auto-Voice / Protect ----
+    std::vector<AutoActionEntry> m_aopList, m_avoiceList, m_protectList;
+    bool m_aopOn = true, m_avoiceOn = true, m_protectOn = true, m_autoRandomDelay = true;
+    std::vector<PendingAutoAction> m_autoActionQueue;
+    // ---- Nick Colors ----
+    std::vector<CNickEntry> m_cnickList;
+    bool m_cnickOn = true;
+    // ---- Highlight ----
+    std::vector<HighlightEntry> m_highlightList;
+    bool m_highlightOn = true;
     // ---- Online Timer: current-connection and cumulative connect time (unrelated to the scheduled-command /timer feature above) ----
     bool m_otEnabled = true, m_otShowTotal = true;
     ULONGLONG m_otSessionStart = 0;   // GetTickCount64() when the current unbroken "connected" streak began; 0 = not currently counting
@@ -2838,6 +3439,12 @@ class CMainFrame : public CMDIFrameWnd {
         w->m_seq = ++m_seqn;
         w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
         if (wasMax) w->ShowWindow(SW_SHOWMAXIMIZED);
+        if (chan) w->SetNickColorFn([this, w, net](const CString& nick, COLORREF& outColor) -> bool {   // see Nick Colors
+            CNickEntry* e = MatchCnick(w, nick, CString(), net);
+            if (!e || e->method == 2) return false;   // method 2 = messages only, not the nicklist
+            outColor = ResolveNickColor(*e, nick);
+            return true;
+        });
         w->ApplyFont(m_chatFont);
         { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
         m_w[Key(net, name)] = w;
@@ -2953,6 +3560,11 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
         if (name == L"tips") { val = m_tipsOn ? L"$true" : L"$false"; return true; }
+        if (name == L"ignore") { val = m_ignoreOn ? L"$true" : L"$false"; return true; }
+        if (name == L"aop") { val = m_aopOn ? L"$true" : L"$false"; return true; }
+        if (name == L"avoice") { val = m_avoiceOn ? L"$true" : L"$false"; return true; }
+        if (name == L"protect") { val = m_protectOn ? L"$true" : L"$false"; return true; }
+        if (name == L"highlight") { val = m_highlightOn ? L"$true" : L"$false"; return true; }
         if (name == L"inwave" || name == L"inmidi" || name == L"insong") {   // $inwave.fname / .pos / .length / .pause (bare identifier, no parens -- see the EvalIds property-parsing fix above)
             SoundChannel& ch = name == L"inwave" ? m_waveChan : name == L"inmidi" ? m_midiChan : m_mp3Chan;
             if (prop.IsEmpty()) { val = (ch.open && ch.playing) ? L"$true" : L"$false"; return true; }
@@ -3223,6 +3835,55 @@ class CMainFrame : public CMDIFrameWnd {
             else if (prop == L"wid") val.Format(L"%d", found->wid); else val = found->name;
             return true;
         }
+        if (name == L"cnick") {   // $cnick(N/nick, M): the Nth entry, or the first matching one; M=1 selects the "listbox text" fallback color when nothing matches
+            CString a = EvalIds(w, rawArgs, params);
+            int comma = a.Find(L','); CString sel = comma >= 0 ? a.Left(comma) : a; sel.Trim();
+            int M = comma >= 0 ? _wtoi(a.Mid(comma + 1)) : 0;
+            CNickEntry* found = nullptr; int pos = 0; double idxD;
+            if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_cnickList.size()) { found = &m_cnickList[idx - 1]; pos = idx; } }
+            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, sel) || m_cnickList[i].nick.CompareNoCase(sel) == 0) { found = &m_cnickList[i]; pos = (int)i + 1; break; }
+            if (!found) {
+                if (prop == L"color") val.Format(L"%d", (int)cText);   // "'Normal Text' color, or if M=1, 'Listbox text' color" -- this app doesn't keep those as two separate colors, so both report the same one
+                else val = L"0";
+                return true;
+            }
+            if (prop == L"color") val.Format(L"%d", (int)ResolveNickColor(*found, found->nick));
+            else if (prop == L"modes") val = found->modes; else if (prop == L"levels") val = found->levels;
+            else if (prop == L"method") val.Format(L"%d", found->method);
+            else if (prop == L"anymode") val = found->anyMode ? L"$true" : L"$false"; else if (prop == L"nomode") val = found->noMode ? L"$true" : L"$false";
+            else if (prop == L"ignore") val = found->ignoreCond ? L"$true" : L"$false"; else if (prop == L"op") val = found->opCond ? L"$true" : L"$false";
+            else if (prop == L"voice") val = found->voiceCond ? L"$true" : L"$false"; else if (prop == L"protect") val = found->protectCond ? L"$true" : L"$false";
+            else if (prop == L"notify") val = found->notifyCond ? L"$true" : L"$false";
+            else if (prop == L"idle") val.Format(L"%d", found->idleMin); else if (prop == L"auto") val = found->autoColor ? L"$true" : L"$false";
+            else val.Format(L"%d", pos);
+            return true;
+        }
+        if (name == L"aop" || name == L"avoice" || name == L"protect") {   // $aop(address|N) / $avoice(...) / $protect(...): .type returns the channel list; .network the associated network
+            std::vector<AutoActionEntry>& list = name == L"aop" ? m_aopList : name == L"avoice" ? m_avoiceList : m_protectList;
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            AutoActionEntry* found = nullptr; double idxD;
+            if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)list.size()) found = &list[idx - 1]; }
+            else for (auto& e : list) if (GlobMatch(e.mask, a) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
+            if (!found) { val.Empty(); return true; }
+            if (prop == L"type") val = found->channels; else if (prop == L"network") val = found->network; else val = found->mask;
+            return true;
+        }
+        if (name == L"ignore") {   // $ignore(address|N) -- the matching list entry, or the Nth one; .type .network .secs
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            IgnoreEntry* found = nullptr; double idxD;
+            if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_ignoreList.size()) found = &m_ignoreList[idx - 1]; }
+            else for (auto& e : m_ignoreList) if (GlobMatch(e.mask, a) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
+            if (!found) { val.Empty(); return true; }
+            if (prop == L"type") {
+                CString types; if (found->p) types += L"p"; if (found->c) types += L"c"; if (found->n) types += L"n"; if (found->t) types += L"t"; if (found->i) types += L"i";
+                if (found->k) types += L"k"; if (found->d) types += L"d"; if (found->s) types += L"s"; if (found->h) types += L"h"; if (found->y) types += L"y";
+                val = types;
+            }
+            else if (prop == L"network") val = found->network;
+            else if (prop == L"secs") { ULONGLONG now = GetTickCount64(); val.Format(L"%d", found->expiresAt > now ? (int)((found->expiresAt - now) / 1000) : 0); }
+            else val = found->mask;
+            return true;
+        }
         if (name == L"vol") {   // $vol(wave|midi|song|master), with .mute
             CString a = EvalIds(w, rawArgs, params); a.MakeLower(); a.Trim();
             int v = 0; bool mute = false;
@@ -3231,7 +3892,6 @@ class CMainFrame : public CMDIFrameWnd {
             else if (a == L"song") { CString r = MciCmd(L"status " + m_mp3Chan.alias + L" volume"); v = r.IsEmpty() ? 0 : (_wtoi(r) * 65535 / 1000); }
             else if (a == L"master") { v = GetMasterVolumeNow(); mute = GetMasterMuteNow(); }
             else { val.Empty(); return true; }
-            //val = prop == L"mute" ? (mute ? L"$true" : L"$false") : CString();
             val = (prop == L"mute") ? (mute ? CString(L"$true") : CString(L"$false")) : CString();
             if (prop != L"mute") val.Format(L"%d", v);
             return true;
@@ -4039,6 +4699,14 @@ class CMainFrame : public CMDIFrameWnd {
         if (cmd == L"tips") { CmdTips(w, arg); return; }
         if (cmd == L"tip") { CmdTip(w, arg); return; }
         if (cmd == L"titlebar") { CmdTitlebar(w, arg); return; }
+        if (cmd == L"abook") { CmdAbook(w, arg); return; }
+        if (cmd == L"notify") { CmdNotify(w, arg); return; }
+        if (cmd == L"ignore") { CmdIgnore(w, arg); return; }
+        if (cmd == L"aop") { CmdAop(w, arg); return; }
+        if (cmd == L"avoice") { CmdAvoice(w, arg); return; }
+        if (cmd == L"protect") { CmdProtect(w, arg); return; }
+        if (cmd == L"cnick") { CmdCnick(w, arg); return; }
+        if (cmd == L"highlight") { CmdHighlight(w, arg); return; }
         if (cmd == L"splay") { CmdSplay(w, arg); return; }
         if (cmd == L"vol") { CmdVol(w, arg); return; }
         if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
@@ -4256,7 +4924,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -4309,24 +4977,39 @@ class CMainFrame : public CMDIFrameWnd {
                 }
                 //this is to let you know that someone CTCPed you.    
                 //might we should reply to unknown CTCPs
-                Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cCTCP);
+                if (!IsIgnored(net, nick, prefix, L't')) Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cCTCP);
                 return;
             }
+            bool queryOpen = priv && Find(net, nick) != nullptr;   // "private messages ... will not be ignored even if their address matches" while a /query is open
+            wchar_t ignType = notice ? L'n' : (priv ? L'p' : L'c');
+            if (!(ignType == L'p' && queryOpen) && IsIgnored(net, nick, prefix, ignType)) return;   // fully suppressed: not shown, no tip, nothing
+            if (IsIgnored(net, nick, prefix, L'k')) txt = Strip(txt);   // "strip control codes" -- the message still shows, just without mIRC color/style codes
             CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
-            if (ctcp) Show(w, L"* " + nick + txt.Mid(6), cAction);   // ACTION (/me): a real chat message, so it still uses the normal window
+            HighlightEntry* hle = notice ? nullptr : MatchHighlight(nick, txt, priv ? nick : tgt);   // Highlight takes precedence over Nick Colors when both match
+            CNickEntry* cne = (notice || hle) ? nullptr : MatchCnick(w, nick, prefix, net);   // Nick Colors: "messages that this user sends to channel or query windows" -- notices aren't included
+            bool colorMsg = cne && cne->method != 1;   // method 1 = nicklist only, not messages
+            COLORREF hlColor = hle ? MircColor(_wtoi(hle->colorStr)) : cText;
+            if (ctcp) Show(w, L"* " + nick + txt.Mid(6), hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cAction));   // ACTION (/me): a real chat message, so it still uses the normal window
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
-            else Show(w, L"<" + nick + L"> " + txt);
-            if (!notice) {   // see Tips: only real messages (including /me) trigger a balloon, never notices/CTCP noise
+            else Show(w, L"<" + nick + L"> " + txt, hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cText));
+            if (hle) FireHighlight(w, *hle, nick, txt);
+            if (!notice && !IsIgnored(net, nick, prefix, L'y')) {   // see Tips: only real messages (including /me) trigger a balloon, never notices/CTCP noise
                 CString tipText = ctcp ? (nick + L" " + txt.Mid(6)) : (L"<" + nick + L"> " + txt);
                 if (priv && m_tipsPrivate) QueueEventTip(nick, tipText, w);
                 else if (!priv && IsChan(tgt) && m_tipsChannel) QueueEventTip(tgt, tipText, w);
             }
         }
         //* Someone (user@hostname) invites you to join #chan
-        else if (cmd == L"INVITE") { Note(net, nick + L" invites you to join " + P(1), cInvite); }
+        else if (cmd == L"INVITE") { if (!IsIgnored(net, nick, prefix, L'i')) Note(net, nick + L" invites you to join " + P(1), cInvite); }
         else if (cmd == L"JOIN") {
             CString ch = P(0); CChatWnd* w = me ? Open(net, ch, true) : Find(net, ch); if (!w) return;
-            if (!me) w->AddNick(nick);
+            if (!me) {
+                w->AddNick(nick);
+                if ((m_aopOn || m_avoiceOn) && w->NickPrefixChar(net->nick) == L'@') {   // only matters if we actually have ops here
+                    if (m_aopOn && MatchesAutoList(m_aopList, nick, prefix, ch, net)) QueueAutoAction(net, ch, nick, L'o');
+                    if (m_avoiceOn && MatchesAutoList(m_avoiceList, nick, prefix, ch, net)) QueueAutoAction(net, ch, nick, L'v');
+                }
+            }
             Show(w, L"* " + nick + L" (" + host + L") has joined " + ch, cJoin);
         }
         else if (cmd == L"PART") {
@@ -4335,7 +5018,11 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"KICK") {
             if (P(1).CompareNoCase(net->nick) == 0) { Note(net, L"You were kicked from " + P(0) + L" by " + nick + L" (" + P(2) + L")", cKick); Drop(net, P(0)); return; }
-            if (CChatWnd* w = Find(net, P(0))) { w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cKick); }
+            if (CChatWnd* w = Find(net, P(0))) {
+                if (m_protectOn && nick.CompareNoCase(net->nick) != 0 && MatchesAutoList(m_protectList, P(1), CString(), P(0), net) && w->NickPrefixChar(net->nick) == L'@')
+                    Send(net, L"KICK " + P(0) + L" " + nick + L" :Protected user");
+                w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cKick);
+            }
         }
         else if (cmd == L"QUIT") {
             for (auto& kv : m_w) {
@@ -4357,16 +5044,51 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"MODE") {
             CChatWnd* w = Find(net, P(0)); CString m; for (size_t i = 1; i < p.size(); i++) m += p[i] + L" ";
             Show(w ? w : Status(net), L"* " + nick + L" sets mode " + m, cMode);
-            if (w && p.size() > 2) { w->m_refresh = true; Send(net, L"NAMES " + P(0)); }
+            if (w && p.size() > 2) {
+                // Protect: watch specifically for "-o <protected nick>" so we can retaliate. A simplified scan, not a
+                // full CHANMODES-aware parser -- it assumes the common parameter-consuming modes (o, v, k, l, b, e, I),
+                // which covers the typical single or combined mode strings a protect scenario actually involves.
+                if (m_protectOn && nick.CompareNoCase(net->nick) != 0) {
+                    CString modeStr = P(1); bool adding = true; size_t paramIdx = 2;
+                    for (int mi = 0; mi < modeStr.GetLength(); mi++) {
+                        wchar_t mc = modeStr[mi];
+                        if (mc == L'+') adding = true; else if (mc == L'-') adding = false;
+                        else {
+                            if (mc == L'o' && !adding && paramIdx < p.size()) {
+                                CString deopped = p[paramIdx];
+                                if (MatchesAutoList(m_protectList, deopped, CString(), P(0), net) && w->NickPrefixChar(net->nick) == L'@')
+                                    Send(net, L"KICK " + P(0) + L" " + nick + L" :Protected user");
+                            }
+                            if (wcschr(L"ovklbeI", mc)) paramIdx++;
+                        }
+                    }
+                }
+                w->m_refresh = true; Send(net, L"NAMES " + P(0));
+            }
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
-            if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
+            if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin);
+            if (m_notifyPopupOnConnect) ShowNotifyWindow();
+            NotifyTick(true); }
         else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic is " + P(2), cTopic); } }
         else if (cmd == L"333") {   // RPL_TOPICWHOTIME: channel setter unixtimestamp -- who set the topic and when, shown right after the topic itself
             CString chan = P(1), who = P(2), ts = P(3), when;
             if (IsAllDigits(ts)) { CTime ct((time_t)_wtoi64(ts)); when = ct.Format(L"%a %b %d %H:%M:%S %Y"); }
             CChatWnd* w = Find(net, chan);
             Show(w ? w : Status(net), L"* Set by " + who + (when.IsEmpty() ? CString() : L" on " + when), cTopic);
+        }
+        else if (cmd == L"303" && !net->notifyPending.empty()) {   // RPL_ISON: :server 303 mynick :nick1 nick2 ... (whichever of the queried nicks are currently online)
+            CString onlineList = P(1);
+            std::vector<CString> onlineNicks; { CString tmp = onlineList; CString tok; while (!(tok = Word(tmp)).IsEmpty()) onlineNicks.push_back(tok); }
+            for (auto& nck : net->notifyPending) {
+                bool isOnline = false; for (auto& on : onlineNicks) if (on.CompareNoCase(nck) == 0) { isOnline = true; break; }
+                NotifyEntry* e = FindNotifyEntry(nck);
+                if (!e) continue;
+                if (isOnline && !e->online) { e->online = true; NotifyUserOnline(net, *e); }
+                else if (!isOnline && e->online) { e->online = false; NotifyUserOffline(net, *e); }
+            }
+            net->notifyPending.clear();
+            RefreshNotifyWnd();
         }
         else if (cmd == L"321") { /* RPL_LISTSTART header ("Channel Users Name"): nothing to do, our list window has its own column headers */ }
         else if (cmd == L"322") {   // RPL_LIST: <chan> <#users> :<topic> (topic may have a leading "[+modes]" prefix)
@@ -4383,23 +5105,24 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"366") {}
         else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cText); Send(net, L"NICK " + net->nick); }
         //whois stuff
-        else if (cmd == L"311") { Note(net, P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)), cWhois); }   // RPL_WHOISUSER: nick user host * :realname
-        else if (cmd == L"312") { Note(net, P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)), cWhois); } // RPL_WHOISSERVER
+        else if (cmd == L"311") { CString s = P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)); Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); }   // RPL_WHOISUSER: nick user host * :realname
+        else if (cmd == L"312") { CString s = P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)); Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); } // RPL_WHOISSERVER
         else if (cmd == L"317") {   // RPL_WHOISIDLE: nick idle [signon] :seconds idle, signon time
             long idle = _wtol(P(2));
             CString s; s.Format(L"%s has been idle for %ldh %ldm %lds", (LPCWSTR)P(1), idle / 3600, (idle / 60) % 60, idle % 60);
             CString signon = P(3);
             if (!signon.IsEmpty() && IsAllDigits(signon)) { CTime ct((time_t)_wtoi64(signon)); s += L", signed on " + ct.Format(L"%a %b %d %H:%M:%S %Y"); }
-            Note(net, s, cWhois);
+            Note(net, s, cWhois); WhoisCaptureAppend(P(1), s);
         }
-        else if (cmd == L"318") { Note(net, P(1) + L" End of /WHOIS list.", cWhois); }  //End of /WHOIS list. //-- End of WHOIS -- // RPL_ENDOFWHOIS
-        else if (cmd == L"319") { Note(net, P(1) + L" is on channels: " + P(2), cWhois); }  // RPL_WHOISCHANNELS
+        else if (cmd == L"318") { CString s = P(1) + L" End of /WHOIS list."; Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); }  //End of /WHOIS list. //-- End of WHOIS -- // RPL_ENDOFWHOIS
+        else if (cmd == L"319") { CString s = P(1) + L" is on channels: " + P(2); Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); }  // RPL_WHOISCHANNELS
         else if (cmd == L"301" || cmd == L"313" || cmd == L"330" || cmd == L"338" || cmd == L"378" || cmd == L"379" || cmd == L"671") {
             // other common WHOIS-block lines (away, IRC operator, logged-in-as, actual host, connecting-from, user modes,
             // secure connection -- numbers and exact wording vary by server); joined the same way the old generic
             // fallback did, just consistently colored with the rest of the WHOIS block instead of falling through to it
             CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
-            Note(net, j.IsEmpty() ? raw : j, cWhois);
+            CString s = j.IsEmpty() ? raw : j;
+            Note(net, s, cWhois); WhoisCaptureAppend(P(1), s);
         }
         else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
             CString trailing = P(1); int tp = 0;
@@ -4537,6 +5260,10 @@ class CMainFrame : public CMDIFrameWnd {
     // "Place mIRC in tray when minimized" setting -- and Shift, held during the click, always forces tray-minimize
     // even when that setting is off, matching mIRC's own described override (the reverse direction -- forcing a
     // normal taskbar minimize while the setting is on -- isn't described in the Tray help text, so isn't assumed here).
+    BOOL PreTranslateMessage(MSG* pMsg) override {   // Alt+B: the Address Book shortcut -- not a menu mnemonic anywhere in this app's menus, so it's free to use
+        if (pMsg->message == WM_SYSKEYDOWN && pMsg->wParam == 'B' && (::GetKeyState(VK_MENU) & 0x8000)) { OpenAddressBook(); return TRUE; }
+        return CMDIFrameWnd::PreTranslateMessage(pMsg);
+    }
     afx_msg void OnSysCommand(UINT nID, LPARAM lParam) {
         if ((nID & 0xFFF0) == SC_MINIMIZE) {
             bool shiftHeld = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -5002,6 +5729,634 @@ class CMainFrame : public CMDIFrameWnd {
         tag.track = v11 ? CString(std::to_wstring((unsigned char)buf[126]).c_str()) : CString();
         tag.genre.Format(L"%d", (int)(unsigned char)buf[127]);   // reported as the raw numeric genre id -- not mapped to the standard genre-name table
         return true;
+    }
+    void OnAbookMenu() { OpenAddressBook(); }
+    void OpenAddressBook(const CString& startNick = CString(), int tab = IDC_AB_TABUSERS) {
+        CAddressBookDlg dlg(&m_abook, &m_notify, &m_highlightList, &m_aopList, &m_avoiceList, &m_protectList, &m_ignoreList, &m_cnickList, startNick, this);
+        dlg.initialTab = tab;
+        dlg.popupOnConnect = m_notifyPopupOnConnect; dlg.onlyInWindow = m_notifyOnlyInWindow;
+        dlg.inActiveWindow = m_notifyInActiveWindow; dlg.showAddrTime = m_notifyShowAddrTime;
+        dlg.highlightOn = m_highlightOn;
+        dlg.aopOn = m_aopOn; dlg.avoiceOn = m_avoiceOn; dlg.protectOn = m_protectOn; dlg.ignoreOn = m_ignoreOn; dlg.randomDelay = m_autoRandomDelay;
+        dlg.cnickOn = m_cnickOn;
+        dlg.onWhois = [this](const CString& nick) {
+            Net* net = nullptr; for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
+            if (net) Send(net, L"WHOIS " + nick); else AfxMessageBox(L"Not connected to a server.", MB_ICONINFORMATION);
+        };
+        dlg.onShowNotifyWindow = [this] { ShowNotifyWindow(); };
+        dlg.onControlCmd = [this](int sel, const CString& text) {
+            if (sel == 0) CmdAop(nullptr, text); else if (sel == 1) CmdAvoice(nullptr, text); else if (sel == 2) CmdProtect(nullptr, text); else CmdIgnore(nullptr, text);
+        };
+        dlg.onCnickCmd = [this](const CString& text) { CmdCnick(nullptr, text); };
+        dlg.onStartWhoisLookup = [this](const CString& nick) {
+            m_uwhoCapturingNick = nick; m_uwhoCaptureBuffer.Empty();
+            Net* net = nullptr; for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
+            if (net) Send(net, L"WHOIS " + nick); else m_uwhoCaptureBuffer = L"Not connected to a server.\r\n";
+        };
+        dlg.onGetWhoisCapture = [this] { return m_uwhoCaptureBuffer; };
+        bool ok = dlg.DoModal() == IDOK;
+        m_uwhoCapturingNick.Empty(); m_uwhoCaptureBuffer.Empty();   // stop capturing once the dialog's gone, whatever the outcome
+        if (ok) {
+            SaveAbook();
+            m_highlightOn = dlg.highlightOn; SaveHighlight();
+            m_notifyPopupOnConnect = dlg.popupOnConnect; m_notifyOnlyInWindow = dlg.onlyInWindow;
+            m_notifyInActiveWindow = dlg.inActiveWindow; m_notifyShowAddrTime = dlg.showAddrTime;
+            SaveNotify();
+            m_aopOn = dlg.aopOn; m_avoiceOn = dlg.avoiceOn; m_protectOn = dlg.protectOn; m_autoRandomDelay = dlg.randomDelay; SaveAutoLists();
+            m_ignoreOn = dlg.ignoreOn; SaveIgnore();
+            m_cnickOn = dlg.cnickOn; SaveCnick();
+        }
+    }
+    void CmdAbook(CChatWnd* w, CString arg) {   // /abook -wnclh [nickname]
+        arg.Trim();
+        int tab = IDC_AB_TABUSERS;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) {
+                wchar_t c = sw[i];
+                if (c == L'w') tab = IDC_AB_TABWHOIS; else if (c == L'n') tab = IDC_AB_TABNOTIFY;
+                else if (c == L'c') tab = IDC_AB_TABCONTROL; else if (c == L'l') tab = IDC_AB_TABCOLORS; else if (c == L'h') tab = IDC_AB_TABHIGHLIGHT;
+            }
+            arg.TrimLeft();
+        }
+        OpenAddressBook(arg, tab);
+    }
+    // ---- Notify list ----
+    void LoadNotify() {
+        m_notify.clear();
+        CWinApp* a = AfxGetApp();
+        m_notifyOn = a->GetProfileInt(L"Notify", L"on", 1) != 0;
+        m_notifyPopupOnConnect = a->GetProfileInt(L"Notify", L"popupOnConnect", 0) != 0;
+        m_notifyOnlyInWindow = a->GetProfileInt(L"Notify", L"onlyInWindow", 0) != 0;
+        m_notifyInActiveWindow = a->GetProfileInt(L"Notify", L"inActiveWindow", 0) != 0;
+        m_notifyShowAddrTime = a->GetProfileInt(L"Notify", L"showAddrTime", 0) != 0;
+        CString path = IniPath(L"notify.ini");
+        int n = GetPrivateProfileIntW(L"Notify", L"Count", 0, path);
+        wchar_t buf[512];
+        for (int i = 0; i < n; i++) {
+            CString sec; sec.Format(L"Entry%d", i);
+            NotifyEntry e;
+            GetPrivateProfileStringW(sec, L"Nick", L"", buf, 256, path); e.nick = buf;
+            GetPrivateProfileStringW(sec, L"Note", L"", buf, 256, path); e.note = buf;
+            GetPrivateProfileStringW(sec, L"Network", L"", buf, 256, path); e.network = buf;
+            e.doWhois = GetPrivateProfileIntW(sec, L"Whois", 0, path) != 0;
+            GetPrivateProfileStringW(sec, L"SoundJoin", L"", buf, 512, path); e.soundJoin = buf;
+            GetPrivateProfileStringW(sec, L"SoundPart", L"", buf, 512, path); e.soundPart = buf;
+            if (!e.nick.IsEmpty()) m_notify.push_back(e);
+        }
+    }
+    void SaveNotify() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Notify", L"on", m_notifyOn ? 1 : 0);
+        a->WriteProfileInt(L"Notify", L"popupOnConnect", m_notifyPopupOnConnect ? 1 : 0);
+        a->WriteProfileInt(L"Notify", L"onlyInWindow", m_notifyOnlyInWindow ? 1 : 0);
+        a->WriteProfileInt(L"Notify", L"inActiveWindow", m_notifyInActiveWindow ? 1 : 0);
+        a->WriteProfileInt(L"Notify", L"showAddrTime", m_notifyShowAddrTime ? 1 : 0);
+        CString path = IniPath(L"notify.ini");
+        ::DeleteFileW(path);
+        CString cs; cs.Format(L"%d", (int)m_notify.size());
+        WritePrivateProfileStringW(L"Notify", L"Count", cs, path);
+        for (size_t i = 0; i < m_notify.size(); i++) {
+            CString sec; sec.Format(L"Entry%d", (int)i); auto& e = m_notify[i];
+            WritePrivateProfileStringW(sec, L"Nick", e.nick, path); WritePrivateProfileStringW(sec, L"Note", e.note, path);
+            WritePrivateProfileStringW(sec, L"Network", e.network, path); WritePrivateProfileStringW(sec, L"Whois", e.doWhois ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"SoundJoin", e.soundJoin, path); WritePrivateProfileStringW(sec, L"SoundPart", e.soundPart, path);
+        }
+    }
+    NotifyEntry* FindNotifyEntry(const CString& nick) { for (auto& e : m_notify) if (e.nick.CompareNoCase(nick) == 0) return &e; return nullptr; }
+    void PlayNotifySound(const CString& file) {   // reuses the same MCI channels as /splay, auto-picking by file extension
+        if (file.IsEmpty()) return;
+        CString type = MciTypeForFile(file);
+        SoundChannel* ch = type == L"waveaudio" ? &m_waveChan : type == L"sequencer" ? &m_midiChan : &m_mp3Chan;
+        OpenAndPlaySound(*ch, file);
+    }
+    void RefreshNotifyWnd() { if (m_notifyWnd) m_notifyWnd->Populate(m_notify); }
+    void ShowNotifyWindow() {
+        if (!m_notifyWnd) {
+            m_notifyWnd = new CNotifyWnd();
+            m_notifyWnd->m_seq = ++m_seqn;
+            m_notifyWnd->onClosed = [this](CNotifyWnd*) { m_notifyWnd = nullptr; };
+            m_notifyWnd->Create(nullptr, L"Notify List", WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+            RefreshNotifyWnd();
+        }
+        Activate(m_notifyWnd);
+    }
+    void HideNotifyWindow() { if (m_notifyWnd) m_notifyWnd->DestroyWindow(); }
+    void ShowNotifyMessage(Net* net, const CString& msg) {
+        if (m_notifyOnlyInWindow) { RefreshNotifyWnd(); return; }
+        CChatWnd* target = Status(net);
+        Show(target, L"* " + msg, cInfo);
+        if (m_notifyInActiveWindow) { CMDIChildWnd* act = MDIGetActive(); CChatWnd* aw = dynamic_cast<CChatWnd*>(act); if (aw && aw != target) Show(aw, L"* " + msg, cInfo); }
+    }
+    void NotifyUserOnline(Net* net, NotifyEntry& e) {
+        CString msg = e.nick + L" is online on IRC" + (e.note.IsEmpty() ? CString() : L" (" + e.note + L")");
+        ShowNotifyMessage(net, msg);
+        PlayNotifySound(e.soundJoin);
+        if (e.doWhois) Send(net, L"WHOIS " + e.nick);
+    }
+    void NotifyUserOffline(Net* net, NotifyEntry& e) {
+        ShowNotifyMessage(net, e.nick + L" has left IRC" + (e.note.IsEmpty() ? CString() : L" (" + e.note + L")"));
+        PlayNotifySound(e.soundPart);
+    }
+    // Polls each connected network for the notify list's nicks via ISON, every ~60 seconds (mIRC's own "once every
+    // minute or so" baseline) -- this app doesn't implement the newer, server-specific IRCv3 WATCH extension that
+    // some networks use for instant notify updates instead.
+    void NotifyTick(bool force = false) {
+        if (!m_notifyOn || m_notify.empty()) return;
+        ULONGLONG now = GetTickCount64();
+        if (!force && m_notifyLastPoll != 0 && now - m_notifyLastPoll < 60000) return;
+        m_notifyLastPoll = now;
+        for (auto& np : m_nets) {
+            if (!np->conn) continue;
+            std::vector<CString> nicks;
+            for (auto& e : m_notify) if (e.network.IsEmpty() || e.network.CompareNoCase(np->tag) == 0 || (!np->network.IsEmpty() && e.network.CompareNoCase(np->network) == 0)) nicks.push_back(e.nick);
+            if (nicks.empty()) continue;
+            CString ison = L"ISON"; for (auto& nck : nicks) ison += L" " + nck;
+            np->notifyPending = nicks;
+            Send(np.get(), ison);
+        }
+    }
+    void CmdNotify(CChatWnd* w, CString arg) {
+        arg.Trim();
+        bool sFlag = false, hFlag = false, rFlag = false, lFlag = false, nFlag = false;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) { wchar_t c = sw[i]; if (c == L's') sFlag = true; else if (c == L'h') hFlag = true; else if (c == L'r') rFlag = true; else if (c == L'l') lFlag = true; else if (c == L'n') nFlag = true; }
+            arg.TrimLeft();
+        }
+        if (sFlag) ShowNotifyWindow();
+        if (hFlag) HideNotifyWindow();
+        if ((sFlag || hFlag) && arg.IsEmpty()) return;
+        if (lFlag) {
+            if (m_notify.empty()) { Show(w, L"* Notify list is empty.", cInfo); return; }
+            for (auto& e : m_notify) { CString s; s.Format(L"* %s - %s%s", (LPCWSTR)e.nick, e.online ? L"online" : L"offline", e.note.IsEmpty() ? L"" : (LPCWSTR)(CString(L" (") + e.note + L")")); Show(w, s, cInfo); }
+            return;
+        }
+        if (arg.IsEmpty()) { NotifyTick(true); Show(w, L"* Notify list update requested.", cInfo); return; }
+        CString first = Word(arg); CString firstL = first; firstL.MakeLower();
+        if (firstL == L"on") { m_notifyOn = true; SaveNotify(); Show(w, L"* Notify on.", cInfo); return; }
+        if (firstL == L"off") { m_notifyOn = false; SaveNotify(); Show(w, L"* Notify off.", cInfo); return; }
+        if (rFlag) {
+            CString nick = first; if (!nick.IsEmpty() && nick[0] == L'+') nick = nick.Mid(1);
+            size_t before = m_notify.size();
+            m_notify.erase(std::remove_if(m_notify.begin(), m_notify.end(), [&](const NotifyEntry& e) { return e.nick.CompareNoCase(nick) == 0; }), m_notify.end());
+            SaveNotify(); RefreshNotifyWnd();
+            Show(w, before == m_notify.size() ? L"* No such nickname in notify list: " + nick : L"* Removed " + nick + L" from notify list.", before == m_notify.size() ? cPart : cInfo);
+            return;
+        }
+        CString nick = first; bool doWhois = false;
+        if (!nick.IsEmpty() && nick[0] == L'+') { doWhois = true; nick = nick.Mid(1); }
+        CString netOrAddr; if (nFlag) netOrAddr = Word(arg);
+        CString note = arg;
+        NotifyEntry* existing = FindNotifyEntry(nick);
+        if (existing) { existing->doWhois = doWhois; if (!netOrAddr.IsEmpty()) existing->network = netOrAddr; if (!note.IsEmpty()) existing->note = note; }
+        else { NotifyEntry e; e.nick = nick; e.doWhois = doWhois; e.network = netOrAddr; e.note = note; m_notify.push_back(e); }
+        SaveNotify(); RefreshNotifyWnd();
+        Show(w, L"* Added " + nick + L" to notify list.", cInfo);
+    }
+    // ---- Ignore ----
+    void LoadIgnore() {
+        m_ignoreList.clear();
+        CWinApp* a = AfxGetApp();
+        m_ignoreOn = a->GetProfileInt(L"Ignore", L"on", 1) != 0;
+        CString path = IniPath(L"ignore.ini");
+        int n = GetPrivateProfileIntW(L"Ignore", L"Count", 0, path);
+        wchar_t buf[512];
+        for (int idx = 0; idx < n; idx++) {
+            CString sec; sec.Format(L"Entry%d", idx);
+            IgnoreEntry e;
+            GetPrivateProfileStringW(sec, L"Mask", L"", buf, 512, path); e.mask = buf;
+            GetPrivateProfileStringW(sec, L"Network", L"", buf, 256, path); e.network = buf;
+            e.excluded = GetPrivateProfileIntW(sec, L"Excluded", 0, path) != 0;
+            GetPrivateProfileStringW(sec, L"Types", L"pcntikdshy", buf, 32, path); CString types = buf;
+            e.p = types.Find(L'p') >= 0; e.c = types.Find(L'c') >= 0; e.n = types.Find(L'n') >= 0; e.t = types.Find(L't') >= 0; e.i = types.Find(L'i') >= 0;
+            e.k = types.Find(L'k') >= 0; e.d = types.Find(L'd') >= 0; e.s = types.Find(L's') >= 0; e.h = types.Find(L'h') >= 0; e.y = types.Find(L'y') >= 0;
+            if (!e.mask.IsEmpty()) m_ignoreList.push_back(e);   // -u# delays are session-only (GetTickCount64-based) and deliberately never persisted
+        }
+    }
+    void SaveIgnore() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Ignore", L"on", m_ignoreOn ? 1 : 0);
+        CString path = IniPath(L"ignore.ini");
+        ::DeleteFileW(path);
+        CString cs; cs.Format(L"%d", (int)m_ignoreList.size());
+        WritePrivateProfileStringW(L"Ignore", L"Count", cs, path);
+        for (size_t idx = 0; idx < m_ignoreList.size(); idx++) {
+            CString sec; sec.Format(L"Entry%d", (int)idx); auto& e = m_ignoreList[idx];
+            WritePrivateProfileStringW(sec, L"Mask", e.mask, path); WritePrivateProfileStringW(sec, L"Network", e.network, path);
+            WritePrivateProfileStringW(sec, L"Excluded", e.excluded ? L"1" : L"0", path);
+            CString types; if (e.p) types += L"p"; if (e.c) types += L"c"; if (e.n) types += L"n"; if (e.t) types += L"t"; if (e.i) types += L"i";
+            if (e.k) types += L"k"; if (e.d) types += L"d"; if (e.s) types += L"s"; if (e.h) types += L"h"; if (e.y) types += L"y";
+            WritePrivateProfileStringW(sec, L"Types", types, path);
+        }
+    }
+    static bool IgnoreTypeFlag(const IgnoreEntry& e, wchar_t type) {
+        switch (type) { case L'p': return e.p; case L'c': return e.c; case L'n': return e.n; case L't': return e.t; case L'i': return e.i;
+            case L'k': return e.k; case L'd': return e.d; case L's': return e.s; case L'h': return e.h; case L'y': return e.y; default: return false; }
+    }
+    // Checks nick (and, if available, the full nick!user@host) against the ignore list for one message type at a
+    // time. An excluded (-x) match always wins outright, even over an otherwise-matching ignore rule, since that's
+    // the whole point of an exclusion entry.
+    bool IsIgnored(Net* net, const CString& nick, const CString& hostmask, wchar_t type) {
+        if (!m_ignoreOn) return false;
+        ULONGLONG now = GetTickCount64();
+        bool ignored = false;
+        for (auto it = m_ignoreList.begin(); it != m_ignoreList.end();) {
+            if (it->expiresAt && now >= it->expiresAt) { it = m_ignoreList.erase(it); continue; }
+            bool netOk = it->network.IsEmpty() || (net && (it->network.CompareNoCase(net->tag) == 0 || (!net->network.IsEmpty() && it->network.CompareNoCase(net->network) == 0)));
+            if (netOk && IgnoreTypeFlag(*it, type) && (GlobMatch(it->mask, nick) || (!hostmask.IsEmpty() && GlobMatch(it->mask, hostmask)))) {
+                if (it->excluded) return false;
+                ignored = true;
+            }
+            ++it;
+        }
+        return ignored;
+    }
+    IgnoreEntry* FindIgnoreEntry(const CString& mask) { for (auto& e : m_ignoreList) if (e.mask.CompareNoCase(mask) == 0) return &e; return nullptr; }
+    void CmdIgnore(CChatWnd* w, CString arg) {   // /ignore [-lrpcntikdshywxu#] <on|off|nick|address> [type] [network]
+        arg.Trim();
+        bool lFlag = false, rFlag = false, xFlag = false, wFlag = false; int delaySecs = -1;
+        bool anyType = false, fp = false, fc = false, fn = false, ft = false, fi = false, fk = false, fd = false, fs = false, fh = false, fy = false;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) {
+                wchar_t c = sw[i];
+                if (c == L'l') lFlag = true; else if (c == L'r') rFlag = true; else if (c == L'x') xFlag = true; else if (c == L'w') wFlag = true;
+                else if (c == L'p') { fp = true; anyType = true; } else if (c == L'c') { fc = true; anyType = true; } else if (c == L'n') { fn = true; anyType = true; }
+                else if (c == L't') { ft = true; anyType = true; } else if (c == L'i') { fi = true; anyType = true; } else if (c == L'k') { fk = true; anyType = true; }
+                else if (c == L'd') { fd = true; anyType = true; } else if (c == L's') { fs = true; anyType = true; } else if (c == L'h') { fh = true; anyType = true; }
+                else if (c == L'y') { fy = true; anyType = true; }
+                else if (c == L'u') { CString digs; while (i + 1 < sw.GetLength() && iswdigit(sw[i + 1])) digs += sw[++i]; delaySecs = digs.IsEmpty() ? 0 : _wtoi(digs); }
+            }
+            arg.TrimLeft();
+        }
+        if (lFlag) {
+            if (m_ignoreList.empty()) { Show(w, L"* Ignore list is empty.", cInfo); return; }
+            for (auto& e : m_ignoreList) { CString s; s.Format(L"* %s%s%s", e.excluded ? L"(excluded) " : L"", (LPCWSTR)e.mask, e.network.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.network)); Show(w, s, cInfo); }
+            return;
+        }
+        if (arg.IsEmpty()) {
+            if (rFlag) { m_ignoreList.clear(); SaveIgnore(); Show(w, L"* Ignore list cleared.", cInfo); return; }
+            Show(w, m_ignoreOn ? L"* Ignore is on." : L"* Ignore is off.", cInfo);
+            return;
+        }
+        CString first = Word(arg); CString firstL = first; firstL.MakeLower();
+        if (firstL == L"on") { m_ignoreOn = true; SaveIgnore(); Show(w, L"* Ignore on.", cInfo); return; }
+        if (firstL == L"off") { m_ignoreOn = false; SaveIgnore(); Show(w, L"* Ignore off.", cInfo); return; }
+        if (rFlag) {
+            size_t before = m_ignoreList.size();
+            m_ignoreList.erase(std::remove_if(m_ignoreList.begin(), m_ignoreList.end(), [&](const IgnoreEntry& e) { return e.mask.CompareNoCase(first) == 0; }), m_ignoreList.end());
+            SaveIgnore();
+            Show(w, before == m_ignoreList.size() ? L"* No such entry: " + first : L"* Removed " + first + L" from the ignore list.", before == m_ignoreList.size() ? cPart : cInfo);
+            return;
+        }
+        IgnoreEntry e; e.mask = first; e.excluded = xFlag; if (!wFlag) e.network = arg;   // whatever's left after the mask is the optional [network], unless -w (any network)
+        if (anyType) { e.p = fp; e.c = fc; e.n = fn; e.t = ft; e.i = fi; e.k = fk; e.d = fd; e.s = fs; e.h = fh; e.y = fy; }
+        if (delaySecs >= 0) e.expiresAt = GetTickCount64() + (ULONGLONG)delaySecs * 1000;
+        IgnoreEntry* existing = FindIgnoreEntry(first);
+        if (existing) *existing = e; else m_ignoreList.push_back(e);
+        SaveIgnore();
+        Show(w, L"* Added " + first + L" to the ignore list.", cInfo);
+    }
+    // ---- Auto-Op / Auto-Voice / Protect: control.ini, one section per list plus a Settings section ----
+    void LoadAutoLists() {
+        m_aopList.clear(); m_avoiceList.clear(); m_protectList.clear();
+        CWinApp* a = AfxGetApp();
+        m_aopOn = a->GetProfileInt(L"Control", L"aopOn", 1) != 0;
+        m_avoiceOn = a->GetProfileInt(L"Control", L"avoiceOn", 1) != 0;
+        m_protectOn = a->GetProfileInt(L"Control", L"protectOn", 1) != 0;
+        m_autoRandomDelay = a->GetProfileInt(L"Control", L"randomDelay", 1) != 0;
+        CString path = IniPath(L"control.ini");
+        auto loadList = [&](const wchar_t* sectionPrefix, std::vector<AutoActionEntry>& list) {
+            CString countSec = CString(sectionPrefix) + L"Count";
+            int n = GetPrivateProfileIntW(countSec, L"Count", 0, path);
+            wchar_t buf[512];
+            for (int i = 0; i < n; i++) {
+                CString sec; sec.Format(L"%s%d", sectionPrefix, i);
+                AutoActionEntry e;
+                GetPrivateProfileStringW(sec, L"Mask", L"", buf, 512, path); e.mask = buf;
+                GetPrivateProfileStringW(sec, L"Channels", L"", buf, 256, path); e.channels = buf;
+                GetPrivateProfileStringW(sec, L"Network", L"", buf, 256, path); e.network = buf;
+                if (!e.mask.IsEmpty()) list.push_back(e);
+            }
+        };
+        loadList(L"Aop", m_aopList); loadList(L"Avoice", m_avoiceList); loadList(L"Protect", m_protectList);
+    }
+    void SaveAutoLists() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Control", L"aopOn", m_aopOn ? 1 : 0);
+        a->WriteProfileInt(L"Control", L"avoiceOn", m_avoiceOn ? 1 : 0);
+        a->WriteProfileInt(L"Control", L"protectOn", m_protectOn ? 1 : 0);
+        a->WriteProfileInt(L"Control", L"randomDelay", m_autoRandomDelay ? 1 : 0);
+        CString path = IniPath(L"control.ini");
+        ::DeleteFileW(path);
+        auto saveList = [&](const wchar_t* sectionPrefix, const std::vector<AutoActionEntry>& list) {
+            CString countSec = CString(sectionPrefix) + L"Count"; CString cs; cs.Format(L"%d", (int)list.size());
+            WritePrivateProfileStringW(countSec, L"Count", cs, path);
+            for (size_t i = 0; i < list.size(); i++) {
+                CString sec; sec.Format(L"%s%d", sectionPrefix, (int)i); auto& e = list[i];
+                WritePrivateProfileStringW(sec, L"Mask", e.mask, path); WritePrivateProfileStringW(sec, L"Channels", e.channels, path);
+                WritePrivateProfileStringW(sec, L"Network", e.network, path);
+            }
+        };
+        saveList(L"Aop", m_aopList); saveList(L"Avoice", m_avoiceList); saveList(L"Protect", m_protectList);
+    }
+    static bool ChannelInList(const CString& channels, const CString& chan) {
+        if (channels.IsEmpty()) return true;
+        CString tmp = channels; int pos = 0;
+        while (pos != -1) { CString tok = tmp.Tokenize(L",", pos); if (!tok.IsEmpty() && tok.CompareNoCase(chan) == 0) return true; }
+        return false;
+    }
+    static bool MatchesAutoList(const std::vector<AutoActionEntry>& list, const CString& nick, const CString& hostmask, const CString& chan, Net* net) {
+        for (auto& e : list) {
+            bool netOk = e.network.IsEmpty() || (net && (e.network.CompareNoCase(net->tag) == 0 || (!net->network.IsEmpty() && e.network.CompareNoCase(net->network) == 0)));
+            if (!netOk) continue;
+            bool maskOk = GlobMatch(e.mask, nick) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask));
+            if (maskOk && ChannelInList(e.channels, chan)) return true;
+        }
+        return false;
+    }
+    static AutoActionEntry* FindAutoEntry(std::vector<AutoActionEntry>& list, const CString& mask) { for (auto& e : list) if (e.mask.CompareNoCase(mask) == 0) return &e; return nullptr; }
+    void QueueAutoAction(Net* net, const CString& chan, const CString& nick, wchar_t mode) {
+        PendingAutoAction act; act.net = net; act.chan = chan; act.nick = nick; act.mode = mode;
+        ULONGLONG delay = m_autoRandomDelay ? (1000 + (ULONGLONG)(rand() % 6001)) : 0;   // "a random 1 to 7 seconds delay"
+        act.fireAt = GetTickCount64() + delay;
+        m_autoActionQueue.push_back(act);
+    }
+    void AutoActionTick() {
+        if (m_autoActionQueue.empty()) return;
+        ULONGLONG now = GetTickCount64();
+        for (auto it = m_autoActionQueue.begin(); it != m_autoActionQueue.end();) {
+            if (it->fireAt > now) { ++it; continue; }
+            CChatWnd* w = Find(it->net, it->chan);
+            if (w) {
+                wchar_t already = w->NickPrefixChar(it->nick);
+                bool hasStatus = it->mode == L'o' ? (already == L'@') : (already == L'@' || already == L'+');   // "if the user has already been opped/voiced then mIRC does not perform an op/voice" -- op counts as already having voice too
+                if (!hasStatus && w->NickPrefixChar(it->net->nick) == L'@') Send(it->net, L"MODE " + it->chan + (it->mode == L'o' ? L" +o " : L" +v ") + it->nick);
+            }
+            it = m_autoActionQueue.erase(it);
+        }
+    }
+    // Shared by /aop, /avoice, /protect -- same switches, same list shape, same add/remove/list/on/off behavior.
+    // One real simplification versus mIRC's own: a "type" that triggers an automatic WHOIS-based address lookup isn't
+    // implemented -- the mask you give (a plain nick, or a full nick!user@host you type yourself) is used as-is.
+    void CmdAutoList(CChatWnd* w, CString arg, std::vector<AutoActionEntry>& list, bool& onFlag, const CString& label) {
+        arg.Trim();
+        bool lFlag = false, rFlag = false, wFlag = false;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) { wchar_t c = sw[i]; if (c == L'l') lFlag = true; else if (c == L'r') rFlag = true; else if (c == L'w') wFlag = true; }
+            arg.TrimLeft();
+        }
+        if (lFlag) {
+            if (list.empty()) { Show(w, L"* " + label + L" list is empty.", cInfo); return; }
+            for (auto& e : list) { CString s; s.Format(L"* %s%s%s", (LPCWSTR)e.mask, e.channels.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.channels), e.network.IsEmpty() ? L"" : (LPCWSTR)(CString(L" [") + e.network + L"]")); Show(w, s, cInfo); }
+            return;
+        }
+        if (arg.IsEmpty()) {
+            if (rFlag) { list.clear(); SaveAutoLists(); Show(w, L"* " + label + L" list cleared.", cInfo); return; }
+            Show(w, onFlag ? L"* " + label + L" is on." : L"* " + label + L" is off.", cInfo);
+            return;
+        }
+        CString first = Word(arg); CString firstL = first; firstL.MakeLower();
+        if (firstL == L"on") { onFlag = true; SaveAutoLists(); Show(w, L"* " + label + L" on.", cInfo); return; }
+        if (firstL == L"off") { onFlag = false; SaveAutoLists(); Show(w, L"* " + label + L" off.", cInfo); return; }
+        if (rFlag) {
+            size_t before = list.size();
+            list.erase(std::remove_if(list.begin(), list.end(), [&](const AutoActionEntry& e) { return e.mask.CompareNoCase(first) == 0; }), list.end());
+            SaveAutoLists();
+            Show(w, before == list.size() ? L"* No such entry: " + first : L"* Removed " + first + L" from the " + label + L" list.", before == list.size() ? cPart : cInfo);
+            return;
+        }
+        AutoActionEntry e; e.mask = first;
+        CString tok1 = Word(arg);
+        if (!tok1.IsEmpty() && tok1[0] == L'#') { e.channels = tok1; if (!wFlag) e.network = arg; }
+        else if (!wFlag) e.network = tok1.IsEmpty() ? arg : (tok1 + (arg.IsEmpty() ? CString() : L" " + arg));
+        AutoActionEntry* existing = FindAutoEntry(list, first);
+        if (existing) *existing = e; else list.push_back(e);
+        SaveAutoLists();
+        Show(w, L"* Added " + first + L" to the " + label + L" list.", cInfo);
+    }
+    void CmdAop(CChatWnd* w, CString arg) { CmdAutoList(w, arg, m_aopList, m_aopOn, L"Auto-Op"); }
+    void CmdAvoice(CChatWnd* w, CString arg) { CmdAutoList(w, arg, m_avoiceList, m_avoiceOn, L"Auto-Voice"); }
+    void CmdProtect(CChatWnd* w, CString arg) { CmdAutoList(w, arg, m_protectList, m_protectOn, L"Protect"); }
+    // ---- Nick Colors ----
+    void LoadCnick() {
+        m_cnickList.clear();
+        CWinApp* a = AfxGetApp();
+        m_cnickOn = a->GetProfileInt(L"Cnick", L"on", 1) != 0;
+        CString path = IniPath(L"cnick.ini");
+        int n = GetPrivateProfileIntW(L"Cnick", L"Count", 0, path);
+        wchar_t buf[512];
+        for (int i = 0; i < n; i++) {
+            CString sec; sec.Format(L"Entry%d", i);
+            CNickEntry e;
+            GetPrivateProfileStringW(sec, L"Nick", L"", buf, 512, path); e.nick = buf;
+            GetPrivateProfileStringW(sec, L"Color", L"", buf, 16, path); e.colorStr = buf; e.autoColor = (e.colorStr == L"*");
+            GetPrivateProfileStringW(sec, L"Modes", L"", buf, 16, path); e.modes = buf;
+            GetPrivateProfileStringW(sec, L"Levels", L"", buf, 64, path); e.levels = buf;
+            e.anyMode = GetPrivateProfileIntW(sec, L"AnyMode", 0, path) != 0; e.noMode = GetPrivateProfileIntW(sec, L"NoMode", 0, path) != 0;
+            e.ignoreCond = GetPrivateProfileIntW(sec, L"Ignore", 0, path) != 0; e.opCond = GetPrivateProfileIntW(sec, L"Op", 0, path) != 0;
+            e.voiceCond = GetPrivateProfileIntW(sec, L"Voice", 0, path) != 0; e.protectCond = GetPrivateProfileIntW(sec, L"Protect", 0, path) != 0;
+            e.notifyCond = GetPrivateProfileIntW(sec, L"Notify", 0, path) != 0;
+            e.idleMin = GetPrivateProfileIntW(sec, L"Idle", -1, path); e.method = GetPrivateProfileIntW(sec, L"Method", 0, path);
+            if (!e.nick.IsEmpty()) m_cnickList.push_back(e);
+        }
+    }
+    void SaveCnick() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Cnick", L"on", m_cnickOn ? 1 : 0);
+        CString path = IniPath(L"cnick.ini");
+        ::DeleteFileW(path);
+        CString cs; cs.Format(L"%d", (int)m_cnickList.size());
+        WritePrivateProfileStringW(L"Cnick", L"Count", cs, path);
+        for (size_t i = 0; i < m_cnickList.size(); i++) {
+            CString sec; sec.Format(L"Entry%d", (int)i); auto& e = m_cnickList[i];
+            WritePrivateProfileStringW(sec, L"Nick", e.nick, path); 
+            WritePrivateProfileStringW(sec, L"Color", e.autoColor ? L"*" : (LPCWSTR)e.colorStr, path);
+            WritePrivateProfileStringW(sec, L"Modes", e.modes, path); 
+            WritePrivateProfileStringW(sec, L"Levels", e.levels, path);
+            WritePrivateProfileStringW(sec, L"AnyMode", e.anyMode ? L"1" : L"0", path); 
+            WritePrivateProfileStringW(sec, L"NoMode", e.noMode ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Ignore", e.ignoreCond ? L"1" : L"0", path); 
+            WritePrivateProfileStringW(sec, L"Op", e.opCond ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Voice", e.voiceCond ? L"1" : L"0", path); 
+            WritePrivateProfileStringW(sec, L"Protect", e.protectCond ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Notify", e.notifyCond ? L"1" : L"0", path);
+            CString idleS; idleS.Format(L"%d", e.idleMin); 
+            WritePrivateProfileStringW(sec, L"Idle", idleS, path);
+            CString methS; methS.Format(L"%d", e.method); 
+            WritePrivateProfileStringW(sec, L"Method", methS, path);
+        }
+    }
+    bool IsOnIgnoreList(const CString& nick, const CString& hostmask) {   // regardless of type -- used only as a /cnick -i match condition
+        for (auto& e : m_ignoreList) if (GlobMatch(e.mask, nick) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask))) return !e.excluded;
+        return false;
+    }
+    COLORREF ResolveNickColor(const CNickEntry& e, const CString& nick) {
+        if (e.autoColor) { unsigned long h = 0; for (int i = 0; i < nick.GetLength(); i++) h = h * 31 + nick[i]; return MircColor(2 + (int)(h % 13)); }   // a stable hash-based pick from a readable slice of the palette (skipping white/black)
+        return MircColor(_wtoi(e.colorStr));
+    }
+    // Finds the first matching /cnick entry for a nick in a given channel context -- "the nick color list uses the
+    // first match it finds", so list order is significant, exactly as mIRC describes.
+    CNickEntry* MatchCnick(CChatWnd* chanWnd, const CString& nick, const CString& hostmask, Net* net) {
+        if (!m_cnickOn) return nullptr;
+        for (auto& e : m_cnickList) {
+            CString mask = e.nick;
+            if (mask.Find(L'$') >= 0 || mask.Find(L'%') >= 0) mask = EvalIds(chanWnd, mask, CString());   // "you can specify %vars or $identifiers as the nick"
+            bool nickOk = GlobMatch(mask, nick) || (!hostmask.IsEmpty() && GlobMatch(mask, hostmask));
+            if (!nickOk) continue;
+            if (!e.anyMode) {
+                wchar_t prefixChar = chanWnd ? chanWnd->NickPrefixChar(nick) : 0;
+                if (e.noMode) { if (prefixChar != 0) continue; }
+                else if (!e.modes.IsEmpty() && (prefixChar == 0 || e.modes.Find(prefixChar) < 0)) continue;
+            }
+            CString chanName = chanWnd ? chanWnd->m_name : CString();
+            if (e.ignoreCond && !IsOnIgnoreList(nick, hostmask)) continue;
+            if (e.opCond && !MatchesAutoList(m_aopList, nick, hostmask, chanName, net)) continue;
+            if (e.voiceCond && !MatchesAutoList(m_avoiceList, nick, hostmask, chanName, net)) continue;
+            if (e.protectCond && !MatchesAutoList(m_protectList, nick, hostmask, chanName, net)) continue;
+            if (e.notifyCond && !FindNotifyEntry(nick)) continue;
+            return &e;
+        }
+        return nullptr;
+    }
+    void RefreshAllNickColors() { for (auto& kv : m_w) if (kv.second->m_chan) kv.second->RefreshNickColors(); }
+    void CmdCnick(CChatWnd* w, CString arg) {   // /cnick -rfaniovpylNmNsN [on|off|nick[!user@host]] [color] [modes] [levels]
+        arg.Trim();
+        bool rFlag = false, fFlag = false, aFlag = false, nFlag = false, iFlag = false, oFlag = false, vFlag = false, pFlag = false, yFlag = false;
+        int idleMin = -1, method = -1, sortPos = -1;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) {
+                wchar_t c = sw[i];
+                if (c == L'r') rFlag = true; else if (c == L'f') fFlag = true; else if (c == L'a') aFlag = true; else if (c == L'n') nFlag = true;
+                else if (c == L'i') iFlag = true; else if (c == L'o') oFlag = true; else if (c == L'v') vFlag = true; else if (c == L'p') pFlag = true; else if (c == L'y') yFlag = true;
+                else if (c == L'l') { CString digs; while (i + 1 < sw.GetLength() && iswdigit(sw[i + 1])) digs += sw[++i]; idleMin = digs.IsEmpty() ? 0 : _wtoi(digs); }
+                else if (c == L'm') { CString digs; while (i + 1 < sw.GetLength() && iswdigit(sw[i + 1])) digs += sw[++i]; method = digs.IsEmpty() ? 0 : _wtoi(digs); }
+                else if (c == L's') { CString digs; while (i + 1 < sw.GetLength() && iswdigit(sw[i + 1])) digs += sw[++i]; sortPos = digs.IsEmpty() ? 0 : _wtoi(digs); }
+            }
+            arg.TrimLeft();
+        }
+        if (arg.IsEmpty() && !rFlag) { Show(w, m_cnickOn ? L"* Nick colors on." : L"* Nick colors off.", cInfo); return; }
+        CString first = Word(arg); CString firstL = first; firstL.MakeLower();
+        if (firstL == L"on") { m_cnickOn = true; SaveCnick(); RefreshAllNickColors(); Show(w, L"* Nick colors on.", cInfo); return; }
+        if (firstL == L"off") { m_cnickOn = false; SaveCnick(); RefreshAllNickColors(); Show(w, L"* Nick colors off.", cInfo); return; }
+        if (rFlag) {
+            double idxD;
+            if (ParseNum(first, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_cnickList.size()) m_cnickList.erase(m_cnickList.begin() + (idx - 1)); }
+            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, first) || m_cnickList[i].nick.CompareNoCase(first) == 0) { m_cnickList.erase(m_cnickList.begin() + i); break; }
+            SaveCnick(); RefreshAllNickColors(); Show(w, L"* Removed from the nick color list.", cInfo);
+            return;
+        }
+        CString colorStr = Word(arg), modes = Word(arg), levels = arg;
+        CNickEntry e; e.nick = first; e.colorStr = colorStr; e.autoColor = (colorStr == L"*"); e.modes = modes; e.levels = levels;
+        e.anyMode = aFlag; e.noMode = nFlag; e.ignoreCond = iFlag; e.opCond = oFlag; e.voiceCond = vFlag; e.protectCond = pFlag; e.notifyCond = yFlag;
+        e.idleMin = idleMin; e.method = method >= 0 ? method : 0;
+        bool replaced = false;
+        if (!fFlag) for (auto& ex : m_cnickList) if (ex.nick.CompareNoCase(first) == 0) { e.method = method >= 0 ? method : ex.method; ex = e; replaced = true; break; }
+        if (!replaced) {
+            if (sortPos >= 1 && sortPos <= (int)m_cnickList.size() + 1) m_cnickList.insert(m_cnickList.begin() + (sortPos - 1), e);
+            else m_cnickList.push_back(e);
+        }
+        SaveCnick(); RefreshAllNickColors();
+        Show(w, L"* Added " + first + L" to the nick color list.", cInfo);
+    }
+    // ---- Highlight ----
+    void LoadHighlight() {
+        m_highlightList.clear();
+        CWinApp* a = AfxGetApp();
+        m_highlightOn = a->GetProfileInt(L"Highlight", L"on", 1) != 0;
+        CString path = IniPath(L"highlight.ini");
+        int n = GetPrivateProfileIntW(L"Highlight", L"Count", 0, path);
+        wchar_t buf[1024];
+        for (int i = 0; i < n; i++) {
+            CString sec; sec.Format(L"Entry%d", i);
+            HighlightEntry e;
+            GetPrivateProfileStringW(sec, L"Words", L"", buf, 1024, path); e.words = buf;
+            GetPrivateProfileStringW(sec, L"Targets", L"", buf, 512, path); e.targets = buf;
+            e.matchOn = GetPrivateProfileIntW(sec, L"MatchOn", 0, path);
+            GetPrivateProfileStringW(sec, L"Color", L"", buf, 16, path); e.colorStr = buf;
+            GetPrivateProfileStringW(sec, L"Sound", L"", buf, 512, path); e.sound = buf;
+            e.flash = GetPrivateProfileIntW(sec, L"Flash", 0, path) != 0; e.tip = GetPrivateProfileIntW(sec, L"Tip", 0, path) != 0;
+            GetPrivateProfileStringW(sec, L"Message", L"", buf, 512, path); e.message = DecodeNotes(buf);   // reuses the same \n escaping as Address Book notes
+            if (!e.words.IsEmpty()) m_highlightList.push_back(e);
+        }
+    }
+    void SaveHighlight() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Highlight", L"on", m_highlightOn ? 1 : 0);
+        CString path = IniPath(L"highlight.ini");
+        ::DeleteFileW(path);
+        CString cs; cs.Format(L"%d", (int)m_highlightList.size());
+        WritePrivateProfileStringW(L"Highlight", L"Count", cs, path);
+        for (size_t i = 0; i < m_highlightList.size(); i++) {
+            CString sec; sec.Format(L"Entry%d", (int)i); auto& e = m_highlightList[i];
+            WritePrivateProfileStringW(sec, L"Words", e.words, path); WritePrivateProfileStringW(sec, L"Targets", e.targets, path);
+            CString mo; mo.Format(L"%d", e.matchOn); WritePrivateProfileStringW(sec, L"MatchOn", mo, path);
+            WritePrivateProfileStringW(sec, L"Color", e.colorStr, path); WritePrivateProfileStringW(sec, L"Sound", e.sound, path);
+            WritePrivateProfileStringW(sec, L"Flash", e.flash ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Tip", e.tip ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Message", EncodeNotes(e.message), path);
+        }
+    }
+    static std::vector<CString> ExtractWords(const CString& text) {   // splits on anything non-alphabetic, matching "words enclosed in non-alphabetic characters"
+        std::vector<CString> words; CString cur;
+        for (int i = 0; i < text.GetLength(); i++) {
+            wchar_t c = text[i];
+            if (iswalpha(c) || c == L'\'') cur += c;
+            else { if (!cur.IsEmpty()) { words.push_back(cur); cur.Empty(); } }
+        }
+        if (!cur.IsEmpty()) words.push_back(cur);
+        return words;
+    }
+    static bool TermsMatchWhole(const CString& csv, const CString& whole) {   // used for the nickname/.targets checks -- each comma-separated term matched against the entire string
+        if (csv.IsEmpty()) return false;
+        CString tmp = csv; int pos = 0;
+        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (!t.IsEmpty() && GlobMatch(t, whole)) return true; }
+        return false;
+    }
+    // A plain (non-wildcard) word only matches a complete extracted word, since GlobMatch requires an exact match when
+    // there's nothing to wildcard; a term containing * or ? naturally matches part of a word instead, since GlobMatch
+    // already supports that -- this gives "whole word, or wildcarded for partial" for free from the one helper.
+    static bool TextMatchesHighlightWords(const CString& csv, const CString& text) {
+        if (csv.IsEmpty()) return false;
+        std::vector<CString> words = ExtractWords(text);
+        CString tmp = csv; int pos = 0;
+        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (t.IsEmpty()) continue; for (auto& wrd : words) if (GlobMatch(t, wrd)) return true; }
+        return false;
+    }
+    HighlightEntry* MatchHighlight(const CString& nick, const CString& text, const CString& targetName) {
+        if (!m_highlightOn) return nullptr;
+        for (auto& e : m_highlightList) {
+            if (!e.targets.IsEmpty() && !TermsMatchWhole(e.targets, targetName) && !TermsMatchWhole(e.targets, nick)) continue;
+            bool msgMatch = (e.matchOn == 0 || e.matchOn == 2) && TextMatchesHighlightWords(e.words, text);
+            bool nickMatch = (e.matchOn == 1 || e.matchOn == 2) && TermsMatchWhole(e.words, nick);
+            if (msgMatch || nickMatch) return &e;
+        }
+        return nullptr;
+    }
+    void FireHighlight(CChatWnd* w, HighlightEntry& e, const CString& nick, const CString& text) {
+        PlayNotifySound(e.sound);
+        CString msg = e.message.IsEmpty() ? (nick + L": " + text) : EvalIds(w, e.message, CString());
+        if (e.flash && !IsAppActive()) ::FlashWindow(m_hWnd, TRUE);
+        if (e.tip) QueueEventTip(L"Highlight", msg, w);
+    }
+    void CmdHighlight(CChatWnd* w, CString arg) {   // /highlight [on|off|-l|-r N] -- not part of the mIRC text this app's Highlight feature was built from, added for parity with every other list feature here; full add/edit is via the Address Book's Highlight tab
+        arg.Trim(); CString a = arg; a.MakeLower();
+        if (a == L"on") { m_highlightOn = true; SaveHighlight(); Show(w, L"* Highlighting on.", cInfo); return; }
+        if (a == L"off") { m_highlightOn = false; SaveHighlight(); Show(w, L"* Highlighting off.", cInfo); return; }
+        if (a == L"-l") {
+            if (m_highlightList.empty()) { Show(w, L"* Highlight list is empty.", cInfo); return; }
+            for (auto& e : m_highlightList) { CString s; s.Format(L"* %s%s", (LPCWSTR)e.words, e.targets.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.targets)); Show(w, s, cInfo); }
+            return;
+        }
+        if (arg.Left(3).MakeLower() == L"-r ") {
+            int idx = _wtoi(arg.Mid(3));
+            if (idx >= 1 && idx <= (int)m_highlightList.size()) { m_highlightList.erase(m_highlightList.begin() + (idx - 1)); SaveHighlight(); Show(w, L"* Removed.", cInfo); }
+            else Show(w, L"* No such entry.", cPart);
+            return;
+        }
+        Show(w, m_highlightOn ? L"* Highlighting is on." : L"* Highlighting is off.", cInfo);
     }
     void LoadIdentd() {
         CWinApp* a = AfxGetApp();
@@ -5769,6 +7124,42 @@ class CMainFrame : public CMDIFrameWnd {
             WritePrivateProfileStringW(sec, L"TLS", e.o.tls ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Lax", e.o.lax ? L"1" : L"0", path);
         }
     }
+    // ---- Address Book: abook.ini, same one-section-per-record pattern as servers.ini. Notes can be multi-line, which
+    // plain .ini values can't hold directly, so real newlines are escaped to a literal "\n" on save and restored on load.
+    static CString EncodeNotes(CString s) { s.Replace(L"\r\n", L"\n"); s.Replace(L"\n", L"\\n"); return s; }
+    static CString DecodeNotes(CString s) { s.Replace(L"\\n", L"\n"); return s; }
+    void LoadAbook() {
+        m_abook.clear();
+        CString path = IniPath(L"abook.ini");
+        int n = GetPrivateProfileIntW(L"Abook", L"Count", 0, path);
+        wchar_t buf[2048];
+        for (int i = 0; i < n; i++) {
+            CString sec; sec.Format(L"User%d", i);
+            AddressEntry e;
+            GetPrivateProfileStringW(sec, L"Nick", L"", buf, 256, path); e.nick = buf;
+            GetPrivateProfileStringW(sec, L"Name", L"", buf, 256, path); e.name = buf;
+            GetPrivateProfileStringW(sec, L"Email", L"", buf, 256, path); e.email = buf;
+            GetPrivateProfileStringW(sec, L"Website", L"", buf, 256, path); e.website = buf;
+            GetPrivateProfileStringW(sec, L"Address", L"", buf, 256, path); e.address = buf;
+            GetPrivateProfileStringW(sec, L"Notes", L"", buf, 2048, path); e.notes = DecodeNotes(buf);
+            GetPrivateProfileStringW(sec, L"Picture", L"", buf, 512, path); e.picture = buf;
+            if (!e.nick.IsEmpty()) m_abook.push_back(e);
+        }
+    }
+    void SaveAbook() {
+        CString path = IniPath(L"abook.ini");
+        ::DeleteFileW(path);
+        CString cs; cs.Format(L"%d", (int)m_abook.size());
+        WritePrivateProfileStringW(L"Abook", L"Count", cs, path);
+        for (size_t i = 0; i < m_abook.size(); i++) {
+            CString sec; sec.Format(L"User%d", (int)i); auto& e = m_abook[i];
+            WritePrivateProfileStringW(sec, L"Nick", e.nick, path); WritePrivateProfileStringW(sec, L"Name", e.name, path);
+            WritePrivateProfileStringW(sec, L"Email", e.email, path); WritePrivateProfileStringW(sec, L"Website", e.website, path);
+            WritePrivateProfileStringW(sec, L"Address", e.address, path); WritePrivateProfileStringW(sec, L"Notes", EncodeNotes(e.notes), path);
+            WritePrivateProfileStringW(sec, L"Picture", e.picture, path);
+        }
+    }
+    AddressEntry* FindAbookEntry(const CString& nick) { for (auto& e : m_abook) if (e.nick.CompareNoCase(nick) == 0) return &e; return nullptr; }
     afx_msg void OnAbout() { CAboutDlg d(this); d.DoModal(); }
     afx_msg void OnServerList() {
         CServerListDlg d(m_bookmarks, this);
@@ -5833,6 +7224,12 @@ class CMainFrame : public CMDIFrameWnd {
         };
         sq(0, 0, RGB(220,30,30)); sq(5, 0, RGB(30,160,30)); sq(0, 5, RGB(30,90,220)); sq(5, 5, RGB(230,180,0));
     }
+    static void DrawAddressBookGlyph(CDC& mem, int baseX) {   // a simple head-and-shoulders "contact" icon, for the Address Book button
+        CBrush br(RGB(90, 110, 180)); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(40, 40, 40)); CPen* op = mem.SelectObject(&pn);
+        mem.Ellipse(CRect(baseX + 5, 1, baseX + 11, 7));      // head
+        mem.Ellipse(CRect(baseX + 2, 7, baseX + 14, 17));     // shoulders (bottom edge clipped by the cell, which is fine)
+        mem.SelectObject(ob); mem.SelectObject(op);
+    }
     static void DrawOnlineTimerGlyph(CDC& mem, int baseX) {   // a small clock face with two hands, for the Online Timer button
         CPen pn(PS_SOLID, 1, RGB(20, 110, 70)); CPen* op = mem.SelectObject(&pn);
         CBrush* ob = (CBrush*)mem.SelectStockObject(NULL_BRUSH);
@@ -5843,13 +7240,13 @@ class CMainFrame : public CMDIFrameWnd {
         mem.SelectObject(op); mem.SelectObject(ob);
     }
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
-        const int N = 9;
+        const int N = 10;
         CBitmap resBmp;
         bool haveRes = resBmp.LoadBitmap(102) != 0;   // id 102 in MiniIRC.rc ("toolbar.bmp"); absent in the plain one-file build
         int W = haveRes ? 24 : 16, H = W; m_tbIcon = W;
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0);
         if (haveRes) {
-            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, colors, online timer (9 icons)
+            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, address book, online timer, colors (10 icons)
         } else {
             CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
             CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
@@ -5877,28 +7274,30 @@ class CMainFrame : public CMDIFrameWnd {
               CPoint pts[10]; for (int k = 0; k < 10; k++) pts[k] = CPoint(cx + off[k][0], cy + off[k][1]);
               mem.Polygon(pts, 10);
               mem.SelectObject(ob); mem.SelectObject(op); }   // star = favorites glyph
-            DrawOnlineTimerGlyph(mem, 7 * W);   // 8th cell: Online Timer
-            DrawColorsGlyph(mem, 8 * W);        // 9th cell: Colors
+            DrawAddressBookGlyph(mem, 7 * W);   // 8th cell: Address Book
+            DrawOnlineTimerGlyph(mem, 8 * W);   // 9th cell: Online Timer
+            DrawColorsGlyph(mem, 9 * W);        // 10th cell: Colors
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
         m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        TBBUTTON b[13] = {};
+        TBBUTTON b[14] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
         b[3].iBitmap = 2; b[3].idCommand = IDM_SERVERS; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
         b[4].iBitmap = 6; b[4].idCommand = IDM_CHANFAVS; b[4].fsState = TBSTATE_ENABLED; b[4].fsStyle = TBSTYLE_BUTTON;   // channel favorites
-        b[5].iBitmap = 7; b[5].idCommand = IDM_ONLINETIMER; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;   // online timer
-        b[6].iBitmap = 8; b[6].idCommand = IDM_COLORS; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;    // colors
-        b[7].fsStyle = TBSTYLE_SEP;
-        b[8].iBitmap = 3; b[8].idCommand = IDM_CASCADE; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;
-        b[9].iBitmap = 4; b[9].idCommand = IDM_TILE; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;
-        b[10].fsStyle = TBSTYLE_SEP;
-        b[11].iBitmap = 5; b[11].idCommand = IDM_ABOUT; b[11].fsState = TBSTATE_ENABLED; b[11].fsStyle = TBSTYLE_BUTTON;
-        b[12].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(13, b);
+        b[5].iBitmap = 7; b[5].idCommand = IDM_ABOOK; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;   // address book
+        b[6].iBitmap = 8; b[6].idCommand = IDM_ONLINETIMER; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;   // online timer
+        b[7].iBitmap = 9; b[7].idCommand = IDM_COLORS; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;    // colors
+        b[8].fsStyle = TBSTYLE_SEP;
+        b[9].iBitmap = 3; b[9].idCommand = IDM_CASCADE; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;
+        b[10].iBitmap = 4; b[10].idCommand = IDM_TILE; b[10].fsState = TBSTATE_ENABLED; b[10].fsStyle = TBSTYLE_BUTTON;
+        b[11].fsStyle = TBSTYLE_SEP;
+        b[12].iBitmap = 5; b[12].idCommand = IDM_ABOUT; b[12].fsState = TBSTATE_ENABLED; b[12].fsStyle = TBSTYLE_BUTTON;
+        b[13].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(14, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
@@ -5936,7 +7335,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
         if (id == 2003) { TrayAnimTick(); return; }   // tray icon activity flash: same reasoning
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
-        TipTick(); TipCheckActivation(); SoundTick();
+        TipTick(); TipCheckActivation(); SoundTick(); NotifyTick(); AutoActionTick();
         if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
     }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
@@ -6027,6 +7426,7 @@ class CMainFrame : public CMDIFrameWnd {
     DECLARE_MESSAGE_MAP()
 public:
     void Start() {
+        srand((unsigned)time(nullptr));   // seeds rand(), used by Auto-Op/Auto-Voice's random delay; without this it would replay the exact same "random" sequence every single run
         LoadOpts(); 
         LoadFont(); 
         LoadBookmarks(); 
@@ -6040,6 +7440,12 @@ public:
 		LoadOnlineTimer();
 		LoadIdentd();
 		if (m_identdEnabled && !m_identdOnlyConnecting) StartIdentd();
+		LoadAbook();
+		LoadNotify();
+		LoadIgnore();
+		LoadAutoLists();
+		LoadCnick();
+		LoadHighlight();
 		LoadTraySettings();
 		LoadTipsSettings();
 		{
@@ -6076,6 +7482,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
         f.AppendMenu(MF_STRING, IDM_TRAY, L"&Tray...");
         f.AppendMenu(MF_STRING, IDM_TIPS, L"T&ips...");
+        f.AppendMenu(MF_STRING, IDM_ABOOK, L"&Address Book...\tAlt+B");
         { CMenu ps; ps.CreatePopupMenu();   // File > Popups: edit each of the five popup menus
           ps.AppendMenu(MF_STRING, IDM_POPEDIT0, L"&Status window...");
           ps.AppendMenu(MF_STRING, IDM_POPEDIT1, L"&Channel window...");
@@ -6205,7 +7612,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)

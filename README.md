@@ -31,10 +31,11 @@ scripting
 ~~tray icon~~ 
 ~~identd server~~     
 DCC chat/file send/server      
-address book  
-notify  
-~~tip notify balloon~~      
-theme  
+~~address book~~      
+~~notify~~  
+~~play sounds via /splay~~    
+~~tip notify balloon~~  
+~~theme colors for text and background~~  
 ~~logging of status and chat - it will have option to disable and enable logging and location of logs~~  
 more commands  
 many more.....  
