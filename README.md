@@ -24,6 +24,7 @@ you may get random bugs, glitches, or crashes.
 ~~aliases system~~  
 ~~popup system~~  
 ~~variables system~~  
+identifiers 
 script editor to let you to edit aliases/vars/scripts   
 scripting  
 ~~online timer~~  

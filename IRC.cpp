@@ -2784,7 +2784,7 @@ public:
         : book(bk), notifyBook(nbk), highlightBook(hbk), aopList(aop), avoiceList(avo), protectList(prot), ignoreList(ign), cnickList(cnk), initialNick(startNick) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(360); t.push_back(330);
-        t.push_back(0); t.push_back(0); S(L"mIRC Address Book"); t.push_back(9); S(DEFAULT_FONT);
+        t.push_back(0); t.push_back(0); S(L"Address Book"); t.push_back(9); S(DEFAULT_FONT);
         Item(BS_PUSHBUTTON | WS_TABSTOP, 6, 6, 50, 14, IDC_AB_TABUSERS, 0x0080, L"Users");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 58, 6, 50, 14, IDC_AB_TABWHOIS, 0x0080, L"Whois");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 6, 50, 14, IDC_AB_TABNOTIFY, 0x0080, L"Notify");
@@ -3133,7 +3133,7 @@ public:
     }
     afx_msg void OnHelpBtn() {
         AfxMessageBox(L"Users: basic contact info per nickname; Email/Visit launch your mail client or browser.\n\n"
-            L"Notify: nicknames mIRC checks for online/offline, with an optional note, sounds, and auto-/whois on join. "
+            L"Notify: nicknames IRC checks for online/offline, with an optional note, sounds, and auto-/whois on join. "
             L"Checked every ~60 seconds while connected (this client doesn't support the newer, server-specific instant "
             L"WATCH extension some networks offer instead).\n\n"
             L"Chat (DCC) and Control/Colors/Highlight are planned for future updates.", MB_ICONINFORMATION);
