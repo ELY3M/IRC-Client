@@ -249,6 +249,68 @@ static CString IniPath(LPCWSTR name) {   // e.g. IniPath(L"servers.ini") -> full
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     CString p = exe; return p.Left(p.ReverseFind(L'\\') + 1) + name;
 }
+static bool GlobMatch(const wchar_t* pat, const wchar_t* s, bool cs = false);   // forward declaration, default arg here (not at the later real definition -- C++ only allows it once, and it must be visible at FindInDirRecursive's call site below, which comes first in the file)
+// ---------------- File and directory identifiers: small, self-contained path/file helpers ----------------
+static CString ExeDir() { wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH); CString p = exe; return p.Left(p.ReverseFind(L'\\') + 1); }
+static CString ExePath() { wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH); return exe; }
+static CString NoFilePart(const CString& path) { int s = path.ReverseFind(L'\\'); return s >= 0 ? path.Left(s + 1) : CString(); }
+static CString NoPathPart(const CString& path) { int s = path.ReverseFind(L'\\'); return s >= 0 ? path.Mid(s + 1) : path; }
+static CString FileExtOf(const CString& path) { CString n = NoPathPart(path); int d = n.ReverseFind(L'.'); return d > 0 ? n.Mid(d + 1) : CString(); }
+static CString FileNameNoExt(const CString& path) { CString n = NoPathPart(path); int d = n.ReverseFind(L'.'); return d > 0 ? n.Left(d) : n; }
+static CString ShortFnOf(const CString& path) { wchar_t buf[MAX_PATH] = {}; return ::GetShortPathNameW(path, buf, MAX_PATH) ? CString(buf) : path; }
+static CString LongFnOf(const CString& path) { wchar_t buf[MAX_PATH] = {}; return ::GetLongPathNameW(path, buf, MAX_PATH) ? CString(buf) : path; }
+static bool PathExistsFn(const CString& path) { return ::GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
+static bool IsDirPath(const CString& path) { DWORD a = ::GetFileAttributesW(path); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
+static bool IsFilePathFn(const CString& path) { DWORD a = ::GetFileAttributesW(path); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }
+static CString MakeValidFn(CString s) { for (int i = 0; i < s.GetLength(); i++) if (wcschr(L"\\/:*?\"<>|", s[i])) s.SetAt(i, L'_'); return s; }
+static CString MakeTempName(CString dir) {   // deliberately doesn't create the file (unlike GetTempFileName) to avoid an unexpected side effect from just asking for a name
+    if (dir.IsEmpty()) dir = ExeDir(); else if (dir.Right(1) != L"\\") dir += L"\\";
+    CString name; name.Format(L"%s~irc%08X%04X.tmp", (LPCWSTR)dir, (unsigned)::GetTickCount(), rand() & 0xFFFF);
+    return name;
+}
+static DWORD Crc32Of(const unsigned char* data, size_t len) {
+    static DWORD table[256]; static bool init = false;
+    if (!init) { for (DWORD i = 0; i < 256; i++) { DWORD c = i; for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); table[i] = c; } init = true; }
+    DWORD crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+static unsigned __int64 Crc64Of(const unsigned char* data, size_t len) {   // ECMA-182 polynomial, the common CRC-64 variant
+    static unsigned __int64 table[256]; static bool init = false;
+    const unsigned __int64 poly = 0xC96C5795D7870F42ULL;
+    if (!init) { for (int i = 0; i < 256; i++) { unsigned __int64 c = i; for (int k = 0; k < 8; k++) c = (c & 1) ? (poly ^ (c >> 1)) : (c >> 1); table[i] = c; } init = true; }
+    unsigned __int64 crc = ~0ULL;
+    for (size_t i = 0; i < len; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+static std::vector<CString> ReadAllLinesOf(const CString& path) {
+    std::vector<CString> lines; CStdioFile f;
+    if (f.Open(path, CFile::modeRead | CFile::typeText)) { CString ln; while (f.ReadString(ln)) lines.push_back(ln); }
+    return lines;
+}
+// A basic recursive directory/file search for $finddir/$findfile -- supports the dir+wildcard+N+depth lookup form
+// only; the @window-fill and per-match-command forms described for these identifiers aren't implemented.
+static bool FindInDirRecursive(const CString& dir, const CString& wildcardCsv, bool wantDirs, int& counter, int targetN, int depth, int maxDepth, CString& result) {
+    if (maxDepth >= 0 && depth > maxDepth) return false;
+    CString base = dir; if (base.Right(1) != L"\\") base += L"\\";
+    WIN32_FIND_DATAW fd; HANDLE h = ::FindFirstFileW(base + L"*", &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::vector<CString> subdirs;
+    do {
+        CString name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (isDir) subdirs.push_back(name);
+        if (isDir == wantDirs) {
+            CString wc = wildcardCsv; bool matched = false; int pos = 0;
+            while (pos != -1) { CString one = wc.Tokenize(L";", pos); one.Trim(); if (!one.IsEmpty() && GlobMatch(one, name, false)) { matched = true; break; } }
+            if (matched) { counter++; if (counter == targetN) { result = base + name; ::FindClose(h); return true; } }
+        }
+    } while (::FindNextFileW(h, &fd));
+    ::FindClose(h);
+    for (auto& sd : subdirs) if (FindInDirRecursive(base + sd, wildcardCsv, wantDirs, counter, targetN, depth + 1, maxDepth, result)) return true;
+    return false;
+}
 // Loads any GDI+-supported image file (bmp/jpg/png/gif/...), scales it to fit w x h while preserving
 // aspect ratio, and returns a plain GDI HBITMAP the caller owns. Returns nullptr if the file can't be read.
 static HBITMAP LoadImageFileScaled(const CString& path, int w, int h) {
@@ -505,6 +567,11 @@ struct PlayItem {
 // window is far more likely to be closed mid-flight than a network is to be destroyed).
 struct AddressEntry {   // one Address Book record, keyed by nickname -- see CAddressBookDlg, /abook
     CString nick, name, email, website, address, notes, picture;
+};
+struct WhoisCapture {   // structured fields for the Address Book's Whois tab, filled in as numerics/CTCP replies arrive -- see WhoisCapturing() and the 311/312/317/319/301/313 handlers
+    CString nick, name, address, channels, server, serverDesc, status, away, ctcpReply;
+    long idleSecs = -1;
+    bool got311 = false, got317 = false, got319 = false;
 };
 struct HighlightEntry {   // one highlight rule -- see MatchHighlight, the Address Book's Highlight tab
     CString words;      // comma-separated words/wildcards, matched whole-word against the message text
@@ -1854,7 +1921,7 @@ static bool CalcExpr(const CString& s, double& out) {
     CString t = s; CalcParser cp; cp.p = t; out = cp.expr(); cp.ws();
     return cp.ok && *cp.p == 0;
 }
-static bool GlobMatch(const wchar_t* pat, const wchar_t* s, bool cs = false) {   // * and ?; case-insensitive unless cs
+static bool GlobMatch(const wchar_t* pat, const wchar_t* s, bool cs) {   // * and ?; case-insensitive unless cs -- default arg is on the forward declaration near the top of the file instead, since it must be visible there too
     const wchar_t* star = nullptr; const wchar_t* ss = s;
     while (*s) {
         if (*pat == L'*') { star = pat++; ss = s; }
@@ -2732,7 +2799,12 @@ enum {
     IDC_AB_CT_LISTSEL, IDC_AB_CT_LIST, IDC_AB_CT_ADDTEXT, IDC_AB_CT_ADD, IDC_AB_CT_REMOVE, IDC_AB_CT_ENABLE,
     IDC_AB_CT_RANDOMDELAY, IDC_AB_CT_HINT,
     IDC_AB_CO_LIST, IDC_AB_CO_ADDTEXT, IDC_AB_CO_ADD, IDC_AB_CO_REMOVE, IDC_AB_CO_ENABLE, IDC_AB_CO_HINT,
-    IDC_AB_WH_TEXT, IDC_AB_WH_LOOKUP, IDC_AB_WH_LBL,
+    IDC_AB_WH_NICK, IDC_AB_WH_LOOKUP,
+    IDC_AB_WH_LBLNICK, IDC_AB_WH_LBLNAME, IDC_AB_WH_NAME, IDC_AB_WH_LBLADDR, IDC_AB_WH_ADDRESS,
+    IDC_AB_WH_LBLCHAN, IDC_AB_WH_CHANNELS, IDC_AB_WH_LBLIDLE, IDC_AB_WH_IDLE, IDC_AB_WH_LBLAWAY, IDC_AB_WH_AWAY,
+    IDC_AB_WH_LBLSERVER, IDC_AB_WH_SERVER, IDC_AB_WH_LBLSTATUS, IDC_AB_WH_STATUS, IDC_AB_WH_LBLCTCP, IDC_AB_WH_CTCP,
+    IDC_AB_WH_ADD, IDC_AB_WH_FIND, IDC_AB_WH_COPY, IDC_AB_WH_CONNECT,
+    IDC_AB_WH_PING, IDC_AB_WH_TIME, IDC_AB_WH_VERSION, IDC_AB_WH_FINGER,
     // static labels, each needing its own id -- GetDlgItem(0xFFFF) can only ever resolve to one control, so sharing
     // that id across many labels meant only one of them was ever actually being hidden/shown by SetTab
     IDC_AB_LBL_NICK, IDC_AB_LBL_NAME, IDC_AB_LBL_EMAIL, IDC_AB_LBL_WEBSITE, IDC_AB_LBL_ADDRESS, IDC_AB_LBL_NOTES,
@@ -2756,7 +2828,7 @@ class CAddressBookDlg : public CDialog {
     static const int kHighlightPanelIds[21];
     static const int kControlPanelIds[9];
     static const int kColorsPanelIds[7];
-    static const int kWhoisPanelIds[3];
+    static const int kWhoisPanelIds[27];
 public:
     std::vector<AddressEntry>* book;      // owned by CMainFrame; edited in place, saved by the caller after DoModal
     std::vector<NotifyEntry>* notifyBook; // same deal, for the Notify tab
@@ -2770,7 +2842,11 @@ public:
     std::function<void(int, const CString&)> onControlCmd;   // listSel 0=aop 1=avoice 2=protect 3=ignore; feeds the text straight into the matching /command's own parser
     std::function<void(const CString&)> onCnickCmd;          // feeds the text straight into /cnick's own parser
     std::function<void(const CString&)> onStartWhoisLookup;  // nick to look up; replies arrive asynchronously, polled via onGetWhoisCapture
-    std::function<CString()> onGetWhoisCapture;
+    std::function<WhoisCapture()> onGetWhoisCapture;
+    std::function<void(const WhoisCapture&)> onWhoisAdd;     // "Add": add/update this nick in the Address Book's Users tab from the whois data
+    std::function<bool(const CString&)> onWhoisFind;         // "Find": true and switches to the Users tab if a matching entry exists
+    std::function<void(const CString&)> onWhoisConnect;      // "Connect": opens a new connection to the server this user is on
+    std::function<void(const CString&, const CString&)> onCtcpRequest;   // (nick, "PING"/"TIME"/"VERSION"/"FINGER")
     int curIndex = -1;        // index into *book of the entry currently shown, or -1 for a new/blank one
     int notifyIndex = -1;     // same, for *notifyBook
     int highlightIndex = -1;  // same, for *highlightBook
@@ -2873,10 +2949,34 @@ public:
         Item(BS_PUSHBUTTON | WS_TABSTOP, 278, 72, 72, 14, IDC_AB_CO_REMOVE, 0x0080, L"Remove");
         Item(BS_AUTOCHECKBOX | WS_TABSTOP, 200, 92, 150, 10, IDC_AB_CO_ENABLE, 0x0080, L"Nick colors enabled");
         Item(SS_LEFT, 200, 110, 150, 112, IDC_AB_CO_HINT, 0x0082, L"Examples:\nnick 4 (color 4)\nnick * (auto-color)\nnick 4 @%+ (only when opped/voiced)\nnick -r (remove)");
-        // Whois panel (looks up the Users tab's current nickname)
-        Item(SS_LEFT, 14, 36, 300, 9, IDC_AB_WH_LBL, 0x0082, L"Shows the /whois reply for the Users tab's nickname.");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 14, 50, 90, 14, IDC_AB_WH_LOOKUP, 0x0080, L"Lookup");
-        Item(WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 14, 70, 330, 160, IDC_AB_WH_TEXT, 0x0081, L"");
+        // Whois panel: structured fields laid out like mIRC's own Whois tab, rather than a plain text dump
+        Item(SS_RIGHT, 20, 38, 78, 10, IDC_AB_WH_LBLNICK, 0x0082, L"Nickname:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 104, 36, 150, 14, IDC_AB_WH_NICK, 0x0081, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 260, 36, 76, 14, IDC_AB_WH_LOOKUP, 0x0080, L"Whois");
+        Item(SS_RIGHT, 20, 56, 78, 10, IDC_AB_WH_LBLNAME, 0x0082, L"Name:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 56, 150, 10, IDC_AB_WH_NAME, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 260, 54, 76, 14, IDC_AB_WH_ADD, 0x0080, L"Add");
+        Item(SS_RIGHT, 20, 72, 78, 10, IDC_AB_WH_LBLADDR, 0x0082, L"Address:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 72, 150, 10, IDC_AB_WH_ADDRESS, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 260, 70, 76, 14, IDC_AB_WH_FIND, 0x0080, L"Find");
+        Item(SS_RIGHT, 20, 90, 78, 10, IDC_AB_WH_LBLCHAN, 0x0082, L"Channels:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 90, 150, 10, IDC_AB_WH_CHANNELS, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 260, 88, 76, 14, IDC_AB_WH_COPY, 0x0080, L"Copy");
+        Item(SS_RIGHT, 20, 108, 78, 10, IDC_AB_WH_LBLIDLE, 0x0082, L"Idle time:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 108, 150, 10, IDC_AB_WH_IDLE, 0x0082, L"");
+        Item(SS_RIGHT, 20, 126, 78, 10, IDC_AB_WH_LBLAWAY, 0x0082, L"Away:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 126, 150, 10, IDC_AB_WH_AWAY, 0x0082, L"");
+        Item(SS_RIGHT, 20, 144, 78, 10, IDC_AB_WH_LBLSERVER, 0x0082, L"Server:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 144, 150, 10, IDC_AB_WH_SERVER, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 260, 142, 76, 14, IDC_AB_WH_CONNECT, 0x0080, L"Connect");
+        Item(SS_RIGHT, 20, 162, 78, 10, IDC_AB_WH_LBLSTATUS, 0x0082, L"Status:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 162, 150, 10, IDC_AB_WH_STATUS, 0x0082, L"");
+        Item(SS_RIGHT, 20, 180, 78, 10, IDC_AB_WH_LBLCTCP, 0x0082, L"CTCP:");
+        Item(SS_LEFT | SS_NOPREFIX, 104, 180, 230, 10, IDC_AB_WH_CTCP, 0x0082, L"");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 104, 202, 76, 14, IDC_AB_WH_PING, 0x0080, L"Ping");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 184, 202, 76, 14, IDC_AB_WH_TIME, 0x0080, L"Time");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 104, 220, 76, 14, IDC_AB_WH_VERSION, 0x0080, L"Version");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 184, 220, 76, 14, IDC_AB_WH_FINGER, 0x0080, L"Finger");
         // placeholder panel (shown over the same area for not-yet-implemented tabs)
         Item(SS_CENTER, 24, 120, 310, 40, IDC_AB_PLACEHOLDER, 0x0082, L"");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 120, 300, 60, 16, IDOK, 0x0080, L"OK");
@@ -2949,7 +3049,21 @@ public:
         CheckDlgButton(IDC_AB_CT_ENABLE, enabled);
     }
     // ---- Whois tab ----
-    void RefreshWhoisText() { if (onGetWhoisCapture) SetDlgItemText(IDC_AB_WH_TEXT, onGetWhoisCapture()); }
+    void RefreshWhoisFields() {
+        if (!onGetWhoisCapture) return;
+        WhoisCapture c = onGetWhoisCapture();
+        SetDlgItemText(IDC_AB_WH_NAME, c.name);
+        SetDlgItemText(IDC_AB_WH_ADDRESS, c.address);
+        SetDlgItemText(IDC_AB_WH_CHANNELS, c.channels);
+        if (c.idleSecs >= 0) { CString s; s.Format(L"%ldhrs %ldmins %ldsecs", c.idleSecs / 3600, (c.idleSecs / 60) % 60, c.idleSecs % 60); SetDlgItemText(IDC_AB_WH_IDLE, s); }
+        else SetDlgItemText(IDC_AB_WH_IDLE, L"");
+        SetDlgItemText(IDC_AB_WH_AWAY, c.away.IsEmpty() ? CString(L"None") : c.away);
+        CString serverStr = c.server; if (!c.serverDesc.IsEmpty()) serverStr += (serverStr.IsEmpty() ? CString() : CString(L" ")) + c.serverDesc;
+        SetDlgItemText(IDC_AB_WH_SERVER, serverStr);
+        SetDlgItemText(IDC_AB_WH_STATUS, c.status);
+        SetDlgItemText(IDC_AB_WH_CTCP, c.ctcpReply);
+    }
+    CString WhoisTabNick() { CString n; GetDlgItemText(IDC_AB_WH_NICK, n); n.Trim(); return n; }
     // ---- Colors tab (Nick Colors) ----
     void RefreshColorsList() {
         CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_CO_LIST);
@@ -2969,7 +3083,7 @@ public:
         for (int id : kWhoisPanelIds) GetDlgItem(id)->ShowWindow(whois ? SW_SHOW : SW_HIDE);
         bool anyReal = users || notify || highlight || control || colors || whois;
         GetDlgItem(IDC_AB_PLACEHOLDER)->ShowWindow(anyReal ? SW_HIDE : SW_SHOW);
-        if (whois) RefreshWhoisText();
+        if (whois) RefreshWhoisFields();
         if (control) RefreshControlList();
         if (colors) RefreshColorsList();
     }
@@ -3072,13 +3186,51 @@ public:
         return fd.DoModal() == IDOK ? fd.GetPathName() : CString();
     }
     afx_msg void OnShowNotifyWindow() { if (onShowNotifyWindow) onShowNotifyWindow(); }
-    afx_msg void OnTimer(UINT_PTR) { if (curTab == IDC_AB_TABWHOIS) RefreshWhoisText(); }
+    afx_msg void OnTimer(UINT_PTR) { if (curTab == IDC_AB_TABWHOIS) RefreshWhoisFields(); }
     afx_msg void OnWhoisLookup() {
-        CString nick; GetDlgItemText(IDC_AB_NICK, nick); nick.Trim();
-        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname on the Users tab first.", MB_ICONWARNING); return; }
-        SetDlgItemText(IDC_AB_WH_TEXT, L"Looking up " + nick + L"...\r\n");
+        CString nick = WhoisTabNick();
+        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname first.", MB_ICONWARNING); return; }
+        SetDlgItemText(IDC_AB_WH_NAME, L""); SetDlgItemText(IDC_AB_WH_ADDRESS, L""); SetDlgItemText(IDC_AB_WH_CHANNELS, L"");
+        SetDlgItemText(IDC_AB_WH_IDLE, L""); SetDlgItemText(IDC_AB_WH_AWAY, L""); SetDlgItemText(IDC_AB_WH_SERVER, L"");
+        SetDlgItemText(IDC_AB_WH_STATUS, L""); SetDlgItemText(IDC_AB_WH_CTCP, L"");
         if (onStartWhoisLookup) onStartWhoisLookup(nick);
     }
+    afx_msg void OnWhoisAdd() {   // adds (or updates) this nick in the Users tab, pre-filled from the whois data
+        CString nick = WhoisTabNick();
+        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname first.", MB_ICONWARNING); return; }
+        if (onGetWhoisCapture && onWhoisAdd) { WhoisCapture c = onGetWhoisCapture(); c.nick = nick; onWhoisAdd(c); }
+        RefreshNickList();
+        AfxMessageBox(L"Added to the Users tab.", MB_ICONINFORMATION);
+    }
+    afx_msg void OnWhoisFind() {   // switches to the Users tab if this nick is already in the address book
+        CString nick = WhoisTabNick();
+        if (nick.IsEmpty()) { AfxMessageBox(L"Enter a nickname first.", MB_ICONWARNING); return; }
+        if (onWhoisFind && onWhoisFind(nick)) { OnTabUsers(); SetDlgItemText(IDC_AB_NICK, nick); OnNickChange(); }
+        else AfxMessageBox(L"Not found in the Address Book.", MB_ICONINFORMATION);
+    }
+    afx_msg void OnWhoisCopy() {   // copies a short text summary of the whois fields to the clipboard
+        if (!onGetWhoisCapture) return;
+        WhoisCapture c = onGetWhoisCapture();
+        CString s; s.Format(L"Nickname: %s\r\nName: %s\r\nAddress: %s\r\nChannels: %s\r\nServer: %s %s\r\nStatus: %s\r\nAway: %s",
+            (LPCWSTR)WhoisTabNick(), (LPCWSTR)c.name, (LPCWSTR)c.address, (LPCWSTR)c.channels, (LPCWSTR)c.server, (LPCWSTR)c.serverDesc,
+            (LPCWSTR)c.status, (LPCWSTR)(c.away.IsEmpty() ? CString(L"None") : c.away));
+        if (OpenClipboard()) {
+            EmptyClipboard();
+            HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.GetLength() + 1) * sizeof(wchar_t));
+            if (h) { wchar_t* p = (wchar_t*)GlobalLock(h); wcscpy_s(p, s.GetLength() + 1, s); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT, h); }
+            CloseClipboard();
+        }
+    }
+    afx_msg void OnWhoisConnect() {   // connects to the same server this user is on
+        if (!onGetWhoisCapture || !onWhoisConnect) return;
+        WhoisCapture c = onGetWhoisCapture();
+        if (c.server.IsEmpty()) { AfxMessageBox(L"No server known yet -- run Whois first.", MB_ICONWARNING); return; }
+        onWhoisConnect(c.server);
+    }
+    afx_msg void OnCtcpPing() { CString n = WhoisTabNick(); if (!n.IsEmpty() && onCtcpRequest) onCtcpRequest(n, L"PING"); }
+    afx_msg void OnCtcpTime() { CString n = WhoisTabNick(); if (!n.IsEmpty() && onCtcpRequest) onCtcpRequest(n, L"TIME"); }
+    afx_msg void OnCtcpVersion() { CString n = WhoisTabNick(); if (!n.IsEmpty() && onCtcpRequest) onCtcpRequest(n, L"VERSION"); }
+    afx_msg void OnCtcpFinger() { CString n = WhoisTabNick(); if (!n.IsEmpty() && onCtcpRequest) onCtcpRequest(n, L"FINGER"); }
     afx_msg void OnHighlightListSel() {
         CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_HL_LIST);
         int sel = lb->GetCurSel();
@@ -3155,7 +3307,13 @@ const int CAddressBookDlg::kNotifyPanelIds[19] = { IDC_AB_NF_LIST, IDC_AB_NF_NIC
 const int CAddressBookDlg::kHighlightPanelIds[21] = { IDC_AB_HL_ENABLE, IDC_AB_HL_LIST, IDC_AB_HL_WORDS, IDC_AB_HL_TARGETS, IDC_AB_HL_MATCHMSG, IDC_AB_HL_MATCHNICK, IDC_AB_HL_MATCHBOTH, IDC_AB_HL_COLOR, IDC_AB_HL_SOUND, IDC_AB_HL_BROWSESOUND, IDC_AB_HL_FLASH, IDC_AB_HL_TIP, IDC_AB_HL_MESSAGE, IDC_AB_HL_ADD, IDC_AB_HL_REMOVE, IDC_AB_HL_LBL_WORDS, IDC_AB_HL_LBL_TARGETS, IDC_AB_HL_LBL_MATCHON, IDC_AB_HL_LBL_COLOR, IDC_AB_HL_LBL_SOUND, IDC_AB_HL_LBL_MESSAGE };
 const int CAddressBookDlg::kControlPanelIds[9] = { IDC_AB_CT_LISTSEL, IDC_AB_CT_LIST, IDC_AB_CT_ADDTEXT, IDC_AB_CT_ADD, IDC_AB_CT_REMOVE, IDC_AB_CT_ENABLE, IDC_AB_CT_RANDOMDELAY, IDC_AB_CT_HINT, IDC_AB_CT_LBL_ADD };
 const int CAddressBookDlg::kColorsPanelIds[7] = { IDC_AB_CO_LIST, IDC_AB_CO_ADDTEXT, IDC_AB_CO_ADD, IDC_AB_CO_REMOVE, IDC_AB_CO_ENABLE, IDC_AB_CO_HINT, IDC_AB_CO_LBL_ADD };
-const int CAddressBookDlg::kWhoisPanelIds[3] = { IDC_AB_WH_TEXT, IDC_AB_WH_LOOKUP, IDC_AB_WH_LBL };
+const int CAddressBookDlg::kWhoisPanelIds[27] = {
+    IDC_AB_WH_LBLNICK, IDC_AB_WH_NICK, IDC_AB_WH_LOOKUP, IDC_AB_WH_LBLNAME, IDC_AB_WH_NAME, IDC_AB_WH_ADD,
+    IDC_AB_WH_LBLADDR, IDC_AB_WH_ADDRESS, IDC_AB_WH_FIND, IDC_AB_WH_LBLCHAN, IDC_AB_WH_CHANNELS, IDC_AB_WH_COPY,
+    IDC_AB_WH_LBLIDLE, IDC_AB_WH_IDLE, IDC_AB_WH_LBLAWAY, IDC_AB_WH_AWAY, IDC_AB_WH_LBLSERVER, IDC_AB_WH_SERVER, IDC_AB_WH_CONNECT,
+    IDC_AB_WH_LBLSTATUS, IDC_AB_WH_STATUS, IDC_AB_WH_LBLCTCP, IDC_AB_WH_CTCP,
+    IDC_AB_WH_PING, IDC_AB_WH_TIME, IDC_AB_WH_VERSION, IDC_AB_WH_FINGER
+};
 BEGIN_MESSAGE_MAP(CAddressBookDlg, CDialog)
     ON_BN_CLICKED(IDC_AB_TABUSERS, OnTabUsers) ON_BN_CLICKED(IDC_AB_TABWHOIS, OnTabWhois) ON_BN_CLICKED(IDC_AB_TABNOTIFY, OnTabNotify)
     ON_BN_CLICKED(IDC_AB_TABCONTROL, OnTabControl) ON_BN_CLICKED(IDC_AB_TABCOLORS, OnTabColors) ON_BN_CLICKED(IDC_AB_TABHIGHLIGHT, OnTabHighlight)
@@ -3170,7 +3328,10 @@ BEGIN_MESSAGE_MAP(CAddressBookDlg, CDialog)
     ON_CBN_SELCHANGE(IDC_AB_CT_LISTSEL, OnControlListSelChange) ON_BN_CLICKED(IDC_AB_CT_ADD, OnControlAdd) ON_BN_CLICKED(IDC_AB_CT_REMOVE, OnControlRemove)
     ON_BN_CLICKED(IDC_AB_CT_ENABLE, OnControlEnableToggle)
     ON_BN_CLICKED(IDC_AB_CO_ADD, OnColorsAdd) ON_BN_CLICKED(IDC_AB_CO_REMOVE, OnColorsRemove)
-    ON_BN_CLICKED(IDC_AB_WH_LOOKUP, OnWhoisLookup) ON_WM_TIMER()
+    ON_BN_CLICKED(IDC_AB_WH_LOOKUP, OnWhoisLookup) ON_BN_CLICKED(IDC_AB_WH_ADD, OnWhoisAdd) ON_BN_CLICKED(IDC_AB_WH_FIND, OnWhoisFind)
+    ON_BN_CLICKED(IDC_AB_WH_COPY, OnWhoisCopy) ON_BN_CLICKED(IDC_AB_WH_CONNECT, OnWhoisConnect)
+    ON_BN_CLICKED(IDC_AB_WH_PING, OnCtcpPing) ON_BN_CLICKED(IDC_AB_WH_TIME, OnCtcpTime)
+    ON_BN_CLICKED(IDC_AB_WH_VERSION, OnCtcpVersion) ON_BN_CLICKED(IDC_AB_WH_FINGER, OnCtcpFinger) ON_WM_TIMER()
 END_MESSAGE_MAP()
 
 class COnlineTimerDlg : public CDialog {
@@ -3280,11 +3441,14 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_soundDirWave, m_soundDirMidi, m_soundDirMp3, m_soundDirWma, m_soundDirOgg;
     // ---- Address Book (phase 1: the Users tab only -- Whois/Notify/Control/Colors/Highlight are placeholders for now) ----
     std::vector<AddressEntry> m_abook;
-    // ---- Address Book Whois tab: captures the text of WHOIS numerics while a lookup is in progress for the dialog ----
-    CString m_uwhoCapturingNick, m_uwhoCaptureBuffer;
-    void WhoisCaptureAppend(const CString& nick, const CString& text) {
-        if (!m_uwhoCapturingNick.IsEmpty() && m_uwhoCapturingNick.CompareNoCase(nick) == 0) m_uwhoCaptureBuffer += text + L"\r\n";
-    }
+    // ---- File and directory identifiers: small bits of state a few of them need ----
+    int m_readn = 0;                      // $readn: the line number matched by the last $read()
+    CString m_dccGetDir;                  // $getdir: stored for compatibility, since this client has no DCC to actually save anything there
+    CString m_sfstate;                    // $sfstate: "cancel" after the last $sfile/$sdir/$msfile was dismissed without a selection
+    std::vector<CString> m_msfileResults; // $msfile(N): the file list from the most recent $msfile(dir,title,oktext) call
+    // ---- Address Book Whois tab: captures structured WHOIS fields while a lookup is in progress for the dialog ----
+    CString m_uwhoCapturingNick; WhoisCapture m_uwhoCapture;
+    bool WhoisCapturing(const CString& nick) const { return !m_uwhoCapturingNick.IsEmpty() && m_uwhoCapturingNick.CompareNoCase(nick) == 0; }
     // ---- Notify list: ISON-polled, like mIRC's own default (no IRCv3 WATCH support -- see NotifyTick) ----
     std::vector<NotifyEntry> m_notify;
     bool m_notifyOn = true, m_notifyPopupOnConnect = false, m_notifyOnlyInWindow = false, m_notifyInActiveWindow = false, m_notifyShowAddrTime = false;
@@ -3565,6 +3729,17 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"avoice") { val = m_avoiceOn ? L"$true" : L"$false"; return true; }
         if (name == L"protect") { val = m_protectOn ? L"$true" : L"$false"; return true; }
         if (name == L"highlight") { val = m_highlightOn ? L"$true" : L"$false"; return true; }
+        // ---- File and directory identifiers: the bare (no-argument) ones ----
+        if (name == L"ircdir") { val = ExeDir(); return true; }
+        if (name == L"ircexe") { val = ExePath(); return true; }
+        if (name == L"ircini") { val = L"IRC.ini"; return true; }
+        if (name == L"filtered") { val = L"0"; return true; }   // /filter isn't implemented in this client
+        if (name == L"readn") { val.Format(L"%d", m_readn); return true; }
+        if (name == L"getdir") { val = m_dccGetDir; return true; }   // stored for compatibility; nothing actually saves here, since there's no DCC in this client
+        if (name == L"mididir") { val = m_soundDirMidi; return true; }
+        if (name == L"logdir") { val = m_logFolder; return true; }
+        if (name == L"sfstate") { val = m_sfstate; return true; }
+        if (name == L"tempfn") { val = MakeTempName(CString()); return true; }
         if (name == L"inwave" || name == L"inmidi" || name == L"insong") {   // $inwave.fname / .pos / .length / .pause (bare identifier, no parens -- see the EvalIds property-parsing fix above)
             SoundChannel& ch = name == L"inwave" ? m_waveChan : name == L"inmidi" ? m_midiChan : m_mp3Chan;
             if (prop.IsEmpty()) { val = (ch.open && ch.playing) ? L"$true" : L"$false"; return true; }
@@ -3695,7 +3870,7 @@ class CMainFrame : public CMDIFrameWnd {
         int n = 0; bool wild = pat.FindOneOf(L"*?") >= 0; CString pk = VKey(pat);
         auto sweep = [&](VarMap& m, bool isGlobal) {
             for (auto it = m.begin(); it != m.end();) {
-                if (wild ? GlobMatch(pk, it->first) : it->first == pk) { it = m.erase(it); n++; if (isGlobal) m_varsDirty = true; }
+                if (wild ? GlobMatch(pk, it->first, false) : it->first == pk) { it = m.erase(it); n++; if (isGlobal) m_varsDirty = true; }
                 else ++it;
             }
         };
@@ -3841,7 +4016,7 @@ class CMainFrame : public CMDIFrameWnd {
             int M = comma >= 0 ? _wtoi(a.Mid(comma + 1)) : 0;
             CNickEntry* found = nullptr; int pos = 0; double idxD;
             if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_cnickList.size()) { found = &m_cnickList[idx - 1]; pos = idx; } }
-            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, sel) || m_cnickList[i].nick.CompareNoCase(sel) == 0) { found = &m_cnickList[i]; pos = (int)i + 1; break; }
+            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, sel, false) || m_cnickList[i].nick.CompareNoCase(sel) == 0) { found = &m_cnickList[i]; pos = (int)i + 1; break; }
             if (!found) {
                 if (prop == L"color") val.Format(L"%d", (int)cText);   // "'Normal Text' color, or if M=1, 'Listbox text' color" -- this app doesn't keep those as two separate colors, so both report the same one
                 else val = L"0";
@@ -3863,16 +4038,273 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = EvalIds(w, rawArgs, params); a.Trim();
             AutoActionEntry* found = nullptr; double idxD;
             if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)list.size()) found = &list[idx - 1]; }
-            else for (auto& e : list) if (GlobMatch(e.mask, a) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
+            else for (auto& e : list) if (GlobMatch(e.mask, a, false) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
             if (!found) { val.Empty(); return true; }
             if (prop == L"type") val = found->channels; else if (prop == L"network") val = found->network; else val = found->mask;
+            return true;
+        }
+        // ---- File and directory identifiers ----
+        if (name == L"exists") { val = PathExistsFn(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
+        if (name == L"isfile") { val = IsFilePathFn(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
+        if (name == L"isdir") { val = IsDirPath(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
+        if (name == L"nofile") { val = NoFilePart(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"nopath") { val = NoPathPart(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"shortfn") { val = ShortFnOf(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"longfn") { val = LongFnOf(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"mkfn" || name == L"mknickfn") { val = MakeValidFn(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"mklogfn") { val = MakeValidFn(EvalIds(w, rawArgs, params)); return true; }   // this client's logging has no "dated logfiles" toggle to append a date for, so the name comes back unchanged (just sanitized)
+        if (name == L"tempfn") { val = MakeTempName(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"samepath") {
+            CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
+            if (c < 0) { val = L"$false"; return true; }
+            CString p1 = a.Left(c), p2 = a.Mid(c + 1); p1.Trim(); p2.Trim();
+            wchar_t full1[MAX_PATH] = {}, full2[MAX_PATH] = {};
+            ::GetFullPathNameW(p1, MAX_PATH, full1, nullptr); ::GetFullPathNameW(p2, MAX_PATH, full2, nullptr);
+            val = (ShortFnOf(full1).CompareNoCase(ShortFnOf(full2)) == 0) ? L"$true" : L"$false";
+            return true;
+        }
+        if (name == L"lines") {
+            CString a = EvalIds(w, rawArgs, params);
+            val.Format(L"%d", (int)ReadAllLinesOf(a).size());
+            return true;
+        }
+        if (name == L"file") {   // $file(filename): size, ctime, mtime, atime, shortfn, longfn, attr, path, name, ext -- .sig/.version not implemented (would need PE resource parsing)
+            CString a = EvalIds(w, rawArgs, params);
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            if (!::GetFileAttributesExW(a, GetFileExInfoStandard, &fad)) { val.Empty(); return true; }
+            auto toStr = [](FILETIME ft) { SYSTEMTIME st, lst; ::FileTimeToSystemTime(&ft, &st); ::SystemTimeToTzSpecificLocalTime(nullptr, &st, &lst); CTime ct(lst.wYear, lst.wMonth, lst.wDay, lst.wHour, lst.wMinute, lst.wSecond); return ct.Format(L"%a %b %d %H:%M:%S %Y"); };
+            if (prop == L"size") { ULARGE_INTEGER sz; sz.HighPart = fad.nFileSizeHigh; sz.LowPart = fad.nFileSizeLow; val.Format(L"%llu", sz.QuadPart); }
+            else if (prop == L"ctime") val = toStr(fad.ftCreationTime);
+            else if (prop == L"mtime") val = toStr(fad.ftLastWriteTime);
+            else if (prop == L"atime") val = toStr(fad.ftLastAccessTime);
+            else if (prop == L"shortfn") val = ShortFnOf(a);
+            else if (prop == L"longfn") val = LongFnOf(a);
+            else if (prop == L"attr") {
+                CString s; if (fad.dwFileAttributes & FILE_ATTRIBUTE_READONLY) s += L"r"; if (fad.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE) s += L"a";
+                if (fad.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) s += L"s"; if (fad.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) s += L"h";
+                if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) s += L"d";
+                val = s;
+            }
+            else if (prop == L"path") val = NoFilePart(a);
+            else if (prop == L"name") val = FileNameNoExt(a);
+            else if (prop == L"ext") val = FileExtOf(a);
+            else val = a;
+            return true;
+        }
+        if (name == L"disk") {   // $disk(path|N): type, free, label, size, unc, path
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            double nD;
+            if (ParseNum(a, nD)) {
+                int n = (int)nD; DWORD drives = ::GetLogicalDrives();
+                if (n == 0) { int cnt = 0; for (int i = 0; i < 26; i++) if (drives & (1u << i)) cnt++; val.Format(L"%d", cnt); return true; }
+                int idx = 0; wchar_t letter = 0;
+                for (int i = 0; i < 26 && !letter; i++) if (drives & (1u << i)) { idx++; if (idx == n) letter = (wchar_t)(L'A' + i); }
+                if (!letter) { val.Empty(); return true; }
+                a.Format(L"%c:\\", letter);
+            }
+            if (a.Right(1) != L"\\") a += L"\\";
+            if (prop.IsEmpty()) { val = PathExistsFn(a) ? L"$true" : L"$false"; return true; }
+            if (prop == L"type") { UINT t = ::GetDriveTypeW(a); val = t == DRIVE_REMOVABLE ? L"removable" : t == DRIVE_FIXED ? L"fixed" : t == DRIVE_REMOTE ? L"remote" : t == DRIVE_CDROM ? L"cdrom" : t == DRIVE_RAMDISK ? L"ramdisk" : L"unknown"; }
+            else if (prop == L"free" || prop == L"size") { ULARGE_INTEGER avail, total, freeb; if (::GetDiskFreeSpaceExW(a, &avail, &total, &freeb)) val.Format(L"%llu", (prop == L"free" ? avail : total).QuadPart); else val = L"0"; }
+            else if (prop == L"label" || prop == L"unc") { wchar_t vol[MAX_PATH] = {}; ::GetVolumeInformationW(a, vol, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0); val = vol; }
+            else if (prop == L"path") val = a;
+            else val = PathExistsFn(a) ? L"$true" : L"$false";
+            return true;
+        }
+        if (name == L"sysdir") {   // $sysdir(item): profile, desktop, documents, downloads, music, pictures, videos
+            CString a = EvalIds(w, rawArgs, params); a.MakeLower(); a.Trim();
+            GUID folderId;
+            if (a == L"profile") folderId = FOLDERID_Profile; 
+            else if (a == L"desktop") folderId = FOLDERID_Desktop;
+            else if (a == L"documents") folderId = FOLDERID_Documents; 
+            else if (a == L"downloads") folderId = FOLDERID_Downloads;
+            else if (a == L"music") folderId = FOLDERID_Music; 
+            else if (a == L"pictures") folderId = FOLDERID_Pictures;
+            else if (a == L"system") folderId = FOLDERID_System;
+            else if (a == L"videos") folderId = FOLDERID_Videos; 
+            else { val.Empty(); return true; }
+            PWSTR path = nullptr;
+            if (SUCCEEDED(::SHGetKnownFolderPath(folderId, 0, nullptr, &path))) { val = path; ::CoTaskMemFree(path); } else val.Empty();
+            return true;
+        }
+        if (name == L"crc" || name == L"crc64") {   // $crc(text|&binvar|filename,[N]): N=0 text, 1 &binvar (not implemented, this client has no binary-variable system), 2 filename (default)
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L','); CString item = c >= 0 ? a.Left(c) : a; CString nStr = c >= 0 ? a.Mid(c + 1) : CString(); item.Trim(); nStr.Trim();
+            int mode = nStr.IsEmpty() ? 2 : _wtoi(nStr);
+            std::string bytes;
+            if (mode == 0) { CStringA a8(item); bytes.assign(a8.GetString(), a8.GetLength()); }
+            else if (mode == 1) { val.Empty(); return true; }
+            else { CFile f; if (!f.Open(item, CFile::modeRead)) { val.Empty(); return true; } ULONGLONG len = f.GetLength(); bytes.resize((size_t)len); if (len) f.Read(&bytes[0], (UINT)len); }
+            if (name == L"crc") val.Format(L"%lu", Crc32Of((const unsigned char*)bytes.data(), bytes.size()));
+            else val.Format(L"%llu", Crc64Of((const unsigned char*)bytes.data(), bytes.size()));
+            return true;
+        }
+        if (name == L"getdir") { val = m_dccGetDir; return true; }   // $getdir(filename): same stored path regardless of filename/type, since no per-type DCC directory config exists here
+        if (name == L"read") {   // $read(filename, [ntswrp], [matchtext], [N]) -- 'r' (regex) is treated the same as 'w' (wildcard); true regex matching isn't implemented
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            if (parts.empty()) { val.Empty(); return true; }
+            CString filename = parts[0]; filename.Trim();
+            CString switches = parts.size() > 1 ? parts[1] : CString(); switches.Trim();
+            CString matchtext = parts.size() > 2 ? parts[2] : CString(); matchtext.Trim();
+            CString nStr = parts.size() > 3 ? parts[3] : CString(); nStr.Trim();
+            bool noEval = switches.Find(L'n') >= 0, treatText = switches.Find(L't') >= 0;
+            bool doSearch = switches.Find(L's') >= 0 || switches.Find(L'w') >= 0 || switches.Find(L'r') >= 0;
+            std::vector<CString> lines = ReadAllLinesOf(filename);
+            m_readn = 0;
+            if (lines.empty()) { val.Empty(); return true; }
+            bool firstIsCount = !treatText && IsAllDigits(lines[0]);
+            int startIdx = firstIsCount ? 1 : 0;
+            int effectiveCount = (int)lines.size() - startIdx;
+            if (doSearch) {
+                int from = nStr.IsEmpty() ? 0 : _wtoi(nStr); if (from < 0) from = 0;
+                for (int i = from; i < (int)lines.size(); i++) {
+                    CString ln = lines[i]; bool matched;
+                    if (switches.Find(L's') >= 0) matched = ln.Left(matchtext.GetLength()).CompareNoCase(matchtext) == 0;
+                    else matched = GlobMatch(matchtext, ln, false);
+                    if (matched) {
+                        m_readn = i + 1;
+                        val = (switches.Find(L's') >= 0) ? ln.Mid(matchtext.GetLength()) : ln;
+                        val.TrimLeft();
+                        if (!noEval) val = EvalIds(w, val, params);
+                        return true;
+                    }
+                }
+                val.Empty(); return true;
+            }
+            int n = nStr.IsEmpty() ? 0 : _wtoi(nStr);
+            if (n == 0) {
+                if (firstIsCount) { val = lines[0]; return true; }
+                if (effectiveCount <= 0) { val.Empty(); return true; }
+                int pick = startIdx + (rand() % effectiveCount);
+                m_readn = pick + 1; val = lines[pick];
+            } else {
+                int idx = startIdx + (n - 1);
+                if (idx < 0 || idx >= (int)lines.size()) { val.Empty(); return true; }
+                m_readn = idx + 1; val = lines[idx];
+            }
+            if (!noEval) val = EvalIds(w, val, params);
+            return true;
+        }
+        if (name == L"readini") {   // $readini(filename, [np], section, item)
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            if (parts.size() < 3) { val.Empty(); return true; }
+            CString filename = parts[0]; filename.Trim();
+            CString section, item, switches;
+            if (parts.size() >= 4) { switches = parts[1]; section = parts[2]; item = parts[3]; } else { section = parts[1]; item = parts[2]; }
+            section.Trim(); item.Trim(); switches.Trim();
+            wchar_t buf[2048] = {}; const wchar_t* sentinel = L"\x01NOTFOUND";
+            ::GetPrivateProfileStringW(section, item, sentinel, buf, 2048, filename);
+            if (CString(buf) == sentinel) { val.Empty(); return true; }
+            val = buf;
+            if (switches.Find(L'n') < 0) val = EvalIds(w, val, params);
+            return true;
+        }
+        if (name == L"ini") {   // $ini(file,topic/N,item/N)
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            if (parts.size() < 2) { val.Empty(); return true; }
+            CString filename = parts[0]; filename.Trim(); CString topicSel = parts[1]; topicSel.Trim();
+            wchar_t secBuf[32768] = {}; ::GetPrivateProfileSectionNamesW(secBuf, 32768, filename);
+            std::vector<CString> sections; { wchar_t* p = secBuf; while (*p) { sections.push_back(p); p += wcslen(p) + 1; } }
+            double topicNumD; bool topicIsNum = ParseNum(topicSel, topicNumD);
+            if (parts.size() == 2) {
+                if (topicIsNum) { int idx = (int)topicNumD; if (idx == 0) { val.Format(L"%d", (int)sections.size()); return true; } val = (idx >= 1 && idx <= (int)sections.size()) ? sections[idx - 1] : CString(); return true; }
+                for (size_t i = 0; i < sections.size(); i++) if (sections[i].CompareNoCase(topicSel) == 0) { val.Format(L"%d", (int)i + 1); return true; }
+                val = L"0"; return true;
+            }
+            CString topicName = topicIsNum ? (((int)topicNumD >= 1 && (int)topicNumD <= (int)sections.size()) ? sections[(int)topicNumD - 1] : CString()) : topicSel;
+            if (topicName.IsEmpty()) { val.Empty(); return true; }
+            CString itemSel = parts[2]; itemSel.Trim();
+            wchar_t itemBuf[32768] = {}; ::GetPrivateProfileSectionW(topicName, itemBuf, 32768, filename);
+            std::vector<CString> itemNames; { wchar_t* p = itemBuf; while (*p) { CString line = p; int eq = line.Find(L'='); itemNames.push_back(eq >= 0 ? line.Left(eq) : line); p += wcslen(p) + 1; } }
+            double itemNumD; bool itemIsNum = ParseNum(itemSel, itemNumD);
+            if (itemIsNum) { int idx = (int)itemNumD; if (idx == 0) { val.Format(L"%d", (int)itemNames.size()); return true; } val = (idx >= 1 && idx <= (int)itemNames.size()) ? itemNames[idx - 1] : CString(L"0"); return true; }
+            for (size_t i = 0; i < itemNames.size(); i++) if (itemNames[i].CompareNoCase(itemSel) == 0) { val.Format(L"%d", (int)i + 1); return true; }
+            val = L"0"; return true;
+        }
+        if (name == L"finddir" || name == L"findfile") {   // $finddir/$findfile(dir,wildcard,N,depth[,@window|command]) -- only the N-th-match lookup form is implemented; the @window-fill and per-match-command forms are not
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            if (parts.size() < 2) { val.Empty(); return true; }
+            CString dir = parts[0]; dir.Trim(); CString wildcard = parts[1]; wildcard.Trim();
+            int targetN = 1; if (parts.size() > 2) { double nD; if (ParseNum(parts[2], nD)) targetN = (int)nD; }
+            int maxDepth = -1; if (parts.size() > 3) { double dD; if (ParseNum(parts[3], dD)) maxDepth = (int)dD; }
+            int counter = 0; CString result;
+            bool found = FindInDirRecursive(dir, wildcard, name == L"finddir", counter, targetN, 0, maxDepth, result);
+            val = found ? result : CString();
+            return true;
+        }
+        if (name == L"sfile") {   // $sfile(dir,title,oktext): the standard file-open dialog
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            CString dir = parts.size() > 0 ? parts[0] : CString(); CString title = parts.size() > 1 ? parts[1] : CString(L"Select File");
+            m_sfstate.Empty();
+            CFileDialog fd(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"All Files (*.*)|*.*||", this);
+            if (!dir.IsEmpty()) fd.m_ofn.lpstrInitialDir = dir;
+            fd.m_ofn.lpstrTitle = title;
+            if (fd.DoModal() == IDOK) val = fd.GetPathName(); else { m_sfstate = L"cancel"; val.Empty(); }
+            return true;
+        }
+        if (name == L"sdir") {   // $sdir(dir,title): the standard folder-browse dialog
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            CString title = parts.size() > 1 ? parts[1] : CString(L"Select Folder");
+            m_sfstate.Empty();
+            wchar_t path[MAX_PATH] = {};
+            BROWSEINFOW bi = {}; bi.hwndOwner = m_hWnd; bi.pszDisplayName = path; bi.lpszTitle = title; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl = ::SHBrowseForFolderW(&bi);
+            if (pidl) { ::SHGetPathFromIDListW(pidl, path); ::CoTaskMemFree(pidl); val = path; } else { m_sfstate = L"cancel"; val.Empty(); }
+            return true;
+        }
+        if (name == L"msfile") {   // $msfile(dir,title,oktext) triggers the dialog and returns the count; $msfile(N) (a single numeric arg) returns the Nth file from that last run
+            CString a = EvalIds(w, rawArgs, params);
+            double nD;
+            if (ParseNum(a, nD)) { int idx = (int)nD; val = (idx >= 1 && idx <= (int)m_msfileResults.size()) ? m_msfileResults[idx - 1] : CString(); return true; }
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            CString dir = parts.size() > 0 ? parts[0] : CString(); CString title = parts.size() > 1 ? parts[1] : CString(L"Select Files");
+            m_sfstate.Empty(); m_msfileResults.clear();
+            std::vector<wchar_t> buf(16384, 0);
+            CFileDialog fd(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_ALLOWMULTISELECT | OFN_EXPLORER, L"All Files (*.*)|*.*||", this);
+            fd.m_ofn.lpstrFile = buf.data(); fd.m_ofn.nMaxFile = (DWORD)buf.size();
+            if (!dir.IsEmpty()) fd.m_ofn.lpstrInitialDir = dir;
+            fd.m_ofn.lpstrTitle = title;
+            if (fd.DoModal() == IDOK) { POSITION pos = fd.GetStartPosition(); while (pos) m_msfileResults.push_back(fd.GetNextPathName(pos)); val.Format(L"%d", (int)m_msfileResults.size()); }
+            else { m_sfstate = L"cancel"; val = L"0"; }
+            return true;
+        }
+        if (name == L"abook") {   // $abook(nick,N): properties nick, info, email, website, picture, note -- "noteN" in the spec all map to this one stored notes field
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); t.Trim(); parts.push_back(t); } }
+            AddressEntry* found = nullptr;
+            if (parts.size() == 1) {
+                double nD;
+                if (ParseNum(parts[0], nD)) { int idx = (int)nD; if (idx >= 1 && idx <= (int)m_abook.size()) found = &m_abook[idx - 1]; }
+                else for (auto& e : m_abook) if (GlobMatch(parts[0], e.nick, false)) { found = &e; break; }
+            } else if (parts.size() >= 2) {
+                int n = _wtoi(parts[1]); int cnt = 0;
+                for (auto& e : m_abook) if (GlobMatch(parts[0], e.nick, false)) { cnt++; if (cnt == n) { found = &e; break; } }
+            }
+            if (!found) { val.Empty(); return true; }
+            if (prop == L"nick") val = found->nick; else if (prop == L"email") val = found->email; else if (prop == L"website") val = found->website;
+            else if (prop == L"picture") val = found->picture; else if (prop == L"info" || prop.Left(4) == L"note") val = found->notes;
+            else val = found->nick;
+            return true;
+        }
+        if (name == L"alias") {   // $alias(N/filename): this client has one flat alias list (aliases.ini), not multiple alias files, so this is necessarily simplified
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            double nD;
+            if (a.IsEmpty() || (ParseNum(a, nD) && (int)nD == 0)) { val = L"1"; return true; }
+            if (ParseNum(a, nD)) { val = (int)nD == 1 ? CString(L"aliases.ini") : CString(); return true; }
+            val = a.CompareNoCase(L"aliases.ini") == 0 ? a : CString();
             return true;
         }
         if (name == L"ignore") {   // $ignore(address|N) -- the matching list entry, or the Nth one; .type .network .secs
             CString a = EvalIds(w, rawArgs, params); a.Trim();
             IgnoreEntry* found = nullptr; double idxD;
             if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_ignoreList.size()) found = &m_ignoreList[idx - 1]; }
-            else for (auto& e : m_ignoreList) if (GlobMatch(e.mask, a) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
+            else for (auto& e : m_ignoreList) if (GlobMatch(e.mask, a, false) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
             if (!found) { val.Empty(); return true; }
             if (prop == L"type") {
                 CString types; if (found->p) types += L"p"; if (found->c) types += L"c"; if (found->n) types += L"n"; if (found->t) types += L"t"; if (found->i) types += L"i";
@@ -3929,7 +4361,7 @@ class CMainFrame : public CMDIFrameWnd {
             double nn = 1; if (c >= 0 && !ParseNum(a.Mid(c + 1), nn)) return false;
             std::vector<CChatWnd*> customs; for (auto& kv : m_w) if (kv.second->m_custom) customs.push_back(kv.second);
             CChatWnd* cw = nullptr;
-            if (!sel.IsEmpty() && sel[0] == L'@') { int idx = 0; for (auto* x : customs) if (GlobMatch(sel, x->m_name) && ++idx == (int)nn) { cw = x; break; } }
+            if (!sel.IsEmpty() && sel[0] == L'@') { int idx = 0; for (auto* x : customs) if (GlobMatch(sel, x->m_name, false) && ++idx == (int)nn) { cw = x; break; } }
             else { double idxD; if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)customs.size()) cw = customs[idx - 1]; } }
             if (!cw) { val.Empty(); return true; }
             CRect r; cw->GetWindowRect(r); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&r, 2);
@@ -4003,9 +4435,9 @@ class CMainFrame : public CMDIFrameWnd {
             double nn = 1; if (c >= 0 && !ParseNum(EvalIds(w, rawArgs.Mid(c + 1), params), nn)) return false;
             CString pk = VKey(pat); bool wild = pk.FindOneOf(L"*?") >= 0;
             std::vector<std::pair<VarEntry*, bool>> hits;
-            if (!m_scopes.empty()) for (auto& kv : m_scopes.back().locals) if (wild ? GlobMatch(pk, kv.first) : kv.first == pk) hits.push_back({ &kv.second, true });
+            if (!m_scopes.empty()) for (auto& kv : m_scopes.back().locals) if (wild ? GlobMatch(pk, kv.first, false) : kv.first == pk) hits.push_back({ &kv.second, true });
             for (auto& kv : m_vars) {
-                if (!(wild ? GlobMatch(pk, kv.first) : kv.first == pk)) continue;
+                if (!(wild ? GlobMatch(pk, kv.first, false) : kv.first == pk)) continue;
                 if (!m_scopes.empty() && m_scopes.back().locals.count(kv.first)) continue;   // shadowed by a local of the same name
                 hits.push_back({ &kv.second, false });
             }
@@ -4344,7 +4776,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (op == L"isin") { CString a = lv, b = rv; a.MakeLower(); b.MakeLower(); r = b.Find(a) >= 0; }
         else if (op == L"isincs") r = rv.Find(lv) >= 0;
-        else if (op == L"iswm") r = GlobMatch(lv, rv);      // the wildcard pattern is on the left
+        else if (op == L"iswm") r = GlobMatch(lv, rv, false);      // the wildcard pattern is on the left
         else if (op == L"iswmcs") r = GlobMatch(lv, rv, true);
         else if (op == L"ischan") r = !lv.IsEmpty() && wcschr(L"#&+!", lv[0]) != nullptr;
         return neg ? !r : r;
@@ -4967,6 +5399,7 @@ class CMainFrame : public CMDIFrameWnd {
                     unsigned long rtt = ::GetTickCount() - sent;
                     CString ms; ms.Format(L"%lu", rtt);
                     Show(Status(net), L"[CTCP PING reply from " + nick + L": " + ms + L"ms]", cPart);
+                    if (WhoisCapturing(nick)) m_uwhoCapture.ctcpReply = L"PING: " + ms + L"ms";
                     return;
                 }
                 if (!notice) {
@@ -4977,6 +5410,7 @@ class CMainFrame : public CMDIFrameWnd {
                 }
                 //this is to let you know that someone CTCPed you.    
                 //might we should reply to unknown CTCPs
+                if (notice && WhoisCapturing(nick)) m_uwhoCapture.ctcpReply = txt;   // a reply to a VERSION/TIME/FINGER we sent for the Address Book's Whois tab
                 if (!IsIgnored(net, nick, prefix, L't')) Show(Status(net), L"[CTCP " + txt + L" from " + nick + L"]", cCTCP);
                 return;
             }
@@ -5105,24 +5539,42 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"366") {}
         else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cText); Send(net, L"NICK " + net->nick); }
         //whois stuff
-        else if (cmd == L"311") { CString s = P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)); Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); }   // RPL_WHOISUSER: nick user host * :realname
-        else if (cmd == L"312") { CString s = P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)); Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); } // RPL_WHOISSERVER
+        else if (cmd == L"311") {   // RPL_WHOISUSER: nick user host * :realname
+            CString s = P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)); Note(net, s, cWhois);
+            if (WhoisCapturing(P(1))) { m_uwhoCapture.nick = P(1); m_uwhoCapture.address = P(2) + L"@" + P(3); m_uwhoCapture.name = P(5); m_uwhoCapture.got311 = true; }
+        }
+        else if (cmd == L"312") {   // RPL_WHOISSERVER
+            CString s = P(1) + L" is on server " + P(2) + (P(3).IsEmpty() ? CString() : L" " + P(3)); Note(net, s, cWhois);
+            if (WhoisCapturing(P(1))) { m_uwhoCapture.server = P(2); m_uwhoCapture.serverDesc = P(3); }
+        }
         else if (cmd == L"317") {   // RPL_WHOISIDLE: nick idle [signon] :seconds idle, signon time
             long idle = _wtol(P(2));
             CString s; s.Format(L"%s has been idle for %ldh %ldm %lds", (LPCWSTR)P(1), idle / 3600, (idle / 60) % 60, idle % 60);
             CString signon = P(3);
             if (!signon.IsEmpty() && IsAllDigits(signon)) { CTime ct((time_t)_wtoi64(signon)); s += L", signed on " + ct.Format(L"%a %b %d %H:%M:%S %Y"); }
-            Note(net, s, cWhois); WhoisCaptureAppend(P(1), s);
+            Note(net, s, cWhois);
+            if (WhoisCapturing(P(1))) { m_uwhoCapture.idleSecs = idle; m_uwhoCapture.got317 = true; }
         }
-        else if (cmd == L"318") { CString s = P(1) + L" End of /WHOIS list."; Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); }  //End of /WHOIS list. //-- End of WHOIS -- // RPL_ENDOFWHOIS
-        else if (cmd == L"319") { CString s = P(1) + L" is on channels: " + P(2); Note(net, s, cWhois); WhoisCaptureAppend(P(1), s); }  // RPL_WHOISCHANNELS
-        else if (cmd == L"301" || cmd == L"313" || cmd == L"330" || cmd == L"338" || cmd == L"378" || cmd == L"379" || cmd == L"671") {
-            // other common WHOIS-block lines (away, IRC operator, logged-in-as, actual host, connecting-from, user modes,
-            // secure connection -- numbers and exact wording vary by server); joined the same way the old generic
-            // fallback did, just consistently colored with the rest of the WHOIS block instead of falling through to it
+        else if (cmd == L"318") { Note(net, P(1) + L" End of /WHOIS list.", cWhois); }  // RPL_ENDOFWHOIS
+        else if (cmd == L"319") {   // RPL_WHOISCHANNELS
+            CString s = P(1) + L" is on channels: " + P(2); Note(net, s, cWhois);
+            if (WhoisCapturing(P(1))) { m_uwhoCapture.channels = P(2); m_uwhoCapture.got319 = true; }
+        }
+        else if (cmd == L"301") {   // RPL_AWAY: nick :away message
+            Note(net, P(1) + L" is away: " + P(2), cWhois);
+            if (WhoisCapturing(P(1))) m_uwhoCapture.away = P(2);
+        }
+        else if (cmd == L"313") {   // RPL_WHOISOPERATOR: nick :is an IRC operator (exact wording varies by server, but this numeric always means that)
+            Note(net, P(1) + L" " + P(2), cWhois);
+            if (WhoisCapturing(P(1))) m_uwhoCapture.status = L"IRC Operator";
+        }
+        else if (cmd == L"330" || cmd == L"338" || cmd == L"378" || cmd == L"379" || cmd == L"671") {
+            // other common WHOIS-block lines (logged-in-as, actual host, connecting-from, user modes, secure
+            // connection -- numbers and exact wording vary by server); joined the same way the old generic fallback
+            // did, just consistently colored with the rest of the WHOIS block instead of falling through to it.
+            // Not captured into any of the Whois tab's dedicated fields -- there isn't one for these.
             CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
-            CString s = j.IsEmpty() ? raw : j;
-            Note(net, s, cWhois); WhoisCaptureAppend(P(1), s);
+            Note(net, j.IsEmpty() ? raw : j, cWhois);
         }
         else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
             CString trailing = P(1); int tp = 0;
@@ -5749,13 +6201,36 @@ class CMainFrame : public CMDIFrameWnd {
         };
         dlg.onCnickCmd = [this](const CString& text) { CmdCnick(nullptr, text); };
         dlg.onStartWhoisLookup = [this](const CString& nick) {
-            m_uwhoCapturingNick = nick; m_uwhoCaptureBuffer.Empty();
+            m_uwhoCapturingNick = nick; m_uwhoCapture = WhoisCapture();
             Net* net = nullptr; for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
-            if (net) Send(net, L"WHOIS " + nick); else m_uwhoCaptureBuffer = L"Not connected to a server.\r\n";
+            if (net) Send(net, L"WHOIS " + nick); else AfxMessageBox(L"Not connected to a server.", MB_ICONINFORMATION);
         };
-        dlg.onGetWhoisCapture = [this] { return m_uwhoCaptureBuffer; };
+        dlg.onGetWhoisCapture = [this] { return m_uwhoCapture; };
+        dlg.onWhoisAdd = [this](const WhoisCapture& c) {
+            AddressEntry* existing = FindAbookEntry(c.nick);
+            AddressEntry e = existing ? *existing : AddressEntry();
+            e.nick = c.nick; if (!c.name.IsEmpty()) e.name = c.name; if (!c.address.IsEmpty()) e.address = c.address;
+            if (existing) *existing = e; else m_abook.push_back(e);
+        };
+        dlg.onWhoisFind = [this](const CString& nick) { return FindAbookEntry(nick) != nullptr; };
+        dlg.onWhoisConnect = [this](const CString& server) {   // opens a new connection to the server this whois result is on -- reuses the active window's network if it's idle, like /server -m
+            auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
+            bool reuse = a && a->net && !a->net->conn;
+            Net* net = reuse ? a->net : NewNet();
+            net->o.host = server; net->o.port = 6667;   // WHOIS doesn't report the port the user connected on; 6667 is the plain-text IRC default
+            net->nick = net->o.nick; net->tag = server;
+            Status(net);
+            Connect(net, server, 6667);
+        };
+        dlg.onCtcpRequest = [this](const CString& nick, const CString& type) {
+            Net* net = nullptr; for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
+            if (!net) { AfxMessageBox(L"Not connected to a server.", MB_ICONINFORMATION); return; }
+            CString payload = type;
+            if (type == L"PING") { CString ts; ts.Format(L"%lu", ::GetTickCount()); payload += L" " + ts; }
+            Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + payload + CString(wchar_t(1)));
+        };
         bool ok = dlg.DoModal() == IDOK;
-        m_uwhoCapturingNick.Empty(); m_uwhoCaptureBuffer.Empty();   // stop capturing once the dialog's gone, whatever the outcome
+        m_uwhoCapturingNick.Empty(); m_uwhoCapture = WhoisCapture();   // stop capturing once the dialog's gone, whatever the outcome
         if (ok) {
             SaveAbook();
             m_highlightOn = dlg.highlightOn; SaveHighlight();
@@ -5964,7 +6439,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto it = m_ignoreList.begin(); it != m_ignoreList.end();) {
             if (it->expiresAt && now >= it->expiresAt) { it = m_ignoreList.erase(it); continue; }
             bool netOk = it->network.IsEmpty() || (net && (it->network.CompareNoCase(net->tag) == 0 || (!net->network.IsEmpty() && it->network.CompareNoCase(net->network) == 0)));
-            if (netOk && IgnoreTypeFlag(*it, type) && (GlobMatch(it->mask, nick) || (!hostmask.IsEmpty() && GlobMatch(it->mask, hostmask)))) {
+            if (netOk && IgnoreTypeFlag(*it, type) && (GlobMatch(it->mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(it->mask, hostmask, false)))) {
                 if (it->excluded) return false;
                 ignored = true;
             }
@@ -6071,7 +6546,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& e : list) {
             bool netOk = e.network.IsEmpty() || (net && (e.network.CompareNoCase(net->tag) == 0 || (!net->network.IsEmpty() && e.network.CompareNoCase(net->network) == 0)));
             if (!netOk) continue;
-            bool maskOk = GlobMatch(e.mask, nick) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask));
+            bool maskOk = GlobMatch(e.mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask, false));
             if (maskOk && ChannelInList(e.channels, chan)) return true;
         }
         return false;
@@ -6190,7 +6665,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
     }
     bool IsOnIgnoreList(const CString& nick, const CString& hostmask) {   // regardless of type -- used only as a /cnick -i match condition
-        for (auto& e : m_ignoreList) if (GlobMatch(e.mask, nick) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask))) return !e.excluded;
+        for (auto& e : m_ignoreList) if (GlobMatch(e.mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask, false))) return !e.excluded;
         return false;
     }
     COLORREF ResolveNickColor(const CNickEntry& e, const CString& nick) {
@@ -6204,7 +6679,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& e : m_cnickList) {
             CString mask = e.nick;
             if (mask.Find(L'$') >= 0 || mask.Find(L'%') >= 0) mask = EvalIds(chanWnd, mask, CString());   // "you can specify %vars or $identifiers as the nick"
-            bool nickOk = GlobMatch(mask, nick) || (!hostmask.IsEmpty() && GlobMatch(mask, hostmask));
+            bool nickOk = GlobMatch(mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(mask, hostmask, false));
             if (!nickOk) continue;
             if (!e.anyMode) {
                 wchar_t prefixChar = chanWnd ? chanWnd->NickPrefixChar(nick) : 0;
@@ -6245,7 +6720,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (rFlag) {
             double idxD;
             if (ParseNum(first, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_cnickList.size()) m_cnickList.erase(m_cnickList.begin() + (idx - 1)); }
-            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, first) || m_cnickList[i].nick.CompareNoCase(first) == 0) { m_cnickList.erase(m_cnickList.begin() + i); break; }
+            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, first, false) || m_cnickList[i].nick.CompareNoCase(first) == 0) { m_cnickList.erase(m_cnickList.begin() + i); break; }
             SaveCnick(); RefreshAllNickColors(); Show(w, L"* Removed from the nick color list.", cInfo);
             return;
         }
@@ -6312,7 +6787,7 @@ class CMainFrame : public CMDIFrameWnd {
     static bool TermsMatchWhole(const CString& csv, const CString& whole) {   // used for the nickname/.targets checks -- each comma-separated term matched against the entire string
         if (csv.IsEmpty()) return false;
         CString tmp = csv; int pos = 0;
-        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (!t.IsEmpty() && GlobMatch(t, whole)) return true; }
+        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (!t.IsEmpty() && GlobMatch(t, whole, false)) return true; }
         return false;
     }
     // A plain (non-wildcard) word only matches a complete extracted word, since GlobMatch requires an exact match when
@@ -6322,7 +6797,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (csv.IsEmpty()) return false;
         std::vector<CString> words = ExtractWords(text);
         CString tmp = csv; int pos = 0;
-        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (t.IsEmpty()) continue; for (auto& wrd : words) if (GlobMatch(t, wrd)) return true; }
+        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (t.IsEmpty()) continue; for (auto& wrd : words) if (GlobMatch(t, wrd, false)) return true; }
         return false;
     }
     HighlightEntry* MatchHighlight(const CString& nick, const CString& text, const CString& targetName) {
@@ -6742,7 +7217,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (eFlag) {   // -e: run the matching timer(s) right now, once, without touching their schedule or repeat count
             bool any = false;
-            for (auto& t : m_timers) if (GlobMatch(tname, t.name)) { any = true; CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : w; if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString()); }
+            for (auto& t : m_timers) if (GlobMatch(tname, t.name, false)) { any = true; CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : w; if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString()); }
             if (!any) Show(w, L"* No matching timer: " + tname, cPart);
             return;
         }
@@ -6750,7 +7225,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (w1l == L"off") {
             bool wild = tname.Find(L'?') >= 0 || tname.Find(L'*') >= 0;
             size_t before = m_timers.size();
-            m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return wild ? GlobMatch(tname, t.name) : t.name.CompareNoCase(tname) == 0; }), m_timers.end());
+            m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return wild ? GlobMatch(tname, t.name, false) : t.name.CompareNoCase(tname) == 0; }), m_timers.end());
             Show(w, before == m_timers.size() ? L"* No matching timer: " + tname : L"* Timer(s) turned off: " + tname, before == m_timers.size() ? cPart : cInfo);
             return;
         }
