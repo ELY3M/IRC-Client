@@ -42,7 +42,13 @@ along with this program.  If not, see <https://gnu.org>.
 #pragma comment(lib, "secur32.lib")
 #pragma comment(lib, "shell32.lib")
 #include <gdiplus.h>
+#include <mmsystem.h>
+#include <objbase.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "winmm.lib")     // MCI (sound playback) -- see /splay, /vol, $vol, $inwave/$inmidi/$insong
+#pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -v
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
@@ -496,6 +502,12 @@ struct PlayItem {
 // Net+window-name are stored rather than a CChatWnd* directly, resolved fresh via Find() at fire time, since the
 // window could be closed while the timer is still running (the same reasoning as PlayItem's net pointer, but a
 // window is far more likely to be closed mid-flight than a network is to be destroyed).
+struct SoundChannel {   // one of wave/midi/song; see /splay, /vol, $vol, $inwave/$inmidi/$insong
+    CString alias;       // MCI device alias for this channel
+    CString curFile;
+    bool open = false, playing = false, paused = false;
+    std::vector<std::pair<CString, int>> queue;   // -q queued (file, startPosMs) pairs, played in order once the current sound ends
+};
 struct TipInfo {   // see /tips, /tip, $tips, $tip -- a queued balloon tip, either from an automatic event or scripted via $tip()
     CString name, title, text;
     int delaySec = 10;    // -1 = permanent (stays until closed or dismissed)
@@ -2687,6 +2699,9 @@ class CMainFrame : public CMDIFrameWnd {
     int m_tipsQueueSize = 5, m_tipsDisplayTime = 10;
     std::vector<TipInfo> m_tipQueue; int m_tipSeq = 0;
     bool m_tipsAppWasActive = true;
+    // ---- Sound playback (/splay, /vol, $vol, $inwave/$inmidi/$insong, $sound) ----
+    SoundChannel m_waveChan{ L"ircwave" }, m_midiChan{ L"ircmidi" }, m_mp3Chan{ L"ircmp3" };
+    CString m_soundDirWave, m_soundDirMidi, m_soundDirMp3, m_soundDirWma, m_soundDirOgg;
     // ---- Online Timer: current-connection and cumulative connect time (unrelated to the scheduled-command /timer feature above) ----
     bool m_otEnabled = true, m_otShowTotal = true;
     ULONGLONG m_otSessionStart = 0;   // GetTickCount64() when the current unbroken "connected" streak began; 0 = not currently counting
@@ -2931,13 +2946,23 @@ class CMainFrame : public CMDIFrameWnd {
 
     // ---- identifiers: $me $chan $network $os $date $adate $day $daylight $fulldate $gmt $time, and $0 $N $N- $N-M ----
     // Evaluated by "//cmd ..." and inside aliases (like mIRC: a plain "/cmd" line is NOT evaluated).
-    bool IdentValue(CChatWnd* w, const CString& name, CString& val) {
+    bool IdentValue(CChatWnd* w, const CString& name, const CString& prop, CString& val) {
         Net* net = w ? w->net : nullptr;
         CTime now = CTime::GetCurrentTime();
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
         if (name == L"tips") { val = m_tipsOn ? L"$true" : L"$false"; return true; }
+        if (name == L"inwave" || name == L"inmidi" || name == L"insong") {   // $inwave.fname / .pos / .length / .pause (bare identifier, no parens -- see the EvalIds property-parsing fix above)
+            SoundChannel& ch = name == L"inwave" ? m_waveChan : name == L"inmidi" ? m_midiChan : m_mp3Chan;
+            if (prop.IsEmpty()) { val = (ch.open && ch.playing) ? L"$true" : L"$false"; return true; }
+            if (prop == L"fname") val = ch.curFile;
+            else if (prop == L"pos") val = ch.open ? MciCmd(L"status " + ch.alias + L" position") : CString(L"0");
+            else if (prop == L"length") val = ch.open ? MciCmd(L"status " + ch.alias + L" length") : CString(L"0");
+            else if (prop == L"pause") val = ch.paused ? L"$true" : L"$false";
+            else val = (ch.open && ch.playing) ? L"$true" : L"$false";
+            return true;
+        }
         if (name == L"titlebar") {   // the active chat window's own title (not the main app titlebar)
             CMDIChildWnd* act = MDIGetActive();
             if (act) act->GetWindowText(val); else val.Empty();
@@ -3198,6 +3223,46 @@ class CMainFrame : public CMDIFrameWnd {
             else if (prop == L"wid") val.Format(L"%d", found->wid); else val = found->name;
             return true;
         }
+        if (name == L"vol") {   // $vol(wave|midi|song|master), with .mute
+            CString a = EvalIds(w, rawArgs, params); a.MakeLower(); a.Trim();
+            int v = 0; bool mute = false;
+            if (a == L"wave") { DWORD vol = 0; ::waveOutGetVolume(nullptr, &vol); v = LOWORD(vol); }
+            else if (a == L"midi") { CString r = MciCmd(L"status " + m_midiChan.alias + L" volume"); v = r.IsEmpty() ? 0 : (_wtoi(r) * 65535 / 1000); }
+            else if (a == L"song") { CString r = MciCmd(L"status " + m_mp3Chan.alias + L" volume"); v = r.IsEmpty() ? 0 : (_wtoi(r) * 65535 / 1000); }
+            else if (a == L"master") { v = GetMasterVolumeNow(); mute = GetMasterMuteNow(); }
+            else { val.Empty(); return true; }
+            //val = prop == L"mute" ? (mute ? L"$true" : L"$false") : CString();
+            val = (prop == L"mute") ? (mute ? CString(L"$true") : CString(L"$false")) : CString();
+            if (prop != L"mute") val.Format(L"%d", v);
+            return true;
+        }
+        if (name == L"sound") {   // $sound(type) -> that type's configured folder; $sound(filename) -> ID3v1 tag properties (mp3 only) or .length via a temporary MCI probe
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            CString a0l = a; a0l.MakeLower();
+            if (a0l == L"wave") { val = m_soundDirWave; return true; }
+            if (a0l == L"midi") { val = m_soundDirMidi; return true; }
+            if (a0l == L"mp3") { val = m_soundDirMp3; return true; }
+            if (a0l == L"wma") { val = m_soundDirWma; return true; }
+            if (a0l == L"ogg") { val = m_soundDirOgg; return true; }
+            if (prop == L"length") {
+                CString type = MciTypeForFile(a); val.Empty();
+                if (!type.IsEmpty()) {
+                    CString resolved = ResolveSoundPath(a); CString cmd; cmd.Format(L"open \"%s\" type %s alias ircprobe", (LPCWSTR)resolved, (LPCWSTR)type);
+                    if (MciOk(cmd)) { val = MciCmd(L"status ircprobe length"); MciOk(L"close ircprobe"); }
+                }
+                return true;
+            }
+            Id3v1Tag tag; bool haveTag = a0l.Right(4) == L".mp3" && ReadId3v1(ResolveSoundPath(a), tag);
+            if (prop == L"title") val = haveTag ? tag.title : CString();
+            else if (prop == L"artist") val = haveTag ? tag.artist : CString();
+            else if (prop == L"album") val = haveTag ? tag.album : CString();
+            else if (prop == L"year") val = haveTag ? tag.year : CString();
+            else if (prop == L"comment") val = haveTag ? tag.comment : CString();
+            else if (prop == L"genre") val = haveTag ? tag.genre : CString();
+            else if (prop == L"track") val = haveTag ? tag.track : CString();
+            else val = a;
+            return true;
+        }
         if (name == L"window") {   // $window(N) or $window(@name) or $window(@wildcard,N): a reduced property set (see the /window notes for what's not modeled here)
             CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
             CString sel = c < 0 ? a : a.Left(c); sel.Trim();
@@ -3393,19 +3458,32 @@ class CMainFrame : public CMDIFrameWnd {
                 int k = j; while (k < L && iswalnum(in[k])) k++;
                 CString name = in.Mid(j, k - j); name.MakeLower();
                 bool done = false;
-                if (k < L && in[k] == L'(') {   // $func(args)  and, for $var and your own aliases, an optional .property
+                // $func(args) -- any identifier can have one, not just $var/aliases (that used to be the only case
+                // handled, which silently broke .property access on $window/$line/$sline/$tip and anything else
+                // added afterward: a call like $window(1).wid would run $window(1) and then print ".wid" literally,
+                // since prop was never populated for a non-var/alias name).
+                bool hasArgs = (k < L && in[k] == L'(');
+                CString args; int afterArgs = k;
+                if (hasArgs) {
                     int depth = 0, m = k;
                     for (; m < L; m++) { if (in[m] == L'(') depth++; else if (in[m] == L')' && --depth == 0) break; }
-                    if (m < L) {
-                        CString args = in.Mid(k + 1, m - k - 1), prop; int end = m + 1;
-                        if ((name == L"var" || FindAlias(name)) && end + 1 < L && in[end] == L'.' && iswalpha(in[end + 1])) {
-                            int pe = end + 1; while (pe < L && iswalnum(in[pe])) pe++;
-                            prop = in.Mid(end + 1, pe - end - 1); prop.MakeLower(); end = pe;
-                        }
-                        if (FuncValue(w, name, args, prop, params, val)) { done = true; endIdx = end; }
-                    }
+                    if (m < L) { args = in.Mid(k + 1, m - k - 1); afterArgs = m + 1; } else hasArgs = false;
                 }
-                if (!done && IdentValue(w, name, val)) { done = true; endIdx = k; }
+                // An optional .property, either right after (args) or -- new -- right after a bare identifier with no
+                // parentheses at all, e.g. $inwave.fname.
+                CString prop; int afterProp = afterArgs;
+                if (afterArgs + 1 < L && in[afterArgs] == L'.' && iswalpha(in[afterArgs + 1])) {
+                    int pe = afterArgs + 1; while (pe < L && iswalnum(in[pe])) pe++;
+                    prop = in.Mid(afterArgs + 1, pe - afterArgs - 1); prop.MakeLower(); afterProp = pe;
+                }
+                if (hasArgs && FuncValue(w, name, args, prop, params, val)) { done = true; endIdx = afterProp; }
+                if (!done) {
+                    // If (args) were present but FuncValue didn't recognize the name, fall back to the bare
+                    // identifier with no property (matches the original behavior: the "(args)" is left as literal
+                    // text). Otherwise -- no parens at all -- pass the property straight through.
+                    CString identProp = hasArgs ? CString() : prop;
+                    if (IdentValue(w, name, identProp, val)) { done = true; endIdx = hasArgs ? k : afterProp; }
+                }
                 ok = done;
             }
             if (ok) {
@@ -3961,6 +4039,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (cmd == L"tips") { CmdTips(w, arg); return; }
         if (cmd == L"tip") { CmdTip(w, arg); return; }
         if (cmd == L"titlebar") { CmdTitlebar(w, arg); return; }
+        if (cmd == L"splay") { CmdSplay(w, arg); return; }
+        if (cmd == L"vol") { CmdVol(w, arg); return; }
         if (cmd == L"timer") { CmdTimer(w, CString(), arg); return; }   // bare "/timer": auto-assigns the next free number
         if (cmd.Left(5) == L"timer" && cmd.GetLength() > 5) { CmdTimer(w, cmdRaw.Mid(5), arg); return; }   // "/timer1", "/timershow", etc: the timer name follows directly, no space
         if (cmd == L"server" || cmd == L"connect") {
@@ -4176,7 +4256,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -4447,6 +4527,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; }
         SaveOnlineTimer();
         StopIdentd();
+        CloseSoundChannel(m_waveChan); CloseSoundChannel(m_midiChan); CloseSoundChannel(m_mp3Chan);
         // "If you hold down the Shift key when you quit mIRC, the next time you run it, it will be minimized."
         AfxGetApp()->WriteProfileInt(L"Tray", L"startMinimizedNext", (::GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 0);
         HideTrayIcon();
@@ -4747,6 +4828,180 @@ class CMainFrame : public CMDIFrameWnd {
             return;
         }
         SetWindowText(arg);
+    }
+    // ---- Sound playback: MCI handles wave/midi/mp3 uniformly, which is what mIRC's own /splay has always used under the hood ----
+    static CString MciCmd(const CString& cmd) { wchar_t buf[512] = {}; return ::mciSendStringW(cmd, buf, _countof(buf), nullptr) == 0 ? CString(buf) : CString(); }
+    static bool MciOk(const CString& cmd) { wchar_t buf[8] = {}; return ::mciSendStringW(cmd, buf, _countof(buf), nullptr) == 0; }
+    static CString MciTry(const CString& cmd) {   // like MciOk, but returns the actual MCI error description on failure instead of just true/false -- lets /splay report *why* a sound wouldn't play (missing codec, bad path, etc.) instead of a bare "could not play"
+        wchar_t buf[512] = {};
+        MCIERROR err = ::mciSendStringW(cmd, buf, _countof(buf), nullptr);
+        if (err == 0) return CString();
+        wchar_t errBuf[256] = {}; ::mciGetErrorStringW(err, errBuf, _countof(errBuf));
+        CString s; s.Format(L"MCI error %lu: %s", err, errBuf[0] ? errBuf : L"(no description)");
+        return s;
+    }
+    static CString MciTypeForFile(const CString& file) {
+        CString ext = file; int dot = ext.ReverseFind(L'.'); ext = dot >= 0 ? ext.Mid(dot + 1) : CString(); ext.MakeLower();
+        if (ext == L"wav") return L"waveaudio";
+        if (ext == L"mid" || ext == L"midi" || ext == L"rmi") return L"sequencer";
+        if (ext == L"mp3" || ext == L"mp2") return L"mpegvideo";   // Windows' built-in mpegvideo MCI driver also handles audio-only MP3s
+        return CString();
+    }
+    CString ResolveSoundPath(const CString& file) {
+        if (file.Find(L':') >= 0 || file.Find(L'\\') >= 0 || file.Find(L'/') >= 0) return file;   // already has a path
+        CString ext = file; int dot = ext.ReverseFind(L'.'); ext = dot >= 0 ? ext.Mid(dot + 1) : CString(); ext.MakeLower();
+        CString dir = ext == L"wav" ? m_soundDirWave : (ext == L"mid" || ext == L"midi") ? m_soundDirMidi : (ext == L"mp3" || ext == L"mp2") ? m_soundDirMp3 : CString();
+        if (!dir.IsEmpty()) {
+            CString p = dir; if (p.Right(1) != L"\\" && p.Right(1) != L"/") p += L"\\";
+            p += file;
+            if (::GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) return p;
+        }
+        return file;
+    }
+    void CloseSoundChannel(SoundChannel& ch) {
+        if (ch.open) MciOk(L"close " + ch.alias);
+        ch.open = ch.playing = ch.paused = false; ch.curFile.Empty();
+    }
+    // Returns empty on success, or a human-readable reason on failure (missing file, no codec for this type, etc.)
+    CString OpenAndPlaySound(SoundChannel& ch, const CString& file, int startMs = -1) {
+        CloseSoundChannel(ch);
+        CString type = MciTypeForFile(file);
+        if (type.IsEmpty()) return L"Unsupported file type (only .wav, .mid/.midi, .mp3/.mp2 are recognized)";
+        CString resolved = ResolveSoundPath(file);
+        if (::GetFileAttributesW(resolved) == INVALID_FILE_ATTRIBUTES)
+            return L"File not found: " + resolved + L" (relative filenames are resolved against the app's current working directory, not necessarily the .exe's own folder -- try a full path, or set the matching Sound Requests directory)";
+        CString cmd; cmd.Format(L"open \"%s\" type %s alias %s", (LPCWSTR)resolved, (LPCWSTR)type, (LPCWSTR)ch.alias);
+        CString err = MciTry(cmd);
+        if (!err.IsEmpty()) return err;
+        ch.open = true; ch.curFile = resolved;
+        CString playCmd = L"play " + ch.alias;
+        if (startMs >= 0) playCmd.AppendFormat(L" from %d", startMs);
+        err = MciTry(playCmd);
+        if (!err.IsEmpty()) { CloseSoundChannel(ch); return err; }
+        ch.playing = true; ch.paused = false;
+        return CString();
+    }
+    void TriggerSoundEvent(const CString& type, const CString& file) {   // this app has no formal "on EVENT" system, so the closest match to mIRC's "sound event" is: run an alias literally named "sound", if one is defined
+        AliasDef* ad = FindAlias(L"sound");
+        if (!ad) return;
+        CChatWnd* w = nullptr; for (auto& kv : m_w) if (kv.second->m_name == L"*status*") { w = kv.second; break; }
+        if (!w) w = m_w.empty() ? nullptr : m_w.begin()->second;
+        if (w) RunAlias(w, *ad, type + L" " + file);
+    }
+    void SoundTick() {   // advances queues and fires the sound event, piggybacking on the regular ~500ms tick
+        SoundChannel* chans[3] = { &m_waveChan, &m_midiChan, &m_mp3Chan };
+        const wchar_t* typeNames[3] = { L"wave", L"midi", L"song" };
+        for (int i = 0; i < 3; i++) {
+            SoundChannel* ch = chans[i];
+            if (!ch->open || ch->paused) continue;
+            if (MciCmd(L"status " + ch->alias + L" mode").CompareNoCase(L"playing") == 0) continue;
+            CString finishedFile = ch->curFile;
+            CloseSoundChannel(*ch);
+            TriggerSoundEvent(typeNames[i], finishedFile);
+            if (!ch->queue.empty()) {
+                auto next = ch->queue.front(); ch->queue.erase(ch->queue.begin());
+                CString err = OpenAndPlaySound(*ch, next.first, next.second);
+                if (!err.IsEmpty()) { CChatWnd* sw = m_w.empty() ? nullptr : m_w.begin()->second; for (auto& kv : m_w) if (kv.second->m_name == L"*status*") { sw = kv.second; break; } if (sw) Show(sw, L"* Could not play queued sound " + next.first + L": " + err, cPart); }
+            }
+        }
+    }
+    static bool GetMasterEndpoint(IAudioEndpointVolume** ppVol) {   // Core Audio: the modern (Vista+) way to read/set the system's own master volume and mute
+        ::CoInitialize(nullptr);
+        IMMDeviceEnumerator* enumerator = nullptr;
+        if (FAILED(::CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator)) || !enumerator) return false;
+        IMMDevice* device = nullptr;
+        HRESULT hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        enumerator->Release();
+        if (FAILED(hr) || !device) return false;
+        hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)ppVol);
+        device->Release();
+        return SUCCEEDED(hr);
+    }
+    static void SetMasterVolumeNow(int v) { IAudioEndpointVolume* vol = nullptr; if (GetMasterEndpoint(&vol)) { vol->SetMasterVolumeLevelScalar((float)v / 65535.0f, nullptr); vol->Release(); } }
+    static int GetMasterVolumeNow() { IAudioEndpointVolume* vol = nullptr; float f = 0; if (GetMasterEndpoint(&vol)) { vol->GetMasterVolumeLevelScalar(&f); vol->Release(); } return (int)(f * 65535.0f); }
+    static void SetMasterMuteNow(bool m) { IAudioEndpointVolume* vol = nullptr; if (GetMasterEndpoint(&vol)) { vol->SetMute(m, nullptr); vol->Release(); } }
+    static bool GetMasterMuteNow() { IAudioEndpointVolume* vol = nullptr; BOOL m = FALSE; if (GetMasterEndpoint(&vol)) { vol->GetMute(&m); vol->Release(); } return m != FALSE; }
+    void CmdSplay(CChatWnd* w, CString arg) {
+        arg.Trim();
+        bool wFlag = false, mFlag = false, pFlag = false, qFlag = false, cFlag = false;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) { wchar_t c = sw[i]; if (c == L'w') wFlag = true; else if (c == L'm') mFlag = true; else if (c == L'p') pFlag = true; else if (c == L'q') qFlag = true; else if (c == L'c') cFlag = true; }
+            arg.TrimLeft();
+        }
+        if (cFlag) {
+            bool any = !wFlag && !mFlag && !pFlag;
+            if (wFlag || any) m_waveChan.queue.clear(); if (mFlag || any) m_midiChan.queue.clear(); if (pFlag || any) m_mp3Chan.queue.clear();
+            if (arg.IsEmpty()) { Show(w, L"* Sound queue cleared.", cInfo); return; }
+        }
+        CString first = arg; CString w1 = Word(first); CString w1l = w1; w1l.MakeLower();
+        auto targets = [&]() { std::vector<SoundChannel*> t; if (wFlag) t.push_back(&m_waveChan); if (mFlag) t.push_back(&m_midiChan); if (pFlag) t.push_back(&m_mp3Chan); if (t.empty()) t = { &m_waveChan, &m_midiChan, &m_mp3Chan }; return t; };
+        if (w1l == L"stop" || w1l == L"pause" || w1l == L"resume" || w1l == L"skip") {
+            for (auto* ch : targets()) {
+                if (!ch->open) continue;
+                if (w1l == L"stop") CloseSoundChannel(*ch);
+                else if (w1l == L"pause") { MciOk(L"pause " + ch->alias); ch->paused = true; }
+                else if (w1l == L"resume") { MciOk(L"resume " + ch->alias); ch->paused = false; }
+                else if (w1l == L"skip") {
+                    CloseSoundChannel(*ch);
+                    if (!ch->queue.empty()) { auto next = ch->queue.front(); ch->queue.erase(ch->queue.begin()); CString err = OpenAndPlaySound(*ch, next.first, next.second); if (!err.IsEmpty()) Show(w, L"* Could not play " + next.first + L": " + err, cPart); }
+                }
+            }
+            return;
+        }
+        if (w1l == L"seek") { if (m_mp3Chan.open) MciOk(L"play " + m_mp3Chan.alias + L" from " + first); return; }   // seeks the mp3 channel specifically, matching the spec's own example
+        if (arg.IsEmpty()) { Show(w, L"* Usage: /splay -cwmpq [filename|stop|pause|resume|seek|skip] [pos]", cPart); return; }
+        CString fname = w1; CString posStr = first; posStr.Trim();
+        int startMs = posStr.IsEmpty() ? -1 : _wtoi(posStr);
+        CString type = MciTypeForFile(fname);
+        if (type.IsEmpty()) { Show(w, L"* Unsupported sound file type: " + fname, cPart); return; }
+        SoundChannel* ch = wFlag ? &m_waveChan : mFlag ? &m_midiChan : pFlag ? &m_mp3Chan : type == L"waveaudio" ? &m_waveChan : type == L"sequencer" ? &m_midiChan : &m_mp3Chan;
+        if (qFlag && ch->open) { ch->queue.push_back({ fname, startMs }); return; }
+        CString err = OpenAndPlaySound(*ch, fname, startMs);
+        if (!err.IsEmpty()) Show(w, L"* Could not play " + fname + L": " + err, cPart);
+    }
+    void CmdVol(CChatWnd* w, CString arg) {
+        arg.Trim();
+        bool wFlag = false, mFlag = false, pFlag = false, vFlag = false; int muteN = -1;
+        while (arg.Left(1) == L"-") {
+            CString sw = Word(arg);
+            for (int i = 1; i < sw.GetLength(); i++) {
+                wchar_t c = sw[i];
+                if (c == L'w') wFlag = true; else if (c == L'm') mFlag = true; else if (c == L'p') pFlag = true; else if (c == L'v') vFlag = true;
+                else if (c == L'u') { CString digs; while (i + 1 < sw.GetLength() && iswdigit(sw[i + 1])) digs += sw[++i]; muteN = digs.IsEmpty() ? 0 : _wtoi(digs); }
+            }
+            arg.TrimLeft();
+        }
+        if (muteN >= 0 && vFlag) SetMasterMuteNow(muteN == 1);   // per-stream mute for wave/midi/mp3 isn't separately implemented -- neither waveOutSetVolume nor MCI expose a clean per-stream mute flag the way the system mixer does; only -v's master mute is real here
+        if (!arg.IsEmpty()) {
+            int v = _wtoi(arg); if (v < 0) v = 0; if (v > 65535) v = 65535;
+            bool any = !wFlag && !mFlag && !pFlag && !vFlag;
+            if (vFlag) SetMasterVolumeNow(v);
+            if (wFlag || any) { DWORD vol = MAKELONG((WORD)v, (WORD)v); ::waveOutSetVolume(nullptr, vol); }
+            if (mFlag) MciOk(L"setaudio " + m_midiChan.alias + L" volume to " + CString(std::to_wstring(v * 1000 / 65535).c_str()));   // MCI volume is 0-1000; only takes effect while that channel is open/playing
+            if (pFlag) MciOk(L"setaudio " + m_mp3Chan.alias + L" volume to " + CString(std::to_wstring(v * 1000 / 65535).c_str()));
+        }
+        Show(w, L"* Volume updated.", cInfo);
+    }
+    // ---- ID3v1 tag reading for $sound(file.mp3) -- the simple, fixed-size 128-byte trailer format only; full ID3v2
+    // (.id3/.tag/.tags) and MPEG-header-derived properties (bitrate, vbr, sample rate, mode, version, copyright,
+    // private, crc) are NOT implemented -- those need actual frame/tag-structure parsing well beyond this format.
+    struct Id3v1Tag { CString title, artist, album, year, comment, genre, track; };
+    static CString Id3Str(const char* p, int len) {
+        CStringA a(p, len); int end = a.GetLength(); while (end > 0 && (a[end - 1] == 0 || a[end - 1] == ' ')) end--;
+        return CString(a.Left(end));
+    }
+    static bool ReadId3v1(const CString& path, Id3v1Tag& tag) {
+        CFile f; if (!f.Open(path, CFile::modeRead | CFile::shareDenyNone)) return false;
+        if (f.GetLength() < 128) return false;
+        f.Seek(-128, CFile::end);
+        char buf[128]; if (f.Read(buf, 128) != 128 || memcmp(buf, "TAG", 3) != 0) return false;
+        tag.title = Id3Str(buf + 3, 30); tag.artist = Id3Str(buf + 33, 30); tag.album = Id3Str(buf + 63, 30); tag.year = Id3Str(buf + 93, 4);
+        bool v11 = buf[125] == 0 && buf[126] != 0;   // ID3v1.1: byte 125 is a zero separator, byte 126 is the track number, shortening the comment by 2 bytes
+        tag.comment = Id3Str(buf + 97, v11 ? 28 : 30);
+        tag.track = v11 ? CString(std::to_wstring((unsigned char)buf[126]).c_str()) : CString();
+        tag.genre.Format(L"%d", (int)(unsigned char)buf[127]);   // reported as the raw numeric genre id -- not mapped to the standard genre-name table
+        return true;
     }
     void LoadIdentd() {
         CWinApp* a = AfxGetApp();
@@ -5681,7 +5936,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
         if (id == 2003) { TrayAnimTick(); return; }   // tray icon activity flash: same reasoning
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
-        TipTick(); TipCheckActivation();
+        TipTick(); TipCheckActivation(); SoundTick();
         if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
     }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
