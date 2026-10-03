@@ -14,7 +14,7 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://gnu.org>.
 */
-
+#include <afxinet.h>
 #include <afxwin.h>
 #include <afxcmn.h>
 #include <afxsock.h>
@@ -50,6 +50,8 @@ along with this program.  If not, see <https://gnu.org>.
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")     // MCI (sound playback) -- see /splay, /vol, $vol, $inwave/$inmidi/$insong
 #pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -
+#include <wininet.h>
+#pragma comment(lib, "wininet.lib")   // About dialog's "Check for Update" button -- a single blocking HTTPS GET to the GitHub API, nothing more
 // $zip: zlib + minizip-ng (store/deflate + WinZip AES), vendored as plain C source files compiled alongside this
 // .cpp -- see the build notes near CmdZip/FuncValue's "zip" handler for the exact file list and compiler flags.
 // mz_crypt_winvista.c's AES/hash primitives are implemented via Windows' own CNG (BCrypt), hence this lib.
@@ -72,6 +74,7 @@ extern "C" {
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
 
+#include "version.h"
 #define VERSION L"IRC Client - https://github.com/ELY3M/IRC-Client"
 #define DEFAULT_FONT L"Fixedsys"
 
@@ -1204,10 +1207,51 @@ BEGIN_MESSAGE_MAP(CPlayCtrlDlg, CDialog)
     ON_BN_CLICKED(IDC_PC_REMOVE, OnRemove) ON_BN_CLICKED(IDC_PC_STOPALL, OnStopAll)
 END_MESSAGE_MAP()
 
+enum {
+    IDC_VERSION = 10001
+};
+// ---------------- Check for Update: a single blocking HTTPS GET to the GitHub API, nothing fancier. The About
+// dialog is already modal, so a brief block while the request completes is acceptable -- this deliberately doesn't
+// spin up a background thread for what's a user-initiated, one-off click. ----
+static bool HttpGetText(const wchar_t* host, const wchar_t* path, std::string& outBody, CString& err) {
+    HINTERNET hInet = InternetOpenW(L"IRC-Client-UpdateCheck/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hInet) { err = L"Could not initialize WinINet."; return false; }
+    HINTERNET hConn = InternetConnectW(hInet, host, INTERNET_DEFAULT_HTTPS_PORT, nullptr, nullptr, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConn) { err.Format(L"Could not connect to %s (error %lu).", host, ::GetLastError()); InternetCloseHandle(hInet); return false; }
+    DWORD flags = INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI;
+    HINTERNET hReq = HttpOpenRequestW(hConn, L"GET", path, nullptr, nullptr, nullptr, flags, 0);
+    if (!hReq) { err.Format(L"Could not open a request to %s (error %lu).", host, ::GetLastError()); InternetCloseHandle(hConn); InternetCloseHandle(hInet); return false; }
+    // GitHub's API rejects requests with no User-Agent header outright, hence this (InternetOpenW's agent name only
+    // covers some WinINet code paths, not reliably this one).
+    CString hdrs = L"User-Agent: IRC-Client-UpdateCheck\r\nAccept: application/vnd.github+json\r\n";
+    bool ok = HttpSendRequestW(hReq, hdrs, hdrs.GetLength(), nullptr, 0) != FALSE;
+    if (!ok) { err.Format(L"Request to %s failed (error %lu).", host, ::GetLastError()); InternetCloseHandle(hReq); InternetCloseHandle(hConn); InternetCloseHandle(hInet); return false; }
+    DWORD status = 0, statusSize = sizeof(status);
+    HttpQueryInfoW(hReq, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &statusSize, nullptr);
+    char buf[4096]; DWORD read = 0; outBody.clear();
+    while (InternetReadFile(hReq, buf, sizeof(buf), &read) && read > 0) outBody.append(buf, read);
+    InternetCloseHandle(hReq); InternetCloseHandle(hConn); InternetCloseHandle(hInet);
+    if (status != 200) { err.Format(L"GitHub returned HTTP %lu.", status); return false; }
+    return true;
+}
+// Pulls out the first "sha":"..." field in a GitHub commit API response -- that's always the commit's own sha,
+// appearing before any nested ones (tree.sha, parents[].sha), so a plain first-match string search is reliable
+// here without needing a real JSON parser for just this one field.
+static CString ExtractJsonShaField(const std::string& json) {
+    size_t p = json.find("\"sha\"");
+    if (p == std::string::npos) return CString();
+    p = json.find(':', p); if (p == std::string::npos) return CString();
+    p = json.find('"', p); if (p == std::string::npos) return CString();
+    size_t end = json.find('"', p + 1); if (end == std::string::npos) return CString();
+    std::string sha = json.substr(p + 1, end - p - 1);
+    CStringA a(sha.c_str()); return CString(a);
+}
 class CAboutDlg : public CDialog {
     std::vector<WORD> t; int cnt = 0;
     CClickableStatic m_banner; 
+    CClickableStatic m_url;
     CBitmap m_aboutBmp;
+    CString m_localHash;   // set in the constructor from GIT_COMMIT_HASH (version.h), read by CheckForUpdate()
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
     void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
     void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
@@ -1228,22 +1272,26 @@ class CAboutDlg : public CDialog {
     }
 public:
     CAboutDlg(CWnd* parent) {
+        CString version = GIT_COMMIT_HASH;
+        m_localHash = version;
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); 
         t.push_back(0); 
         t.push_back(0); 
-        t.push_back(320);
-        t.push_back(400);
+        t.push_back(380);
+        t.push_back(450);
         t.push_back(0); 
         t.push_back(0); 
         S(L"About IRC"); 
         t.push_back(9); 
         S(DEFAULT_FONT);
         ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon
-        ItemRes(SS_BITMAP | SS_NOTIFY, 10, 40, 300, 300, 501, 103);  // banner image, moved/resized to fit inside the enlarged dialog
-        Item(SS_LEFT, 10, 350, 300, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
-        Item(SS_CENTER, 10, 400, 400, 20, 0xFFFF, 0x0082, L"https://github.com/ELY3M/IRC-Client");
-        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 136, 374, 48, 16, IDOK, 0x0080, L"OK");
+        ItemRes(SS_BITMAP | SS_NOTIFY, 10, 40, 350, 350, 501, 103);  // banner image, moved/resized to fit inside the enlarged dialog
+        Item(SS_LEFT, 10, 230, 300, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
+        Item(SS_LEFT | SS_NOTIFY, 10, 250, 300, 20, 503, 0x0082, L"https://github.com/ELY3M/IRC-Client");
+        Item(SS_LEFT | SS_NOTIFY, 10, 270, 300, 20, 505, 0x0082, L"Build: " + version);
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP | SS_NOTIFY | BS_CENTER | BS_VCENTER, 136, 290, 90, 16, 504, 0x0080, L"Check for Update");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 136, 315, 48, 16, IDOK, 0x0080, L"OK");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
@@ -1261,17 +1309,57 @@ public:
         };
         return TRUE;
     }
+    BOOL OnCommand(WPARAM wParam, LPARAM lParam) override {
+        WORD notificationCode = HIWORD(wParam);
+        WORD controlID = LOWORD(wParam);
+        if (notificationCode == 0 && controlID == 503) {
+            ShellExecute(NULL, L"open", L"https://github.com/ELY3M/IRC-Client", NULL, NULL, SW_SHOWNORMAL);
+            return TRUE;
+        }
+        if (notificationCode == 0 && controlID == 505) {   // the build/commit label -- jumps straight to that exact commit on GitHub
+            ShellExecute(NULL, L"open", L"https://github.com/ELY3M/IRC-Client/commit/" + m_localHash, NULL, NULL, SW_SHOWNORMAL);
+            return TRUE;
+        }
+        if (notificationCode == 0 && controlID == 504) { CheckForUpdate(); return TRUE; }
+        return CDialog::OnCommand(wParam, lParam); // Pass all other commands back to MFC
+    }
+    void CheckForUpdate() {
+        SetDlgItemText(504, L"Checking...");
+        GetDlgItem(504)->EnableWindow(FALSE);
+        HCURSOR oldCursor = ::SetCursor(::LoadCursor(nullptr, IDC_WAIT));
+
+        std::string body; CString err;
+        bool ok = HttpGetText(L"api.github.com", L"/repos/ELY3M/IRC-Client/commits/master", body, err);
+
+        ::SetCursor(oldCursor);
+        GetDlgItem(504)->EnableWindow(TRUE);
+        SetDlgItemText(504, L"Check for Update");
+
+        if (!ok) { AfxMessageBox(L"Couldn't check for updates:\r\n\r\n" + err, MB_ICONWARNING); return; }
+        CString remoteFull = ExtractJsonShaField(body);
+        if (remoteFull.IsEmpty()) { AfxMessageBox(L"GitHub's response didn't look like what was expected -- couldn't find a commit hash in it.", MB_ICONWARNING); return; }
+        CString remoteShort = remoteFull.Left(7);   // version.h stores the short (7-char) form; compare apples to apples
+        CString local = m_localHash; local.Trim();
+
+        if (local.CompareNoCase(remoteShort) == 0) {
+            AfxMessageBox(L"You're running the latest version.\r\n\r\nBuild: " + local, MB_ICONINFORMATION);
+            return;
+        }
+        CString msg; msg.Format(L"A newer version is available.\r\n\r\nYour build:    %s\r\nLatest build: %s\r\n\r\nOpen the GitHub releases page?",
+            (LPCWSTR)local, (LPCWSTR)remoteShort);
+        if (AfxMessageBox(msg, MB_ICONINFORMATION | MB_YESNO) == IDYES)
+            ShellExecute(NULL, L"open", L"https://github.com/ELY3M/IRC-Client/releases", NULL, NULL, SW_SHOWNORMAL);
+    }
     void ChangeImage() {
         CFileDialog fd(TRUE, L"png", nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
             L"Image Files (*.bmp;*.jpg;*.jpeg;*.png;*.gif)|*.bmp;*.jpg;*.jpeg;*.png;*.gif|All Files (*.*)|*.*||", this);
         if (fd.DoModal() != IDOK) return;
-        HBITMAP hb = LoadImageFileScaled(fd.GetPathName(), 300, 300);
+        HBITMAP hb = LoadImageFileScaled(fd.GetPathName(), 350, 350);
         if (!hb) { AfxMessageBox(L"Couldn't load that image."); return; }
         m_aboutBmp.DeleteObject(); m_aboutBmp.Attach(hb);
         m_banner.SetBitmap((HBITMAP)m_aboutBmp);
     }
 };
-
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
 class CIrcSock : public CAsyncSocket {
 public:
@@ -1862,11 +1950,27 @@ public:
     std::function<void(CPoint)> onDragEnd;   // a drag that started on empty toolbar space ended at this screen point
     std::function<void(CPoint)> onDragMove;  // fires on every mouse move during a drag, so the frame can update a live preview outline
     std::function<void()> onDragCancel;      // Escape pressed, or capture lost unexpectedly, during a drag
+    enum { GRIP = 12 };   // margin reserved at the control's leading edge (via TB_SETINDENT -- see BuildToolbar) for the dots drawn below, same visual language as CSwitchBar's gripper
 protected:
     bool m_dragging = false;
+    afx_msg void OnPaint() {
+        Default();   // let the toolbar draw its buttons normally first (shifted right by the TB_SETINDENT margin)
+        CClientDC dc(this); CRect c; GetClientRect(c); bool vert = c.Height() > c.Width();
+        CBrush br(::GetSysColor(COLOR_BTNSHADOW)); CBrush* ob = dc.SelectObject(&br);
+        if (vert) { for (int x = c.Width() / 2 - 4; x <= c.Width() / 2 + 4; x += 4) for (int y = 3; y < (int)GRIP - 1; y += 4) dc.Ellipse(x, y, x + 2, y + 2); }
+        else { for (int y = c.Height() / 2 - 4; y <= c.Height() / 2 + 4; y += 4) for (int x = 3; x < (int)GRIP - 1; x += 4) dc.Ellipse(x, y, x + 2, y + 2); }
+        dc.SelectObject(ob);
+    }
+    bool OnEmptySpace(CPoint p) {   // true if p isn't over any actual button -- HitTest's "not on a button" return is cross-checked against real
+        CToolBarCtrl& tbc = GetToolBarCtrl();   // button geometry too, since HitTest's behavior for space the control was stretched into (beyond its
+        int idx = tbc.HitTest(&p);              // last button, which is exactly where dragging starts from) isn't something to take on faith untested
+        if (idx >= 0) return false;
+        int n = tbc.GetButtonCount();
+        for (int i = 0; i < n; i++) { CRect r; if (tbc.GetItemRect(i, &r) && r.PtInRect(p)) return false; }
+        return true;
+    }
     afx_msg void OnLButtonDown(UINT flags, CPoint p) {
-        int idx = GetToolBarCtrl().HitTest(&p);
-        if (idx < 0) { m_dragging = true; SetCapture(); ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); return; }   // negative = not on a button: empty space, fair game to drag from
+        if (OnEmptySpace(p)) { m_dragging = true; SetCapture(); ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); return; }
         CToolBar::OnLButtonDown(flags, p);
     }
     afx_msg void OnMouseMove(UINT flags, CPoint p) {
@@ -1889,7 +1993,7 @@ protected:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CDraggableToolBar, CToolBar)
-    ON_WM_LBUTTONDOWN() ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP() ON_WM_KEYDOWN() ON_WM_CAPTURECHANGED()
+    ON_WM_LBUTTONDOWN() ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP() ON_WM_KEYDOWN() ON_WM_CAPTURECHANGED() ON_WM_PAINT()
 END_MESSAGE_MAP()
 
 // ---------------- MDI client area: subclassed only to add an optional background image behind the child windows ----------------
@@ -8526,6 +8630,7 @@ class CMainFrame : public CMDIFrameWnd {
         b[14].fsStyle = TBSTYLE_SEP;
         m_tb.GetToolBarCtrl().AddButtons(15, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
+        m_tb.GetToolBarCtrl().SendMessage(TB_SETINDENT, CDraggableToolBar::GRIP, 0);   // reserves a blank margin before the first button for the gripper dots (drawn in CDraggableToolBar::OnPaint) -- real toolbar-control geometry, not just a visual overlay, so hit-testing/GetItemRect already treat it as empty space
         m_tb.GetToolBarCtrl().AutoSize();
         CRect tbr; m_tb.GetWindowRect(&tbr); m_tbNaturalSize = tbr.Size();   // the toolbar's natural (unwrapped, horizontal) size, used by LayoutBars() for every position
     }

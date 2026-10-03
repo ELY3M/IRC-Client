@@ -127,6 +127,10 @@
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
+    <PreBuildEvent>
+      <Command>for /f %%i in ('git rev-parse --short HEAD') do echo #define GIT_COMMIT_HASH "%%i" &gt; "$(ProjectDir)version.h"
+</Command>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -150,6 +154,10 @@
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
+    <PreBuildEvent>
+      <Command>for /f %%i in ('git rev-parse --short HEAD') do echo #define GIT_COMMIT_HASH "%%i" &gt; "$(ProjectDir)version.h"
+</Command>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="IRC.cpp" />
