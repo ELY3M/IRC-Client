@@ -13,10 +13,76 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="zipkit">
+      <UniqueIdentifier>{ab2d43bc-c36d-4740-bf3a-06fb0a9acd47}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="IRC.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\adler32.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\crc32.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\deflate.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\inffast.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\inflate.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\inftrees.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_crypt.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_crypt_winvista.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_os.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_os_win32.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm_buf.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm_mem.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm_os_win32.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm_split.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm_wzaes.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_strm_zlib.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_zip.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\mz_zip_rw.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\trees.c">
+      <Filter>zipkit</Filter>
+    </ClCompile>
+    <ClCompile Include="zipkit\zutil.c">
+      <Filter>zipkit</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

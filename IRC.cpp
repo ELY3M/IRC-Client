@@ -49,7 +49,25 @@ along with this program.  If not, see <https://gnu.org>.
 #include <endpointvolume.h>
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")     // MCI (sound playback) -- see /splay, /vol, $vol, $inwave/$inmidi/$insong
-#pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -v
+#pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -
+// $zip: zlib + minizip-ng (store/deflate + WinZip AES), vendored as plain C source files compiled alongside this
+// .cpp -- see the build notes near CmdZip/FuncValue's "zip" handler for the exact file list and compiler flags.
+// mz_crypt_winvista.c's AES/hash primitives are implemented via Windows' own CNG (BCrypt), hence this lib.
+#pragma comment(lib, "bcrypt.lib")
+extern "C" {
+#include "mz.h"
+#include "mz_os.h"
+#include "mz_strm.h"
+#include "mz_strm_os.h"
+#include "mz_strm_mem.h"
+#include "mz_strm_buf.h"
+#include "mz_strm_split.h"
+#include "mz_strm_zlib.h"
+#include "mz_strm_wzaes.h"
+#include "mz_crypt.h"
+#include "mz_zip.h"
+#include "mz_zip_rw.h"
+}
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
 
@@ -303,13 +321,149 @@ static bool FindInDirRecursive(const CString& dir, const CString& wildcardCsv, b
         if (isDir) subdirs.push_back(name);
         if (isDir == wantDirs) {
             CString wc = wildcardCsv; bool matched = false; int pos = 0;
-            while (pos != -1) { CString one = wc.Tokenize(L";", pos); one.Trim(); if (!one.IsEmpty() && GlobMatch(one, name, false)) { matched = true; break; } }
+            while (pos != -1) { CString one = wc.Tokenize(L";", pos); one.Trim(); if (!one.IsEmpty() && GlobMatch(one, name)) { matched = true; break; } }
             if (matched) { counter++; if (counter == targetN) { result = base + name; ::FindClose(h); return true; } }
         }
     } while (::FindNextFileW(h, &fd));
     ::FindClose(h);
     for (auto& sd : subdirs) if (FindInDirRecursive(base + sd, wildcardCsv, wantDirs, counter, targetN, depth + 1, maxDepth, result)) return true;
     return false;
+}
+// ---------------- $zip: zlib + minizip-ng wrappers. minizip-ng's whole char* API surface is UTF-8, converted to/from
+// UTF-16 internally by its own Windows backend (mz_os_win32.c) -- so every path, password, and in-zip filename
+// crossing that boundary goes through these two conversions, never CString's own (CP_ACP, not UTF-8) conversion. ----
+static std::string Utf8FromCString(const CString& s) {
+    int len = ::WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return std::string();
+    std::string out(len, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, s, -1, &out[0], len, nullptr, nullptr);
+    out.resize(len - 1);   // drop the null terminator WideCharToMultiByte included in the count
+    return out;
+}
+static CString Utf8ToCString(const char* s) {
+    if (!s) return CString();
+    int wlen = ::MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (wlen <= 0) return CString();
+    std::wstring out(wlen, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s, -1, &out[0], wlen);
+    out.resize(wlen - 1);
+    return CString(out.c_str());
+}
+struct ZipEntryInfo { CString filename; int64_t size = 0; unsigned long crc = 0; CString mtime; int cm = 0; CString em; int idx = 0; };
+// Walks a directory and adds every file to the zip ourselves (rather than relying on minizip-ng's own
+// mz_zip_writer_add_path), because add_path aborts the ENTIRE operation on the first file it fails to add --
+// one awkward filename partway through silently cuts off everything after it. This keeps going past individual
+// failures and only reports the overall outcome, the same way $finddir/$findfile's own directory walk works.
+static bool ZipAddDirRecursive(void* writer, const CString& baseDir, const CString& relPrefix) {
+    CString base = baseDir; if (base.Right(1) != L"\\") base += L"\\";
+    WIN32_FIND_DATAW fd; HANDLE h = ::FindFirstFileW(base + L"*", &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;   // empty or inaccessible directory isn't treated as a hard failure
+    bool allOk = true;
+    do {
+        CString name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        CString fullPath = base + name;
+        CString relName = relPrefix.IsEmpty() ? name : (relPrefix + L"/" + name);   // zip entries conventionally use forward slashes regardless of host OS
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!ZipAddDirRecursive(writer, fullPath, relName)) allOk = false;
+        } else {
+            std::string pathA = Utf8FromCString(fullPath), nameA = Utf8FromCString(relName);
+            if (mz_zip_writer_add_file(writer, pathA.c_str(), nameA.c_str()) != MZ_OK) allOk = false;
+        }
+    } while (::FindNextFileW(h, &fd));
+    ::FindClose(h);
+    return allOk;
+}
+static bool ZipCreate(const CString& zipPath, const CString& srcPath, const CString& password, bool overwrite) {
+    if (!overwrite && PathExistsFn(zipPath)) return false;
+    if (overwrite) ::DeleteFileW(zipPath);
+    void* writer = mz_zip_writer_create();
+    if (!writer) return false;
+    std::string pw = Utf8FromCString(password);
+    if (!password.IsEmpty()) { mz_zip_writer_set_password(writer, pw.c_str()); mz_zip_writer_set_aes(writer, 1); }
+    mz_zip_writer_set_compress_method(writer, MZ_COMPRESS_METHOD_DEFLATE);
+    std::string zipA = Utf8FromCString(zipPath);
+    int32_t err = mz_zip_writer_open_file(writer, zipA.c_str(), 0, 0);
+    bool ok = err == MZ_OK;
+    if (ok) {
+        if (IsDirPath(srcPath)) ok = ZipAddDirRecursive(writer, srcPath, CString());
+        else {
+            std::string srcA = Utf8FromCString(srcPath), nameA = Utf8FromCString(NoPathPart(srcPath));
+            ok = mz_zip_writer_add_file(writer, srcA.c_str(), nameA.c_str()) == MZ_OK;
+        }
+    }
+    int32_t closeErr = mz_zip_writer_close(writer);
+    mz_zip_writer_delete(&writer);
+    return ok && closeErr == MZ_OK;
+}
+static int32_t ZipNoOverwriteCb(void*, void*, mz_zip_file*, const char*) { return MZ_EXIST_ERROR; }
+static bool ZipExtract(const CString& zipPath, const CString& destDir, const CString& password, bool overwrite) {
+    void* reader = mz_zip_reader_create();
+    if (!reader) return false;
+    std::string pw = Utf8FromCString(password);
+    if (!password.IsEmpty()) mz_zip_reader_set_password(reader, pw.c_str());
+    if (!overwrite) mz_zip_reader_set_overwrite_cb(reader, nullptr, ZipNoOverwriteCb);
+    std::string zipA = Utf8FromCString(zipPath);
+    int32_t err = mz_zip_reader_open_file(reader, zipA.c_str());
+    if (err == MZ_OK) { std::string dirA = Utf8FromCString(destDir); err = mz_zip_reader_save_all(reader, dirA.c_str()); }
+    mz_zip_reader_close(reader);
+    mz_zip_reader_delete(&reader);
+    return err == MZ_OK;
+}
+static bool ZipTest(const CString& zipPath, const CString& password) {
+    void* reader = mz_zip_reader_create();
+    if (!reader) return false;
+    std::string pw = Utf8FromCString(password);
+    if (!password.IsEmpty()) mz_zip_reader_set_password(reader, pw.c_str());
+    std::string zipA = Utf8FromCString(zipPath);
+    int32_t err = mz_zip_reader_open_file(reader, zipA.c_str());
+    bool ok = err == MZ_OK;
+    while (ok && err == MZ_OK) {
+        if (mz_zip_reader_entry_open(reader) != MZ_OK) { ok = false; break; }
+        uint8_t buf[8192]; int32_t n;
+        do { n = mz_zip_reader_entry_read(reader, buf, sizeof buf); } while (n > 0);
+        if (n < 0) ok = false;   // a negative return mid-read is a genuine error (including CRC mismatch, checked internally)
+        if (mz_zip_reader_entry_close(reader) != MZ_OK) ok = false;   // entry_close is also where the final CRC check against the stored value happens
+        if (!ok) break;
+        err = mz_zip_reader_goto_next_entry(reader);
+    }
+    if (err != MZ_OK && err != MZ_END_OF_LIST) ok = false;
+    mz_zip_reader_close(reader);
+    mz_zip_reader_delete(&reader);
+    return ok;
+}
+// wantIdx >= 1 looks up the Nth entry; wantIdx == 0 just counts (info is left untouched); wantName (if non-empty)
+// looks up by name instead of position, taking priority over wantIdx.
+static bool ZipList(const CString& zipPath, const CString& password, int wantIdx, const CString& wantName, int& totalCount, ZipEntryInfo& info) {
+    totalCount = 0;
+    void* reader = mz_zip_reader_create();
+    if (!reader) return false;
+    std::string pw = Utf8FromCString(password);
+    if (!password.IsEmpty()) mz_zip_reader_set_password(reader, pw.c_str());
+    std::string zipA = Utf8FromCString(zipPath);
+    int32_t err = mz_zip_reader_open_file(reader, zipA.c_str());
+    if (err != MZ_OK) { mz_zip_reader_delete(&reader); return false; }
+    int idx = 0; bool found = false;
+    err = mz_zip_reader_goto_first_entry(reader);
+    while (err == MZ_OK) {
+        idx++;
+        mz_zip_file* fi = nullptr;
+        if (!found && mz_zip_reader_entry_get_info(reader, &fi) == MZ_OK && fi) {
+            CString fname = Utf8ToCString(fi->filename);
+            bool match = !wantName.IsEmpty() ? (fname.CompareNoCase(wantName) == 0) : (idx == wantIdx);
+            if (match) {
+                found = true;
+                info.filename = fname; info.size = fi->uncompressed_size; info.crc = fi->crc;
+                CTime ct((time_t)fi->modified_date); info.mtime = ct.GetTime() > 0 ? ct.Format(L"%a %b %d %H:%M:%S %Y") : CString();
+                info.cm = fi->compression_method; info.em = fi->aes_version ? CString(L"AES") : CString(L"none"); info.idx = idx;
+            }
+        }
+        err = mz_zip_reader_goto_next_entry(reader);
+    }
+    totalCount = idx;
+    mz_zip_reader_close(reader);
+    mz_zip_reader_delete(&reader);
+    return found;
 }
 // Loads any GDI+-supported image file (bmp/jpg/png/gif/...), scales it to fit w x h while preserving
 // aspect ratio, and returns a plain GDI HBITMAP the caller owns. Returns nullptr if the file can't be read.
@@ -3005,7 +3159,7 @@ public:
         CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_NF_LIST);
         int sel = lb->GetCurSel();
         lb->ResetContent();
-        for (auto& e : *notifyBook) { CString s; s.Format(L"%s - %s%s", (LPCWSTR)e.nick, e.online ? L"Online" : L"Offline", e.note.IsEmpty() ? L"" : (LPCWSTR)(CString(L" (") + e.note + L")")); lb->AddString(s); }
+        for (auto& e : *notifyBook) { CString s; s.Format(L"%s - %s%s", (LPCWSTR)e.nick, e.online ? L"Online" : L"Offline", e.note.IsEmpty() ? L"" : (CString(L" (") + e.note + L")")); lb->AddString(s); }
         if (sel >= 0 && sel < lb->GetCount()) lb->SetCurSel(sel);
     }
     void ShowNotifyEntry(int idx) {
@@ -3020,9 +3174,7 @@ public:
         CListBox* lb = (CListBox*)GetDlgItem(IDC_AB_HL_LIST);
         int sel = lb->GetCurSel();
         lb->ResetContent();
-        for (auto& e : *highlightBook) { 
-            CString s; s.Format(L"%s%s", (LPCWSTR)e.words, e.targets.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.targets)); lb->AddString(s);
-        }
+        for (auto& e : *highlightBook) { CString s; s.Format(L"%s%s", (LPCWSTR)e.words, e.targets.IsEmpty() ? L"" : (CString(L" on ") + e.targets)); lb->AddString(s); }
         if (sel >= 0 && sel < lb->GetCount()) lb->SetCurSel(sel);
     }
     void ShowHighlightEntry(int idx) {
@@ -3043,7 +3195,7 @@ public:
         if (sel == 3) { for (auto& e : *ignoreList) { CString s; s.Format(L"%s%s", e.excluded ? L"(excl) " : L"", (LPCWSTR)e.mask); lb->AddString(s); } }
         else {
             std::vector<AutoActionEntry>* list = sel == 0 ? aopList : sel == 1 ? avoiceList : protectList;
-            for (auto& e : *list) { CString s; s.Format(L"%s%s", (LPCWSTR)e.mask, e.channels.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.channels)); lb->AddString(s); }
+            for (auto& e : *list) { CString s; s.Format(L"%s%s", (LPCWSTR)e.mask, e.channels.IsEmpty() ? L"" : (CString(L" on ") + e.channels)); lb->AddString(s); }
         }
         bool enabled = sel == 0 ? aopOn : sel == 1 ? avoiceOn : sel == 2 ? protectOn : ignoreOn;
         CheckDlgButton(IDC_AB_CT_ENABLE, enabled);
@@ -3870,7 +4022,7 @@ class CMainFrame : public CMDIFrameWnd {
         int n = 0; bool wild = pat.FindOneOf(L"*?") >= 0; CString pk = VKey(pat);
         auto sweep = [&](VarMap& m, bool isGlobal) {
             for (auto it = m.begin(); it != m.end();) {
-                if (wild ? GlobMatch(pk, it->first, false) : it->first == pk) { it = m.erase(it); n++; if (isGlobal) m_varsDirty = true; }
+                if (wild ? GlobMatch(pk, it->first) : it->first == pk) { it = m.erase(it); n++; if (isGlobal) m_varsDirty = true; }
                 else ++it;
             }
         };
@@ -4016,7 +4168,7 @@ class CMainFrame : public CMDIFrameWnd {
             int M = comma >= 0 ? _wtoi(a.Mid(comma + 1)) : 0;
             CNickEntry* found = nullptr; int pos = 0; double idxD;
             if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_cnickList.size()) { found = &m_cnickList[idx - 1]; pos = idx; } }
-            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, sel, false) || m_cnickList[i].nick.CompareNoCase(sel) == 0) { found = &m_cnickList[i]; pos = (int)i + 1; break; }
+            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, sel) || m_cnickList[i].nick.CompareNoCase(sel) == 0) { found = &m_cnickList[i]; pos = (int)i + 1; break; }
             if (!found) {
                 if (prop == L"color") val.Format(L"%d", (int)cText);   // "'Normal Text' color, or if M=1, 'Listbox text' color" -- this app doesn't keep those as two separate colors, so both report the same one
                 else val = L"0";
@@ -4038,7 +4190,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = EvalIds(w, rawArgs, params); a.Trim();
             AutoActionEntry* found = nullptr; double idxD;
             if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)list.size()) found = &list[idx - 1]; }
-            else for (auto& e : list) if (GlobMatch(e.mask, a, false) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
+            else for (auto& e : list) if (GlobMatch(e.mask, a) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
             if (!found) { val.Empty(); return true; }
             if (prop == L"type") val = found->channels; else if (prop == L"network") val = found->network; else val = found->mask;
             return true;
@@ -4161,7 +4313,7 @@ class CMainFrame : public CMDIFrameWnd {
                 for (int i = from; i < (int)lines.size(); i++) {
                     CString ln = lines[i]; bool matched;
                     if (switches.Find(L's') >= 0) matched = ln.Left(matchtext.GetLength()).CompareNoCase(matchtext) == 0;
-                    else matched = GlobMatch(matchtext, ln, false);
+                    else matched = GlobMatch(matchtext, ln);
                     if (matched) {
                         m_readn = i + 1;
                         val = (switches.Find(L's') >= 0) ? ln.Mid(matchtext.GetLength()) : ln;
@@ -4281,10 +4433,10 @@ class CMainFrame : public CMDIFrameWnd {
             if (parts.size() == 1) {
                 double nD;
                 if (ParseNum(parts[0], nD)) { int idx = (int)nD; if (idx >= 1 && idx <= (int)m_abook.size()) found = &m_abook[idx - 1]; }
-                else for (auto& e : m_abook) if (GlobMatch(parts[0], e.nick, false)) { found = &e; break; }
+                else for (auto& e : m_abook) if (GlobMatch(parts[0], e.nick)) { found = &e; break; }
             } else if (parts.size() >= 2) {
                 int n = _wtoi(parts[1]); int cnt = 0;
-                for (auto& e : m_abook) if (GlobMatch(parts[0], e.nick, false)) { cnt++; if (cnt == n) { found = &e; break; } }
+                for (auto& e : m_abook) if (GlobMatch(parts[0], e.nick)) { cnt++; if (cnt == n) { found = &e; break; } }
             }
             if (!found) { val.Empty(); return true; }
             if (prop == L"nick") val = found->nick; else if (prop == L"email") val = found->email; else if (prop == L"website") val = found->website;
@@ -4300,11 +4452,45 @@ class CMainFrame : public CMDIFrameWnd {
             val = a.CompareNoCase(L"aliases.ini") == 0 ? a : CString();
             return true;
         }
+        if (name == L"zip") {   // $zip(file.zip,cetlpo,file|dir,password,N) -- create/extract/test/list a zip, with optional AES-256 password protection
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            if (parts.size() < 2) { val.Empty(); return true; }
+            CString zipFile = parts[0]; zipFile.Trim();
+            CString switches = parts[1]; switches.Trim(); switches.MakeLower();
+            bool pFlag = switches.Find(L'p') >= 0, oFlag = switches.Find(L'o') >= 0;
+            if (switches.Find(L'l') >= 0) {
+                // Listing has no use for "file|dir", so that slot is skipped entirely here: file.zip, switches,
+                // [password if p], N -- NOT file.zip, switches, file|dir, password, N like the other operations.
+                CString password = (pFlag && parts.size() > 2) ? parts[2] : CString();
+                CString nArg = pFlag ? (parts.size() > 3 ? parts[3] : CString()) : (parts.size() > 2 ? parts[2] : CString());
+                nArg.Trim();
+                double nD; bool nIsNum = ParseNum(nArg, nD);
+                int totalCount = 0; ZipEntryInfo info;
+                if (nIsNum && (int)nD == 0) { ZipList(zipFile, password, 0, CString(), totalCount, info); val.Format(L"%d", totalCount); return true; }
+                bool found = nIsNum ? ZipList(zipFile, password, (int)nD, CString(), totalCount, info) : ZipList(zipFile, password, 0, nArg, totalCount, info);
+                if (!found) { val.Empty(); return true; }
+                if (prop == L"size") val.Format(L"%lld", (long long)info.size);
+                else if (prop == L"crc") val.Format(L"%08lx", info.crc);
+                else if (prop == L"mtime") val = info.mtime;
+                else if (prop == L"cm") val.Format(L"%d", info.cm);
+                else if (prop == L"em") val = info.em;
+                else if (prop == L"idx") val.Format(L"%d", info.idx);
+                else val = info.filename;
+                return true;
+            }
+            CString target = parts.size() > 2 ? parts[2] : CString(); target.Trim();
+            CString password = (pFlag && parts.size() > 3) ? parts[3] : CString();
+            if (switches.Find(L'c') >= 0) { val = ZipCreate(zipFile, target, password, oFlag) ? L"$true" : L"$false"; return true; }
+            if (switches.Find(L'e') >= 0) { val = ZipExtract(zipFile, target, password, oFlag) ? L"$true" : L"$false"; return true; }
+            if (switches.Find(L't') >= 0) { val = ZipTest(zipFile, password) ? L"$true" : L"$false"; return true; }
+            val.Empty(); return true;
+        }
         if (name == L"ignore") {   // $ignore(address|N) -- the matching list entry, or the Nth one; .type .network .secs
             CString a = EvalIds(w, rawArgs, params); a.Trim();
             IgnoreEntry* found = nullptr; double idxD;
             if (ParseNum(a, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_ignoreList.size()) found = &m_ignoreList[idx - 1]; }
-            else for (auto& e : m_ignoreList) if (GlobMatch(e.mask, a, false) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
+            else for (auto& e : m_ignoreList) if (GlobMatch(e.mask, a) || e.mask.CompareNoCase(a) == 0) { found = &e; break; }
             if (!found) { val.Empty(); return true; }
             if (prop == L"type") {
                 CString types; if (found->p) types += L"p"; if (found->c) types += L"c"; if (found->n) types += L"n"; if (found->t) types += L"t"; if (found->i) types += L"i";
@@ -4324,7 +4510,7 @@ class CMainFrame : public CMDIFrameWnd {
             else if (a == L"song") { CString r = MciCmd(L"status " + m_mp3Chan.alias + L" volume"); v = r.IsEmpty() ? 0 : (_wtoi(r) * 65535 / 1000); }
             else if (a == L"master") { v = GetMasterVolumeNow(); mute = GetMasterMuteNow(); }
             else { val.Empty(); return true; }
-            val = (prop == L"mute") ? (mute ? CString(L"$true") : CString(L"$false")) : CString();
+            val = prop == L"mute" ? (mute ? L"$true" : L"$false") : CString();
             if (prop != L"mute") val.Format(L"%d", v);
             return true;
         }
@@ -4361,7 +4547,7 @@ class CMainFrame : public CMDIFrameWnd {
             double nn = 1; if (c >= 0 && !ParseNum(a.Mid(c + 1), nn)) return false;
             std::vector<CChatWnd*> customs; for (auto& kv : m_w) if (kv.second->m_custom) customs.push_back(kv.second);
             CChatWnd* cw = nullptr;
-            if (!sel.IsEmpty() && sel[0] == L'@') { int idx = 0; for (auto* x : customs) if (GlobMatch(sel, x->m_name, false) && ++idx == (int)nn) { cw = x; break; } }
+            if (!sel.IsEmpty() && sel[0] == L'@') { int idx = 0; for (auto* x : customs) if (GlobMatch(sel, x->m_name) && ++idx == (int)nn) { cw = x; break; } }
             else { double idxD; if (ParseNum(sel, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)customs.size()) cw = customs[idx - 1]; } }
             if (!cw) { val.Empty(); return true; }
             CRect r; cw->GetWindowRect(r); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&r, 2);
@@ -4435,9 +4621,9 @@ class CMainFrame : public CMDIFrameWnd {
             double nn = 1; if (c >= 0 && !ParseNum(EvalIds(w, rawArgs.Mid(c + 1), params), nn)) return false;
             CString pk = VKey(pat); bool wild = pk.FindOneOf(L"*?") >= 0;
             std::vector<std::pair<VarEntry*, bool>> hits;
-            if (!m_scopes.empty()) for (auto& kv : m_scopes.back().locals) if (wild ? GlobMatch(pk, kv.first, false) : kv.first == pk) hits.push_back({ &kv.second, true });
+            if (!m_scopes.empty()) for (auto& kv : m_scopes.back().locals) if (wild ? GlobMatch(pk, kv.first) : kv.first == pk) hits.push_back({ &kv.second, true });
             for (auto& kv : m_vars) {
-                if (!(wild ? GlobMatch(pk, kv.first, false) : kv.first == pk)) continue;
+                if (!(wild ? GlobMatch(pk, kv.first) : kv.first == pk)) continue;
                 if (!m_scopes.empty() && m_scopes.back().locals.count(kv.first)) continue;   // shadowed by a local of the same name
                 hits.push_back({ &kv.second, false });
             }
@@ -4776,7 +4962,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (op == L"isin") { CString a = lv, b = rv; a.MakeLower(); b.MakeLower(); r = b.Find(a) >= 0; }
         else if (op == L"isincs") r = rv.Find(lv) >= 0;
-        else if (op == L"iswm") r = GlobMatch(lv, rv, false);      // the wildcard pattern is on the left
+        else if (op == L"iswm") r = GlobMatch(lv, rv);      // the wildcard pattern is on the left
         else if (op == L"iswmcs") r = GlobMatch(lv, rv, true);
         else if (op == L"ischan") r = !lv.IsEmpty() && wcschr(L"#&+!", lv[0]) != nullptr;
         return neg ? !r : r;
@@ -6364,7 +6550,7 @@ class CMainFrame : public CMDIFrameWnd {
         if ((sFlag || hFlag) && arg.IsEmpty()) return;
         if (lFlag) {
             if (m_notify.empty()) { Show(w, L"* Notify list is empty.", cInfo); return; }
-            for (auto& e : m_notify) { CString s; s.Format(L"* %s - %s%s", (LPCWSTR)e.nick, e.online ? L"online" : L"offline", e.note.IsEmpty() ? L"" : (LPCWSTR)(CString(L" (") + e.note + L")")); Show(w, s, cInfo); }
+            for (auto& e : m_notify) { CString s; s.Format(L"* %s - %s%s", (LPCWSTR)e.nick, e.online ? L"online" : L"offline", e.note.IsEmpty() ? L"" : (CString(L" (") + e.note + L")")); Show(w, s, cInfo); }
             return;
         }
         if (arg.IsEmpty()) { NotifyTick(true); Show(w, L"* Notify list update requested.", cInfo); return; }
@@ -6439,7 +6625,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto it = m_ignoreList.begin(); it != m_ignoreList.end();) {
             if (it->expiresAt && now >= it->expiresAt) { it = m_ignoreList.erase(it); continue; }
             bool netOk = it->network.IsEmpty() || (net && (it->network.CompareNoCase(net->tag) == 0 || (!net->network.IsEmpty() && it->network.CompareNoCase(net->network) == 0)));
-            if (netOk && IgnoreTypeFlag(*it, type) && (GlobMatch(it->mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(it->mask, hostmask, false)))) {
+            if (netOk && IgnoreTypeFlag(*it, type) && (GlobMatch(it->mask, nick) || (!hostmask.IsEmpty() && GlobMatch(it->mask, hostmask)))) {
                 if (it->excluded) return false;
                 ignored = true;
             }
@@ -6467,7 +6653,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (lFlag) {
             if (m_ignoreList.empty()) { Show(w, L"* Ignore list is empty.", cInfo); return; }
-            for (auto& e : m_ignoreList) { CString s; s.Format(L"* %s%s%s", e.excluded ? L"(excluded) " : L"", (LPCWSTR)e.mask, e.network.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.network)); Show(w, s, cInfo); }
+            for (auto& e : m_ignoreList) { CString s; s.Format(L"* %s%s%s", e.excluded ? L"(excluded) " : L"", (LPCWSTR)e.mask, e.network.IsEmpty() ? L"" : (CString(L" on ") + e.network)); Show(w, s, cInfo); }
             return;
         }
         if (arg.IsEmpty()) {
@@ -6546,7 +6732,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& e : list) {
             bool netOk = e.network.IsEmpty() || (net && (e.network.CompareNoCase(net->tag) == 0 || (!net->network.IsEmpty() && e.network.CompareNoCase(net->network) == 0)));
             if (!netOk) continue;
-            bool maskOk = GlobMatch(e.mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask, false));
+            bool maskOk = GlobMatch(e.mask, nick) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask));
             if (maskOk && ChannelInList(e.channels, chan)) return true;
         }
         return false;
@@ -6585,7 +6771,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (lFlag) {
             if (list.empty()) { Show(w, L"* " + label + L" list is empty.", cInfo); return; }
-            for (auto& e : list) { CString s; s.Format(L"* %s%s%s", (LPCWSTR)e.mask, e.channels.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.channels), e.network.IsEmpty() ? L"" : (LPCWSTR)(CString(L" [") + e.network + L"]")); Show(w, s, cInfo); }
+            for (auto& e : list) { CString s; s.Format(L"* %s%s%s", (LPCWSTR)e.mask, e.channels.IsEmpty() ? L"" : (CString(L" on ") + e.channels), e.network.IsEmpty() ? L"" : (CString(L" [") + e.network + L"]")); Show(w, s, cInfo); }
             return;
         }
         if (arg.IsEmpty()) {
@@ -6647,25 +6833,18 @@ class CMainFrame : public CMDIFrameWnd {
         WritePrivateProfileStringW(L"Cnick", L"Count", cs, path);
         for (size_t i = 0; i < m_cnickList.size(); i++) {
             CString sec; sec.Format(L"Entry%d", (int)i); auto& e = m_cnickList[i];
-            WritePrivateProfileStringW(sec, L"Nick", e.nick, path); 
-            WritePrivateProfileStringW(sec, L"Color", e.autoColor ? L"*" : (LPCWSTR)e.colorStr, path);
-            WritePrivateProfileStringW(sec, L"Modes", e.modes, path); 
-            WritePrivateProfileStringW(sec, L"Levels", e.levels, path);
-            WritePrivateProfileStringW(sec, L"AnyMode", e.anyMode ? L"1" : L"0", path); 
-            WritePrivateProfileStringW(sec, L"NoMode", e.noMode ? L"1" : L"0", path);
-            WritePrivateProfileStringW(sec, L"Ignore", e.ignoreCond ? L"1" : L"0", path); 
-            WritePrivateProfileStringW(sec, L"Op", e.opCond ? L"1" : L"0", path);
-            WritePrivateProfileStringW(sec, L"Voice", e.voiceCond ? L"1" : L"0", path); 
-            WritePrivateProfileStringW(sec, L"Protect", e.protectCond ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Nick", e.nick, path); WritePrivateProfileStringW(sec, L"Color", e.autoColor ? L"*" : e.colorStr, path);
+            WritePrivateProfileStringW(sec, L"Modes", e.modes, path); WritePrivateProfileStringW(sec, L"Levels", e.levels, path);
+            WritePrivateProfileStringW(sec, L"AnyMode", e.anyMode ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"NoMode", e.noMode ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Ignore", e.ignoreCond ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Op", e.opCond ? L"1" : L"0", path);
+            WritePrivateProfileStringW(sec, L"Voice", e.voiceCond ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Protect", e.protectCond ? L"1" : L"0", path);
             WritePrivateProfileStringW(sec, L"Notify", e.notifyCond ? L"1" : L"0", path);
-            CString idleS; idleS.Format(L"%d", e.idleMin); 
-            WritePrivateProfileStringW(sec, L"Idle", idleS, path);
-            CString methS; methS.Format(L"%d", e.method); 
-            WritePrivateProfileStringW(sec, L"Method", methS, path);
+            CString idleS; idleS.Format(L"%d", e.idleMin); WritePrivateProfileStringW(sec, L"Idle", idleS, path);
+            CString methS; methS.Format(L"%d", e.method); WritePrivateProfileStringW(sec, L"Method", methS, path);
         }
     }
     bool IsOnIgnoreList(const CString& nick, const CString& hostmask) {   // regardless of type -- used only as a /cnick -i match condition
-        for (auto& e : m_ignoreList) if (GlobMatch(e.mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask, false))) return !e.excluded;
+        for (auto& e : m_ignoreList) if (GlobMatch(e.mask, nick) || (!hostmask.IsEmpty() && GlobMatch(e.mask, hostmask))) return !e.excluded;
         return false;
     }
     COLORREF ResolveNickColor(const CNickEntry& e, const CString& nick) {
@@ -6679,7 +6858,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& e : m_cnickList) {
             CString mask = e.nick;
             if (mask.Find(L'$') >= 0 || mask.Find(L'%') >= 0) mask = EvalIds(chanWnd, mask, CString());   // "you can specify %vars or $identifiers as the nick"
-            bool nickOk = GlobMatch(mask, nick, false) || (!hostmask.IsEmpty() && GlobMatch(mask, hostmask, false));
+            bool nickOk = GlobMatch(mask, nick) || (!hostmask.IsEmpty() && GlobMatch(mask, hostmask));
             if (!nickOk) continue;
             if (!e.anyMode) {
                 wchar_t prefixChar = chanWnd ? chanWnd->NickPrefixChar(nick) : 0;
@@ -6720,7 +6899,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (rFlag) {
             double idxD;
             if (ParseNum(first, idxD)) { int idx = (int)idxD; if (idx >= 1 && idx <= (int)m_cnickList.size()) m_cnickList.erase(m_cnickList.begin() + (idx - 1)); }
-            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, first, false) || m_cnickList[i].nick.CompareNoCase(first) == 0) { m_cnickList.erase(m_cnickList.begin() + i); break; }
+            else for (size_t i = 0; i < m_cnickList.size(); i++) if (GlobMatch(m_cnickList[i].nick, first) || m_cnickList[i].nick.CompareNoCase(first) == 0) { m_cnickList.erase(m_cnickList.begin() + i); break; }
             SaveCnick(); RefreshAllNickColors(); Show(w, L"* Removed from the nick color list.", cInfo);
             return;
         }
@@ -6787,7 +6966,7 @@ class CMainFrame : public CMDIFrameWnd {
     static bool TermsMatchWhole(const CString& csv, const CString& whole) {   // used for the nickname/.targets checks -- each comma-separated term matched against the entire string
         if (csv.IsEmpty()) return false;
         CString tmp = csv; int pos = 0;
-        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (!t.IsEmpty() && GlobMatch(t, whole, false)) return true; }
+        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (!t.IsEmpty() && GlobMatch(t, whole)) return true; }
         return false;
     }
     // A plain (non-wildcard) word only matches a complete extracted word, since GlobMatch requires an exact match when
@@ -6797,7 +6976,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (csv.IsEmpty()) return false;
         std::vector<CString> words = ExtractWords(text);
         CString tmp = csv; int pos = 0;
-        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (t.IsEmpty()) continue; for (auto& wrd : words) if (GlobMatch(t, wrd, false)) return true; }
+        while (pos != -1) { CString t = tmp.Tokenize(L",", pos); t.Trim(); if (t.IsEmpty()) continue; for (auto& wrd : words) if (GlobMatch(t, wrd)) return true; }
         return false;
     }
     HighlightEntry* MatchHighlight(const CString& nick, const CString& text, const CString& targetName) {
@@ -6822,7 +7001,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (a == L"off") { m_highlightOn = false; SaveHighlight(); Show(w, L"* Highlighting off.", cInfo); return; }
         if (a == L"-l") {
             if (m_highlightList.empty()) { Show(w, L"* Highlight list is empty.", cInfo); return; }
-            for (auto& e : m_highlightList) { CString s; s.Format(L"* %s%s", (LPCWSTR)e.words, e.targets.IsEmpty() ? L"" : (LPCWSTR)(CString(L" on ") + e.targets)); Show(w, s, cInfo); }
+            for (auto& e : m_highlightList) { CString s; s.Format(L"* %s%s", (LPCWSTR)e.words, e.targets.IsEmpty() ? L"" : (CString(L" on ") + e.targets)); Show(w, s, cInfo); }
             return;
         }
         if (arg.Left(3).MakeLower() == L"-r ") {
@@ -7217,7 +7396,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (eFlag) {   // -e: run the matching timer(s) right now, once, without touching their schedule or repeat count
             bool any = false;
-            for (auto& t : m_timers) if (GlobMatch(tname, t.name, false)) { any = true; CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : w; if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString()); }
+            for (auto& t : m_timers) if (GlobMatch(tname, t.name)) { any = true; CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : w; if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString()); }
             if (!any) Show(w, L"* No matching timer: " + tname, cPart);
             return;
         }
@@ -7225,7 +7404,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (w1l == L"off") {
             bool wild = tname.Find(L'?') >= 0 || tname.Find(L'*') >= 0;
             size_t before = m_timers.size();
-            m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return wild ? GlobMatch(tname, t.name, false) : t.name.CompareNoCase(tname) == 0; }), m_timers.end());
+            m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return wild ? GlobMatch(tname, t.name) : t.name.CompareNoCase(tname) == 0; }), m_timers.end());
             Show(w, before == m_timers.size() ? L"* No matching timer: " + tname : L"* Timer(s) turned off: " + tname, before == m_timers.size() ? cPart : cInfo);
             return;
         }

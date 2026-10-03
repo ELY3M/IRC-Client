@@ -109,16 +109,20 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;_WIN32_WINNT=0x0601;ZLIB_COMPAT;HAVE_ZLIB;HAVE_WZAES;HAVE_CRYPT_BACKEND;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;
+</PreprocessorDefinitions>
+      <ConformanceMode>false</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>zipkit;</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SpecifySectionAttributes>
       </SpecifySectionAttributes>
+      <AdditionalDependencies>ws2_32.lib;bcrypt.lib;</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -129,16 +133,19 @@
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;_WIN32_WINNT=0x0601;ZLIB_COMPAT;HAVE_ZLIB;HAVE_WZAES;HAVE_CRYPT_BACKEND;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;
+</PreprocessorDefinitions>
+      <ConformanceMode>false</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>zipkit;</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SpecifySectionAttributes>
       </SpecifySectionAttributes>
+      <AdditionalDependencies>ws2_32.lib;bcrypt.lib;</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -146,6 +153,27 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="IRC.cpp" />
+    <ClCompile Include="zipkit\adler32.c" />
+    <ClCompile Include="zipkit\crc32.c" />
+    <ClCompile Include="zipkit\deflate.c" />
+    <ClCompile Include="zipkit\inffast.c" />
+    <ClCompile Include="zipkit\inflate.c" />
+    <ClCompile Include="zipkit\inftrees.c" />
+    <ClCompile Include="zipkit\mz_crypt.c" />
+    <ClCompile Include="zipkit\mz_crypt_winvista.c" />
+    <ClCompile Include="zipkit\mz_os.c" />
+    <ClCompile Include="zipkit\mz_os_win32.c" />
+    <ClCompile Include="zipkit\mz_strm.c" />
+    <ClCompile Include="zipkit\mz_strm_buf.c" />
+    <ClCompile Include="zipkit\mz_strm_mem.c" />
+    <ClCompile Include="zipkit\mz_strm_os_win32.c" />
+    <ClCompile Include="zipkit\mz_strm_split.c" />
+    <ClCompile Include="zipkit\mz_strm_wzaes.c" />
+    <ClCompile Include="zipkit\mz_strm_zlib.c" />
+    <ClCompile Include="zipkit\mz_zip.c" />
+    <ClCompile Include="zipkit\mz_zip_rw.c" />
+    <ClCompile Include="zipkit\trees.c" />
+    <ClCompile Include="zipkit\zutil.c" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="about.bmp" />
