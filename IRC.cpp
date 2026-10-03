@@ -1766,6 +1766,7 @@ public:
     std::function<void(int)> onSel, onClose;
     std::function<void(int, CPoint)> onMenu;
     std::function<void(CPoint)> onBarMenu;   // right-click on empty space (not a button)
+    std::function<void(CPoint)> onDragEnd;   // a drag that started on the grip (see InGrip) ended at this screen point; the frame decides which edge to redock to
     Gdiplus::Bitmap* skin = nullptr;   // background skin image, owned by the frame; nullptr = plain color
     BOOL Create(CWnd* parent) {
         return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_BTNFACE + 1)), nullptr,
@@ -1786,6 +1787,8 @@ protected:
         for (int i = 0; i < (int)btns.size(); i++) if (BtnRect(i, c, vert).PtInRect(p)) return i;
         return -1;
     }
+    bool InGrip(const CRect& c, bool vert, CPoint p) const { return vert ? (p.y < (int)GRIP) : (p.x < (int)GRIP); }
+    bool m_dragging = false;
     void DrawGrip(CDC& dc, const CRect& c, bool vert) {   // a small cluster of dots at the leading edge, like a standard Win32 rebar gripper --
         CBrush br(::GetSysColor(COLOR_BTNSHADOW)); CBrush* ob = dc.SelectObject(&br);   // visual only (see onBarMenu for how repositioning actually happens)
         if (vert) { for (int x = c.Width() / 2 - 4; x <= c.Width() / 2 + 4; x += 4) for (int y = 3; y < GRIP - 1; y += 4) dc.Ellipse(x, y, x + 2, y + 2); }
@@ -1811,7 +1814,15 @@ protected:
             dc.DrawText(b.text, t, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
-    afx_msg void OnLButtonDown(UINT, CPoint p) { int i = Hit(p); if (i >= 0 && onSel) onSel(i); }
+    afx_msg void OnLButtonDown(UINT, CPoint p) {
+        CRect c; GetClientRect(c); bool vert = IsVertical(c);
+        if (InGrip(c, vert, p)) { m_dragging = true; SetCapture(); ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); return; }
+        int i = Hit(p); if (i >= 0 && onSel) onSel(i);
+    }
+    afx_msg void OnMouseMove(UINT, CPoint) { if (m_dragging) ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); }   // re-applied every move: the default WM_SETCURSOR processing would otherwise keep resetting it to the arrow
+    afx_msg void OnLButtonUp(UINT, CPoint p) {
+        if (m_dragging) { m_dragging = false; ReleaseCapture(); CPoint sp = p; ClientToScreen(&sp); if (onDragEnd) onDragEnd(sp); }
+    }
     afx_msg void OnRButtonUp(UINT, CPoint p) {
         int i = Hit(p); CPoint sp = p; ClientToScreen(&sp);
         if (i >= 0) { if (onMenu) onMenu(i, sp); } else if (onBarMenu) onBarMenu(sp);
@@ -1826,6 +1837,36 @@ BEGIN_MESSAGE_MAP(CSwitchBar, CWnd)
     ON_WM_RBUTTONUP() 
     ON_WM_MBUTTONUP()
     ON_WM_ERASEBKGND()
+    ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP()
+END_MESSAGE_MAP()
+
+// ---------------- Toolbar: a thin CToolBar subclass, only to detect a drag starting on empty space (not a button)
+// and report where it ends. This does NOT use MFC's EnableDocking/DockControlBar -- that was tried and reverted
+// (see CMainFrame::BuildToolbar's comment): it wraps the toolbar in an internal CDockBar container whose size
+// didn't match the toolbar's own layout, breaking its background and right-click handling. Positioning here stays
+// entirely manual (CMainFrame::LayoutBars), with this class only adding the mouse tracking for the drag gesture. ----
+class CDraggableToolBar : public CToolBar {
+public:
+    std::function<void(CPoint)> onDragEnd;   // a drag that started on empty toolbar space ended at this screen point
+protected:
+    bool m_dragging = false;
+    afx_msg void OnLButtonDown(UINT flags, CPoint p) {
+        int idx = GetToolBarCtrl().HitTest(&p);
+        if (idx < 0) { m_dragging = true; SetCapture(); ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); return; }   // negative = not on a button: empty space, fair game to drag from
+        CToolBar::OnLButtonDown(flags, p);
+    }
+    afx_msg void OnMouseMove(UINT flags, CPoint p) {
+        if (m_dragging) ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL));   // re-applied every move, same reason as CSwitchBar's version
+        CToolBar::OnMouseMove(flags, p);
+    }
+    afx_msg void OnLButtonUp(UINT flags, CPoint p) {
+        if (m_dragging) { m_dragging = false; ReleaseCapture(); CPoint sp = p; ClientToScreen(&sp); if (onDragEnd) onDragEnd(sp); }
+        CToolBar::OnLButtonUp(flags, p);
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CDraggableToolBar, CToolBar)
+    ON_WM_LBUTTONDOWN() ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP()
 END_MESSAGE_MAP()
 
 // ---------------- MDI client area: subclassed only to add an optional background image behind the child windows ----------------
@@ -3812,7 +3853,7 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
     std::vector<Bookmark> m_bookmarks;   // saved server list (servers.ini)
     std::vector<ChanFav> m_favs;         // saved channel favorites (channels.ini)
-    CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg;
+    CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CDraggableToolBar m_tb; CImageList m_tbImg;
     int m_swPos = 0;        // 0=top, 1=bottom, 2=left, 3=right
     int m_tbPos = 0;        // 0=top, 1=left, 2=bottom, 3=right
     CSize m_tbNaturalSize;  // the toolbar's own natural (horizontal, unwrapped) size, captured once in BuildToolbar()
@@ -8441,6 +8482,7 @@ class CMainFrame : public CMDIFrameWnd {
         // the same hand-rolled approach already used for the switchbar, so both bars behave consistently.
         m_tb.CreateEx(this, TBSTYLE_FLAT | TBSTYLE_WRAPABLE, WS_CHILD | WS_VISIBLE | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
+        m_tb.onDragEnd = [this](CPoint sp) { if (!m_barsLocked) SetTbPos(DetermineEdge(sp)); };
         TBBUTTON b[15] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
@@ -8643,6 +8685,16 @@ class CMainFrame : public CMDIFrameWnd {
         AfxGetApp()->WriteProfileInt(L"Conn", L"SwPos", pos);
         LayoutBars();
     }
+    int DetermineEdge(CPoint screenPt) const {   // which of the frame's four edges a drop point is closest to -- 0=top,1=left,2=bottom,3=right
+        CRect fr; GetClientRect(&fr); ClientToScreen(&fr);
+        int distTop = screenPt.y - fr.top, distBottom = fr.bottom - screenPt.y;
+        int distLeft = screenPt.x - fr.left, distRight = fr.right - screenPt.x;
+        int m = (std::min)((std::min)(distTop, distBottom), (std::min)(distLeft, distRight));
+        if (m == distTop) return 0;
+        if (m == distLeft) return 1;
+        if (m == distBottom) return 2;
+        return 3;
+    }
     void SetTbPos(int pos) {   // 0=top,1=left,2=bottom,3=right -- positioned manually in LayoutBars(), not via MFC docking (see BuildToolbar's comment)
         m_tbPos = pos;
         AfxGetApp()->WriteProfileInt(L"Conn", L"TbPos", pos);
@@ -8749,6 +8801,11 @@ public:
         m_bar.SetPaneInfo(2, 0, SBPS_NORMAL, 170); m_bar.SetPaneInfo(3, 0, SBPS_NORMAL, 280);
         BuildToolbar();
         m_sw.Create(this);
+        m_sw.onDragEnd = [this](CPoint sp) {   // DetermineEdge returns 0=top,1=left,2=bottom,3=right; m_swPos uses a different order (0=top,1=bottom,2=left,3=right) -- map between them
+            if (m_barsLocked) return;
+            static const int edgeToSwPos[4] = { 0, 2, 1, 3 };
+            SetSwPos(edgeToSwPos[DetermineEdge(sp)]);
+        };
         m_sw.onBarMenu = [this](CPoint pt) {
             CMenu m; m.CreatePopupMenu();
             CMenu pos; pos.CreatePopupMenu();
