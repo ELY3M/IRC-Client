@@ -550,7 +550,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -1241,6 +1241,7 @@ public:
         ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon
         ItemRes(SS_BITMAP | SS_NOTIFY, 10, 40, 300, 300, 501, 103);  // banner image, moved/resized to fit inside the enlarged dialog
         Item(SS_LEFT, 10, 350, 300, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
+        ///Item(SS_LEFT, 10, 400, 300, 20, 0xFFFF, 0x0082, L"https://github.com/ELY3M/IRC-Client");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 136, 374, 48, 16, IDOK, 0x0080, L"OK");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
@@ -2229,6 +2230,22 @@ static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos,
 }
 
 // ---------------- Alias editor: the whole alias list as text, like mIRC's alias editor ----------------
+// Splits text into lines without stopping early at a blank line, unlike the CString::Tokenize loops used elsewhere
+// in this file (those treat an empty token as "done"), which the Script Editor's Popups tab specifically needs
+// since it uses blank lines as spacing between sections.
+static std::vector<CString> SplitLinesRobust(const CString& text) {
+    std::vector<CString> lines; int pos = 0;
+    for (;;) {
+        int nl = text.Find(L'\n', pos);
+        CString piece = nl < 0 ? text.Mid(pos) : text.Mid(pos, nl - pos);
+        piece.TrimRight(L'\r');
+        lines.push_back(piece);
+        if (nl < 0) break;
+        pos = nl + 1;
+    }
+    while (!lines.empty() && lines.back().IsEmpty()) lines.pop_back();   // drop the trailing blank line left by a final \r\n
+    return lines;
+}
 class CAliasDlg : public CDialog {
     CString& val; std::vector<WORD> t; int cnt = 0;
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
@@ -2261,6 +2278,150 @@ public:
     }
     void OnOK() override { GetDlgItemText(101, val); CDialog::OnOK(); }
 };
+
+// ---------------- Scripts Editor: a single tabbed dialog combining Aliases, Popups, Remote, and Variables as raw
+// text, mIRC-style. "Users" (mIRC's access-level list tab) isn't included: this client's access lists
+// (Auto-Op/Auto-Voice/Protect/Ignore, under Address Book > Control) are structured data, not something that
+// round-trips cleanly as free-form text, and there's no unified numeric access-level system for them to assign. ----
+enum {   // this dialog's own control/menu ids -- kept separate from (and defined before) CAddressBookDlg's enum,
+         // which lives much later in the file and isn't visible yet at this point
+    IDC_SE_TABALIASES = 3900, IDC_SE_TABPOPUPS, IDC_SE_TABVARS, IDC_SE_TABREMOTE,
+    IDC_SE_EDITALIASES, IDC_SE_EDITPOPUPS, IDC_SE_EDITVARS, IDC_SE_EDITREMOTE,
+    IDC_SE_STATUSFILE, IDC_SE_STATUSPOS, IDM_SE_SAVE, IDM_SE_UNDO, IDM_SE_CUT, IDM_SE_COPY, IDM_SE_PASTE, IDM_SE_SELALL, IDM_SE_ABOUT
+};
+class CScriptEditorDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    CMenu* m_menu = nullptr;
+    int m_curTab = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+    int CurEditId() const {
+        switch (m_curTab) { case 0: return IDC_SE_EDITALIASES; case 1: return IDC_SE_EDITPOPUPS; case 2: return IDC_SE_EDITREMOTE; default: return IDC_SE_EDITVARS; }
+    }
+    void StashCurrentTabText() {   // so switching tabs doesn't lose whatever's been typed in the one being left
+        if (m_curTab == 0) GetDlgItemText(IDC_SE_EDITALIASES, aliasText);
+        else if (m_curTab == 1) GetDlgItemText(IDC_SE_EDITPOPUPS, popupText);
+        else if (m_curTab == 2) GetDlgItemText(IDC_SE_EDITREMOTE, remoteText);
+        else GetDlgItemText(IDC_SE_EDITVARS, varText);
+    }
+public:
+    CString aliasText, popupText, remoteText, varText;   // the caller fills these in before DoModal()
+    std::function<void(const CString&)> onSaveAliases, onSavePopups, onSaveRemote, onSaveVars;   // called (per-tab, via File > Save) or all four (on OK)
+
+    CScriptEditorDlg(CWnd* parent) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(440); t.push_back(300);
+        t.push_back(0); t.push_back(0); S(L"Scripts Editor"); t.push_back(9); S(DEFAULT_FONT);
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 6, 6, 70, 14, IDC_SE_TABALIASES, 0x0080, L"Aliases");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 78, 6, 70, 14, IDC_SE_TABPOPUPS, 0x0080, L"Popups");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 150, 6, 70, 14, IDC_SE_TABREMOTE, 0x0080, L"Remote");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 222, 6, 70, 14, IDC_SE_TABVARS, 0x0080, L"Variables");
+        DWORD editStyle = WS_BORDER | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | ES_NOHIDESEL;
+        Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITALIASES, 0x0081, L"");
+        Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITPOPUPS, 0x0081, L"");
+        Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITREMOTE, 0x0081, L"");
+        Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITVARS, 0x0081, L"");
+        Item(SS_LEFT | SS_NOPREFIX, 6, 248, 220, 10, IDC_SE_STATUSFILE, 0x0082, L"");
+        Item(SS_RIGHT | SS_NOPREFIX, 234, 248, 200, 10, IDC_SE_STATUSPOS, 0x0082, L"");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 280, 262, 50, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 336, 262, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 392, 262, 42, 14, IDM_SE_ABOUT, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    ~CScriptEditorDlg() { delete m_menu; }
+    void ShowTab(int tab) {
+        m_curTab = tab;
+        GetDlgItem(IDC_SE_EDITALIASES)->ShowWindow(tab == 0 ? SW_SHOW : SW_HIDE);
+        GetDlgItem(IDC_SE_EDITPOPUPS)->ShowWindow(tab == 1 ? SW_SHOW : SW_HIDE);
+        GetDlgItem(IDC_SE_EDITREMOTE)->ShowWindow(tab == 2 ? SW_SHOW : SW_HIDE);
+        GetDlgItem(IDC_SE_EDITVARS)->ShowWindow(tab == 3 ? SW_SHOW : SW_HIDE);
+        static const wchar_t* const files[4] = { L"File: aliases.ini", L"File: popups.ini", L"File: remote.ini", L"File: vars.ini" };
+        SetDlgItemText(IDC_SE_STATUSFILE, files[tab]);
+        UpdateStatus();
+        GetDlgItem(CurEditId())->SetFocus();
+    }
+    void UpdateStatus() {
+        CWnd* e = GetDlgItem(CurEditId());
+        DWORD selStart = 0, selEnd = 0; e->SendMessage(EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
+        int lineIdx = (int)e->SendMessage(EM_LINEFROMCHAR, selStart, 0);
+        int lineStart = (int)e->SendMessage(EM_LINEINDEX, lineIdx, 0);
+        int lineCount = (int)e->SendMessage(EM_GETLINECOUNT, 0, 0);
+        CString text; e->GetWindowText(text);
+        CString s; s.Format(L"%d:%d/%d  (%.1fk)", lineIdx + 1, (int)selStart - lineStart + 1, lineCount, text.GetLength() / 1024.0);
+        SetDlgItemText(IDC_SE_STATUSPOS, s);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        m_menu = new CMenu(); m_menu->CreateMenu();
+        CMenu file; file.CreatePopupMenu();
+        file.AppendMenu(MF_STRING, IDM_SE_SAVE, L"&Save this tab");
+        file.AppendMenu(MF_SEPARATOR);
+        file.AppendMenu(MF_STRING, IDOK, L"&Close (save all)");
+        file.AppendMenu(MF_STRING, IDCANCEL, L"C&ancel (discard changes)");
+        m_menu->AppendMenu(MF_POPUP, (UINT_PTR)file.Detach(), L"&File");
+        CMenu edit; edit.CreatePopupMenu();
+        edit.AppendMenu(MF_STRING, IDM_SE_UNDO, L"&Undo\tCtrl+Z");
+        edit.AppendMenu(MF_SEPARATOR);
+        edit.AppendMenu(MF_STRING, IDM_SE_CUT, L"Cu&t\tCtrl+X");
+        edit.AppendMenu(MF_STRING, IDM_SE_COPY, L"&Copy\tCtrl+C");
+        edit.AppendMenu(MF_STRING, IDM_SE_PASTE, L"&Paste\tCtrl+V");
+        edit.AppendMenu(MF_SEPARATOR);
+        edit.AppendMenu(MF_STRING, IDM_SE_SELALL, L"Select &All\tCtrl+A");
+        m_menu->AppendMenu(MF_POPUP, (UINT_PTR)edit.Detach(), L"&Edit");
+        CMenu help; help.CreatePopupMenu();
+        help.AppendMenu(MF_STRING, IDM_SE_ABOUT, L"&About the Scripts Editor");
+        m_menu->AppendMenu(MF_POPUP, (UINT_PTR)help.Detach(), L"&Help");
+        SetMenu(m_menu);
+        SetDlgItemText(IDC_SE_EDITALIASES, aliasText);
+        SetDlgItemText(IDC_SE_EDITPOPUPS, popupText);
+        SetDlgItemText(IDC_SE_EDITREMOTE, remoteText);
+        SetDlgItemText(IDC_SE_EDITVARS, varText);
+        ShowTab(0);
+        SetTimer(1, 300, nullptr);
+        return TRUE;
+    }
+    afx_msg void OnTabAliases() { StashCurrentTabText(); ShowTab(0); }
+    afx_msg void OnTabPopups() { StashCurrentTabText(); ShowTab(1); }
+    afx_msg void OnTabRemote() { StashCurrentTabText(); ShowTab(2); }
+    afx_msg void OnTabVars() { StashCurrentTabText(); ShowTab(3); }
+    afx_msg void OnMenuSave() {
+        StashCurrentTabText();
+        if (m_curTab == 0 && onSaveAliases) onSaveAliases(aliasText);
+        else if (m_curTab == 1 && onSavePopups) onSavePopups(popupText);
+        else if (m_curTab == 2 && onSaveRemote) onSaveRemote(remoteText);
+        else if (m_curTab == 3 && onSaveVars) onSaveVars(varText);
+    }
+    afx_msg void OnMenuUndo() { GetDlgItem(CurEditId())->SendMessage(EM_UNDO, 0, 0); }
+    afx_msg void OnMenuCut() { GetDlgItem(CurEditId())->SendMessage(WM_CUT, 0, 0); }
+    afx_msg void OnMenuCopy() { GetDlgItem(CurEditId())->SendMessage(WM_COPY, 0, 0); }
+    afx_msg void OnMenuPaste() { GetDlgItem(CurEditId())->SendMessage(WM_PASTE, 0, 0); }
+    afx_msg void OnMenuSelAll() { GetDlgItem(CurEditId())->SendMessage(EM_SETSEL, 0, -1); }
+    afx_msg void OnMenuAbout() {
+        AfxMessageBox(L"Scripts Editor\r\n\r\nAliases, Popups, and Variables are stored in aliases.ini, popups.ini, and vars.ini.", MB_ICONINFORMATION);
+    }
+    afx_msg void OnTimer(UINT_PTR) { UpdateStatus(); }
+    void OnOK() override {
+        StashCurrentTabText();
+        if (onSaveAliases) onSaveAliases(aliasText);
+        if (onSavePopups) onSavePopups(popupText);
+        if (onSaveRemote) onSaveRemote(remoteText);
+        if (onSaveVars) onSaveVars(varText);
+        CDialog::OnOK();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CScriptEditorDlg, CDialog)
+    ON_BN_CLICKED(IDC_SE_TABALIASES, OnTabAliases) ON_BN_CLICKED(IDC_SE_TABPOPUPS, OnTabPopups) ON_BN_CLICKED(IDC_SE_TABREMOTE, OnTabRemote) ON_BN_CLICKED(IDC_SE_TABVARS, OnTabVars)
+    ON_COMMAND(IDM_SE_SAVE, OnMenuSave) ON_COMMAND(IDM_SE_UNDO, OnMenuUndo) ON_COMMAND(IDM_SE_CUT, OnMenuCut) ON_COMMAND(IDM_SE_COPY, OnMenuCopy)
+    ON_COMMAND(IDM_SE_PASTE, OnMenuPaste) ON_COMMAND(IDM_SE_SELALL, OnMenuSelAll) ON_COMMAND(IDM_SE_ABOUT, OnMenuAbout) ON_WM_TIMER()
+END_MESSAGE_MAP()
 
 // ---------------- Popup menus: file format ----------------
 struct PopupItem { CString title; std::vector<CString> cmd; int depth = 0; };   // cmd empty: a submenu heading, a "-" separator, or a plain label
@@ -2305,6 +2466,86 @@ static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
         out.push_back(it);
     }
     return out;
+}
+
+// ---------------- Remote events: on JOIN/PART/TEXT/ACTION/NOTICE/KICK/QUIT/NICK/TOPIC/CONNECT, remote.ini ----------------
+// Format: on <level>:<EVENT>:[<matchtext>:][<where>:]<commands>  (TEXT/ACTION/NOTICE add matchtext; JOIN/PART/KICK/TOPIC
+// add where; QUIT/NICK/CONNECT have neither). <level> is parsed for a leading ^ (see haltDefaultPrefix below) but
+// otherwise ignored: this client has no numeric access-level system (Auto-Op/Auto-Voice/Protect/Ignore are their own
+// separate lists, not a unified /level), so every event matches regardless of what level was written.
+struct RemoteEvent {
+    CString eventName;              // JOIN, PART, TEXT, ACTION, NOTICE, KICK, QUIT, NICK, TOPIC, CONNECT (always uppercase)
+    bool haltDefaultPrefix = false; // a ^ anywhere in the level field: on ^1:JOIN:... -- lets /halt in this event's
+                                     // body suppress the built-in join/part/text/etc. line, same as real mIRC
+    CString matchText;              // TEXT/ACTION/NOTICE only
+    CString whereSpec;              // JOIN/PART/KICK/TOPIC: channel list or bare # for "any channel"
+                                     // TEXT/ACTION/NOTICE: #, ?, *, or a specific channel/wildcard
+    std::vector<CString> lines;
+};
+static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
+    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE" };
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC" };
+    auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
+    std::vector<RemoteEvent> out;
+    for (size_t i = 0; i < in.size(); i++) {
+        CString t = in[i]; t.Trim();
+        if (t.IsEmpty() || t.Left(1) == L";") continue;
+        if (t.Left(3).CompareNoCase(L"on ") != 0) continue;   // not an event line -- skip silently (comment/blank/stray text)
+        CString rest = t.Mid(3); rest.TrimLeft();
+        int c1 = rest.Find(L':'); if (c1 < 0) continue;
+        CString level = rest.Left(c1); rest = rest.Mid(c1 + 1);
+        RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0;
+        int c2 = rest.Find(L':'); if (c2 < 0) continue;
+        ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
+        if (inList(ev.eventName, kNeedsMatch, 3)) {
+            int c3 = rest.Find(L':'); if (c3 < 0) continue;
+            ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
+        }
+        if (inList(ev.eventName, kNeedsWhere, 7)) {
+            int c4 = rest.Find(L':'); if (c4 < 0) continue;
+            ev.whereSpec = rest.Left(c4); rest = rest.Mid(c4 + 1);
+        }
+        CString cmdText = rest; cmdText.TrimLeft();
+        int db = BraceDelta(cmdText);
+        if (db <= 0) {
+            if (cmdText.Left(1) == L"{" && cmdText.Right(1) == L"}") { cmdText = cmdText.Mid(1, cmdText.GetLength() - 2); cmdText.Trim(); }
+            if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
+        } else {   // a { ... } body over several lines
+            bool outer = cmdText.Left(1) == L"{";
+            if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
+            if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
+            while (db > 0 && i + 1 < in.size()) {
+                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                if (db <= 0) {
+                    if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ev.lines.push_back(head); }
+                    else ev.lines.push_back(l);
+                    break;
+                }
+                ev.lines.push_back(l);
+            }
+        }
+        if (ev.eventName.IsEmpty()) continue;
+        out.push_back(ev);
+    }
+    return out;
+}
+static bool MatchesWhereSpec(const CString& spec, const CString& chan) {   // JOIN/PART/KICK/TOPIC: comma list, bare # = any channel
+    CString s = spec; int pos = 0; bool any = false;
+    for (;;) {
+        int comma = s.Find(L',', pos);
+        CString one = comma < 0 ? s.Mid(pos) : s.Mid(pos, comma - pos); one.Trim();
+        if (!one.IsEmpty()) { any = true; if (one == L"#" || GlobMatch(one, chan)) return true; }
+        if (comma < 0) break;
+        pos = comma + 1;
+    }
+    return !any;   // an empty/missing where-spec matches anything, same as mIRC treating it as unrestricted
+}
+static bool MatchesTextWhere(const CString& spec, bool isPriv, const CString& chanOrNick) {   // TEXT/ACTION/NOTICE
+    CString s = spec; s.Trim();
+    if (s.IsEmpty() || s == L"*") return true;
+    if (s == L"?") return isPriv;
+    if (s == L"#") return !isPriv;
+    return !isPriv && GlobMatch(s, chanOrNick);
 }
 
 // ---------------- Channel Central: /channel  (topic, modes, and the ban / except / invite / quiet lists) ----------------
@@ -3916,7 +4157,16 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"true") { val = L"1"; return true; }
         if (name == L"false") { val = L"0"; return true; }
         if (name == L"ticks") { val.Format(L"%I64u", (unsigned __int64)GetTickCount64()); return true; }
-        if (name == L"chan") { val = (w && w->m_chan) ? w->m_name : CString(); return true; }
+        if (name == L"chan") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
+        if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
+        if (name == L"address") { val = m_evAddress; return true; }
+        if (name == L"knick") { val = m_evKnick; return true; }   // on KICK only: the nick who got kicked ($nick is the kicker)
+        if (name == L"newnick") { val = m_evNewnick; return true; }   // on NICK only: the nick they changed to ($nick is the old one)
+        if (name == L"halted") { val = m_evHaltDef ? L"$true" : L"$false"; return true; }
+        if (name == L"event") { val = m_evName; return true; }   // the name of the currently-running remote event: "JOIN", "TEXT", etc.
+        if (name == L"site") { int at = m_evAddress.Find(L'@'); val = at >= 0 ? m_evAddress.Mid(at + 1) : CString(); return true; }   // the host part of $address
+        if (name == L"wildsite") { int at = m_evAddress.Find(L'@'); val = at >= 0 ? (CString(L"*!*@") + m_evAddress.Mid(at + 1)) : CString(); return true; }
+        if (name == L"fulladdress") { val = (m_evNick.IsEmpty() || m_evAddress.IsEmpty()) ? CString() : (m_evNick + L"!" + m_evAddress); return true; }
         if (name == L"network") { val = net ? net->network : CString(); return true; }
         if (name == L"os") { val = OsName(); return true; }
         if (name == L"date") { val = now.Format(L"%d/%m/%Y"); return true; }
@@ -3971,6 +4221,22 @@ class CMainFrame : public CMDIFrameWnd {
             CString key; key.Format(L"n%d", i++);
             WritePrivateProfileStringW(L"variables", key, kv.second.name + L" " + kv.second.value, path);
         }
+    }
+    // ---- Scripts Editor: the Variables tab, as "%name value" lines matching vars.ini's own convention ----
+    CString BuildVarsText() {
+        CString text;
+        for (auto& kv : m_vars) { if (kv.second.noSave) continue; text += kv.second.name + L" " + kv.second.value + L"\r\n"; }
+        return text;
+    }
+    void ApplyVarsText(const CString& text) {
+        m_vars.clear();
+        for (auto& ln : SplitLinesRobust(text)) {
+            CString l = ln; l.Trim(); if (l.IsEmpty() || l.Left(1) != L"%") continue;
+            int sp = l.Find(L' ');
+            CString name = sp < 0 ? l : l.Left(sp), val = sp < 0 ? CString() : l.Mid(sp + 1);
+            VarEntry e; e.name = name; e.value = val; m_vars[VKey(name)] = e;
+        }
+        m_varsDirty = true; FlushVars();
     }
     VarEntry* FindVar(const CString& name, bool loc = true, bool glob = true) {
         CString k = VKey(name);
@@ -4426,6 +4692,39 @@ class CMainFrame : public CMDIFrameWnd {
             else { m_sfstate = L"cancel"; val = L"0"; }
             return true;
         }
+        if (name == L"mask") {   // $mask(address,type): address may be nick!user@host or just user@host; type 0-9 per mIRC's standard mask table
+            // (10-19 is the same table but with ? wildcards replacing IP-address octets specifically -- not implemented, folds back to 0-9)
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L','); CString addr = c >= 0 ? a.Left(c) : a; CString typeStr = c >= 0 ? a.Mid(c + 1) : CString(L"0");
+            addr.Trim(); typeStr.Trim();
+            int type = _wtoi(typeStr); if (type < 0 || type > 19) type = 0;
+            bool useNick = (type % 10) >= 5; int offset = type % 5;
+            CString rest = addr, nickPart, userPart, hostPart;
+            int ex = rest.Find(L'!'); if (ex >= 0) { nickPart = rest.Left(ex); rest = rest.Mid(ex + 1); }
+            int at = rest.Find(L'@'); if (at >= 0) { userPart = rest.Left(at); hostPart = rest.Mid(at + 1); } else hostPart = rest;
+            int dot = hostPart.Find(L'.'); CString hostFromDot = dot >= 0 ? (CString(L"*") + hostPart.Mid(dot)) : hostPart;
+            CString nickOut = useNick ? (nickPart.IsEmpty() ? CString(L"*") : nickPart) : CString(L"*");
+            CString userOut, hostOut;
+            switch (offset) {
+                case 0: userOut = userPart; hostOut = hostPart; break;
+                case 1: userOut = L"*" + userPart; hostOut = hostPart; break;
+                case 2: userOut = L"*"; hostOut = hostPart; break;
+                case 3: userOut = L"*" + userPart; hostOut = hostFromDot; break;
+                default: userOut = L"*"; hostOut = hostFromDot; break;
+            }
+            val = nickOut + L"!" + userOut + L"@" + hostOut;
+            return true;
+        }
+        if (name == L"address") {   // $address(nick,type): looks up an arbitrary nick's address via the Internal Address List (m_ial), masked per $mask()'s table
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L','); CString nk = c >= 0 ? a.Left(c) : a; CString typeStr = c >= 0 ? a.Mid(c + 1) : CString(L"5");
+            nk.Trim(); typeStr.Trim();
+            auto it = m_ial.find(VKey(nk));
+            if (it == m_ial.end()) { val.Empty(); return true; }
+            CString full = nk + L"!" + it->second;
+            CString maskArgs = full + L"," + typeStr;
+            return FuncValue(w, L"mask", maskArgs, prop, params, val);   // reuse $mask()'s exact masking logic rather than duplicating it
+        }
         if (name == L"abook") {   // $abook(nick,N): properties nick, info, email, website, picture, note -- "noteN" in the spec all map to this one stored notes field
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); t.Trim(); parts.push_back(t); } }
@@ -4867,6 +5166,18 @@ class CMainFrame : public CMDIFrameWnd {
         for (CString piece = text.Tokenize(L"\n", pos); !piece.IsEmpty(); piece = text.Tokenize(L"\n", pos)) { piece.TrimRight(L'\r'); lines.push_back(piece); }
         m_aliases = ParseAliases(lines); SaveAliases();
     }
+    afx_msg void OnScriptEditor() {   // the unified, tabbed Aliases/Popups/Variables editor -- see CScriptEditorDlg
+        CScriptEditorDlg dlg(this);
+        CString at; for (auto& l : AliasLines()) at += l + L"\r\n"; dlg.aliasText = at;
+        dlg.popupText = BuildPopupsText();
+        dlg.remoteText = BuildRemoteText();
+        dlg.varText = BuildVarsText();
+        dlg.onSaveAliases = [this](const CString& text) { ApplyAliasesText(text); };
+        dlg.onSavePopups = [this](const CString& text) { ApplyPopupsText(text); };
+        dlg.onSaveRemote = [this](const CString& text) { ApplyRemoteText(text); };
+        dlg.onSaveVars = [this](const CString& text) { ApplyVarsText(text); };
+        dlg.DoModal();
+    }
     afx_msg void OnColorsDialog() {
         CColorsDlg dlg(m_schemes, m_curScheme, this);
         if (dlg.DoModal() != IDOK) return;
@@ -4979,6 +5290,7 @@ class CMainFrame : public CMDIFrameWnd {
         CString rest = text, first = Word(rest); first.MakeLower(); rest.Trim();
         if (first == L"return") { m_result = rest; return C_RETURN; }
         if (first == L"halt") { m_halt = true; return C_HALT; }
+        if (first == L"haltdef") { m_evHaltDef = true; return C_NEXT; }   // suppress a ^-event's default display without stopping the rest of this script's own commands
         if (first == L"break") return C_BREAK;
         if (first == L"continue") return C_CONTINUE;
         if (first == L"reseterror") return C_NEXT;
@@ -5078,6 +5390,144 @@ class CMainFrame : public CMDIFrameWnd {
             if (!n) continue;
             for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_popRaw[s].push_back(line.Mid(eq + 1)); }
         }
+    }
+    // ---- Remote events: on JOIN/PART/TEXT/ACTION/NOTICE/KICK/QUIT/NICK/TOPIC/CONNECT, remote.ini ----
+    std::vector<CString> m_remoteRaw;   // the file / editor text, exactly as typed
+    std::vector<RemoteEvent> m_events;  // parsed from m_remoteRaw whenever it changes
+    CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName;   // what $nick, $chan, $address, $knick,
+    bool m_evHaltDef = false;   // $newnick, $event resolve to while an event's commands are running
+    // Internal Address List: nick (lowercase) -> user@host, learned passively from any prefixed line we see (JOIN,
+    // PRIVMSG/NOTICE, PART, KICK, NICK, QUIT -- anywhere this file already has both a nick and a host on hand).
+    // Backs $address(nick,type)/$wildsite(nick)-style lookups for nicks other than whoever triggered the current event.
+    std::map<CString, CString> m_ial;
+    void IalLearn(const CString& nick, const CString& host) { if (!nick.IsEmpty() && !host.IsEmpty()) m_ial[VKey(nick)] = host; }
+    void IalRename(const CString& oldNick, const CString& newNick) {
+        auto it = m_ial.find(VKey(oldNick));
+        if (it != m_ial.end()) { m_ial[VKey(newNick)] = it->second; m_ial.erase(it); }
+    }
+    void LoadRemote() {
+        CString path = IniPath(L"remote.ini");
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+            m_remoteRaw = {
+                L"###on *:JOIN:#:/echo $chan $nick ($address) has joined $chan",
+                L"on *:TEXT:hellotest!!!*:#:/notice $nick Hi there!",
+            };
+            SaveRemote(); return;
+        }
+        m_remoteRaw.clear();
+        std::vector<wchar_t> buf(262144, 0);
+        DWORD n = GetPrivateProfileSectionW(L"remote", buf.data(), (DWORD)buf.size(), path);
+        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_remoteRaw.push_back(line.Mid(eq + 1)); }
+        m_events = ParseRemoteEvents(m_remoteRaw);
+    }
+    void SaveRemote() {
+        CString path = IniPath(L"remote.ini");
+        WritePrivateProfileStringW(L"remote", nullptr, nullptr, path);
+        for (size_t i = 0; i < m_remoteRaw.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"remote", key, m_remoteRaw[i], path); }
+        m_events = ParseRemoteEvents(m_remoteRaw);
+    }
+    CString BuildRemoteText() { CString text; for (auto& l : m_remoteRaw) text += l + L"\r\n"; return text; }
+    void ApplyRemoteText(const CString& text) { m_remoteRaw = SplitLinesRobust(text); SaveRemote(); }
+    // Fires a JOIN/PART/KICK/TOPIC-shaped event (matched against a channel list). Returns true if a ^-prefixed match
+    // halted (via /halt or /haltdef), meaning the caller's own built-in display line should be suppressed.
+    bool FireChannelEvent(CChatWnd* w, const CString& eventName, const CString& chan, const CString& nick, const CString& address, const CString& params) {
+        IalLearn(nick, address);
+        m_evHaltDef = false;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {   // pass 0: ^-prefixed (can suppress the default); pass 1: normal (independent)
+            for (auto& ev : m_events) {
+                if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
+                m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evName = eventName;
+                RunScript(w, ev.lines, params);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
+        return suppress;
+    }
+    // TEXT/ACTION/NOTICE: matched against both matchtext (wildcard, against the message) and where (#, ?, *, or a
+    // specific channel). $1- is set to the message text itself.
+    bool FireTextEvent(CChatWnd* w, const CString& eventName, bool isPriv, const CString& chanOrNick, const CString& nick, const CString& address, const CString& text) {
+        IalLearn(nick, address);
+        m_evHaltDef = false;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!MatchesTextWhere(ev.whereSpec, isPriv, chanOrNick)) continue;
+                if (!GlobMatch(ev.matchText, text)) continue;
+                m_evNick = nick; m_evChan = isPriv ? CString() : chanOrNick; m_evAddress = address; m_evName = eventName;
+                RunScript(w, ev.lines, text);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
+        return suppress;
+    }
+    // KICK: like FireChannelEvent, but also sets $knick (the nick who got kicked) alongside $nick (who did the kicking).
+    bool FireKickEvent(CChatWnd* w, const CString& chan, const CString& nick, const CString& address, const CString& knick, const CString& reason) {
+        IalLearn(nick, address);
+        m_evHaltDef = false;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedKnick = m_evKnick, savedName = m_evName;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != L"KICK" || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
+                m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evKnick = knick; m_evName = L"KICK";
+                RunScript(w, ev.lines, reason);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evKnick = savedKnick; m_evName = savedName;
+        return suppress;
+    }
+    // QUIT/NICK/CONNECT: no "where" to match against, so every matching event always runs.
+    void FireSimpleEvent(CChatWnd* w, const CString& eventName, const CString& nick, const CString& address, const CString& params, const CString& newnick = CString()) {
+        IalLearn(nick, address);
+        if (!newnick.IsEmpty()) IalRename(nick, newnick);
+        CString savedNick = m_evNick, savedAddr = m_evAddress, savedNewnick = m_evNewnick, savedName = m_evName;
+        for (auto& ev : m_events) {
+            if (ev.eventName != eventName) continue;
+            m_evNick = nick; m_evAddress = address; m_evNewnick = newnick; m_evName = eventName;
+            RunScript(w, ev.lines, params);
+        }
+        m_evNick = savedNick; m_evAddress = savedAddr; m_evNewnick = savedNewnick; m_evName = savedName;
+    }
+    // ---- Scripts Editor: the Popups tab shows all five popups.ini sections as one text block, bracketed headers
+    // marking where each one starts, same idea as the [Status Window] etc. shown in the real mIRC editor ----
+    static const wchar_t* const* ScriptEditorPopupHeaders() { static const wchar_t* const h[5] = { L"[Status Window]", L"[Channel Window]", L"[Query Window]", L"[Nick List]", L"[Menu Bar]" }; return h; }
+    CString BuildPopupsText() {
+        const wchar_t* const* headers = ScriptEditorPopupHeaders();
+        CString text;
+        for (int s = 0; s < 5; s++) {
+            if (s > 0) text += L"\r\n";
+            text += headers[s]; text += L"\r\n";
+            for (auto& l : m_popRaw[s]) text += l + L"\r\n";
+        }
+        return text;
+    }
+    void ApplyPopupsText(const CString& text) {
+        const wchar_t* const* headers = ScriptEditorPopupHeaders();
+        std::vector<CString> lines = SplitLinesRobust(text);
+        for (int s = 0; s < 5; s++) m_popRaw[s].clear();
+        int cur = -1;
+        for (auto& ln : lines) {
+            int matched = -1;
+            for (int s = 0; s < 5; s++) if (ln == headers[s]) { matched = s; break; }
+            if (matched >= 0) { cur = matched; continue; }
+            if (cur >= 0) m_popRaw[cur].push_back(ln);
+        }
+        for (int s = 0; s < 5; s++) while (!m_popRaw[s].empty() && m_popRaw[s].back().IsEmpty()) m_popRaw[s].pop_back();   // the blank spacer line before the next header isn't part of this section
+        SavePopups();
+        RebuildMenuBarPopups();
+    }
+    void ApplyAliasesText(const CString& text) {
+        m_aliases = ParseAliases(SplitLinesRobust(text));
+        SaveAliases();
     }
     afx_msg void OnPopupEditor(UINT id) {
         int sec = (int)id - (int)IDM_POPEDIT0; if (sec < 0 || sec > 4) return;
@@ -5609,7 +6059,11 @@ class CMainFrame : public CMDIFrameWnd {
             CNickEntry* cne = (notice || hle) ? nullptr : MatchCnick(w, nick, prefix, net);   // Nick Colors: "messages that this user sends to channel or query windows" -- notices aren't included
             bool colorMsg = cne && cne->method != 1;   // method 1 = nicklist only, not messages
             COLORREF hlColor = hle ? MircColor(_wtoi(hle->colorStr)) : cText;
-            if (ctcp) Show(w, L"* " + nick + txt.Mid(6), hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cAction));   // ACTION (/me): a real chat message, so it still uses the normal window
+            CString evName = ctcp ? L"ACTION" : (notice ? L"NOTICE" : L"TEXT");
+            CString evBody = ctcp ? txt.Mid(6) : txt;
+            bool evSuppress = FireTextEvent(w, evName, priv, priv ? nick : tgt, nick, host, evBody);
+            if (evSuppress) { /* a ^-event halted the default display for this message */ }
+            else if (ctcp) Show(w, L"* " + nick + txt.Mid(6), hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cAction));   // ACTION (/me): a real chat message, so it still uses the normal window
             else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
             else Show(w, L"<" + nick + L"> " + txt, hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cText));
             if (hle) FireHighlight(w, *hle, nick, txt);
@@ -5630,21 +6084,29 @@ class CMainFrame : public CMDIFrameWnd {
                     if (m_avoiceOn && MatchesAutoList(m_avoiceList, nick, prefix, ch, net)) QueueAutoAction(net, ch, nick, L'v');
                 }
             }
-            Show(w, L"* " + nick + L" (" + host + L") has joined " + ch, cJoin);
+            bool suppress = FireChannelEvent(w, L"JOIN", ch, nick, host, CString());
+            if (!suppress) Show(w, L"* " + nick + L" (" + host + L") has joined " + ch, cJoin);
         }
         else if (cmd == L"PART") {
             if (me) { Drop(net, P(0)); return; }
-            if (CChatWnd* w = Find(net, P(0))) { w->DelNick(nick); Show(w, L"* " + nick + L" has left " + P(0) + L" (" + P(1) + L")", cPart); }
+            if (CChatWnd* w = Find(net, P(0))) {
+                w->DelNick(nick);
+                bool suppress = FireChannelEvent(w, L"PART", P(0), nick, host, P(1));
+                if (!suppress) Show(w, L"* " + nick + L" has left " + P(0) + L" (" + P(1) + L")", cPart);
+            }
         }
         else if (cmd == L"KICK") {
             if (P(1).CompareNoCase(net->nick) == 0) { Note(net, L"You were kicked from " + P(0) + L" by " + nick + L" (" + P(2) + L")", cKick); Drop(net, P(0)); return; }
             if (CChatWnd* w = Find(net, P(0))) {
                 if (m_protectOn && nick.CompareNoCase(net->nick) != 0 && MatchesAutoList(m_protectList, P(1), CString(), P(0), net) && w->NickPrefixChar(net->nick) == L'@')
                     Send(net, L"KICK " + P(0) + L" " + nick + L" :Protected user");
-                w->DelNick(P(1)); Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cKick);
+                w->DelNick(P(1));
+                bool suppress = FireKickEvent(w, P(0), nick, host, P(1), P(2));
+                if (!suppress) Show(w, L"* " + P(1) + L" was kicked by " + nick + L" (" + P(2) + L")", cKick);
             }
         }
         else if (cmd == L"QUIT") {
+            FireSimpleEvent(ActiveOrStatus(), L"QUIT", nick, host, P(0));
             for (auto& kv : m_w) {
                 CChatWnd* w = kv.second; if (w->net != net) continue;
                 if (w->DelNick(nick) || (!w->m_chan && w->m_name.CompareNoCase(nick) == 0))
@@ -5653,13 +6115,18 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"NICK") {
             CString nn = P(0); if (me) net->nick = nn;
+            FireSimpleEvent(ActiveOrStatus(), L"NICK", nick, host, CString(), nn);
             for (auto& kv : m_w) {
                 CChatWnd* w = kv.second; if (w->net != net) continue;
                 if (w->DelNick(nick)) { w->AddNick(nn); Show(w, L"* " + nick + L" is now known as " + nn, cNickname); }
             }
         }
         else if (cmd == L"TOPIC") {
-            if (CChatWnd* w = Find(net, P(0))) { w->SetTopic(P(1)); Show(w, L"* " + nick + L" changed the topic to: " + P(1), cTopic); }
+            if (CChatWnd* w = Find(net, P(0))) {
+                w->SetTopic(P(1));
+                bool suppress = FireChannelEvent(w, L"TOPIC", P(0), nick, host, P(1));
+                if (!suppress) Show(w, L"* " + nick + L" changed the topic to: " + P(1), cTopic);
+            }
         }
         else if (cmd == L"MODE") {
             CChatWnd* w = Find(net, P(0)); CString m; for (size_t i = 1; i < p.size(); i++) m += p[i] + L" ";
@@ -5689,7 +6156,9 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
             if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin);
             if (m_notifyPopupOnConnect) ShowNotifyWindow();
-            NotifyTick(true); }
+            NotifyTick(true);
+            FireSimpleEvent(Status(net), L"CONNECT", net->nick, CString(), CString());   // real mIRC fires this at end-of-MOTD; 001 (just-registered) is close enough here and much simpler to hook
+        }
         else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic is " + P(2), cTopic); } }
         else if (cmd == L"333") {   // RPL_TOPICWHOTIME: channel setter unixtimestamp -- who set the topic and when, shown right after the topic itself
             CString chan = P(1), who = P(2), ts = P(3), when;
@@ -7878,6 +8347,16 @@ class CMainFrame : public CMDIFrameWnd {
         };
         sq(0, 0, RGB(220,30,30)); sq(5, 0, RGB(30,160,30)); sq(0, 5, RGB(30,90,220)); sq(5, 5, RGB(230,180,0));
     }
+    static void DrawScriptEditorGlyph(CDC& mem, int baseX) {   // a simple page-with-text-lines icon, for the Scripts Editor button
+        CBrush br(RGB(250, 250, 240)); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(90, 90, 90)); CPen* op = mem.SelectObject(&pn);
+        mem.Rectangle(baseX + 3, 1, baseX + 13, 16);   // the page
+        mem.SelectObject(ob); mem.SelectObject(op);
+        CPen linePen(PS_SOLID, 1, RGB(90, 110, 180)); CPen* op2 = mem.SelectObject(&linePen);
+        mem.MoveTo(baseX + 5, 5); mem.LineTo(baseX + 11, 5);
+        mem.MoveTo(baseX + 5, 8); mem.LineTo(baseX + 11, 8);
+        mem.MoveTo(baseX + 5, 11); mem.LineTo(baseX + 9, 11);
+        mem.SelectObject(op2);
+    }
     static void DrawAddressBookGlyph(CDC& mem, int baseX) {   // a simple head-and-shoulders "contact" icon, for the Address Book button
         CBrush br(RGB(90, 110, 180)); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(40, 40, 40)); CPen* op = mem.SelectObject(&pn);
         mem.Ellipse(CRect(baseX + 5, 1, baseX + 11, 7));      // head
@@ -7894,13 +8373,13 @@ class CMainFrame : public CMDIFrameWnd {
         mem.SelectObject(op); mem.SelectObject(ob);
     }
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
-        const int N = 10;
+        const int N = 11;
         CBitmap resBmp;
         bool haveRes = resBmp.LoadBitmap(102) != 0;   // id 102 in MiniIRC.rc ("toolbar.bmp"); absent in the plain one-file build
         int W = haveRes ? 24 : 16, H = W; m_tbIcon = W;
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0);
         if (haveRes) {
-            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, address book, online timer, colors (10 icons)
+            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, scripts editor, address book, online timer, colors (11 icons)
         } else {
             CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
             CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
@@ -7928,30 +8407,32 @@ class CMainFrame : public CMDIFrameWnd {
               CPoint pts[10]; for (int k = 0; k < 10; k++) pts[k] = CPoint(cx + off[k][0], cy + off[k][1]);
               mem.Polygon(pts, 10);
               mem.SelectObject(ob); mem.SelectObject(op); }   // star = favorites glyph
-            DrawAddressBookGlyph(mem, 7 * W);   // 8th cell: Address Book
-            DrawOnlineTimerGlyph(mem, 8 * W);   // 9th cell: Online Timer
-            DrawColorsGlyph(mem, 9 * W);        // 10th cell: Colors
+            DrawScriptEditorGlyph(mem, 7 * W);  // 8th cell: Scripts Editor
+            DrawAddressBookGlyph(mem, 8 * W);   // 9th cell: Address Book
+            DrawOnlineTimerGlyph(mem, 9 * W);   // 10th cell: Online Timer
+            DrawColorsGlyph(mem, 10 * W);       // 11th cell: Colors
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
         m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        TBBUTTON b[14] = {};
+        TBBUTTON b[15] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
         b[3].iBitmap = 2; b[3].idCommand = IDM_SERVERS; b[3].fsState = TBSTATE_ENABLED; b[3].fsStyle = TBSTYLE_BUTTON;
         b[4].iBitmap = 6; b[4].idCommand = IDM_CHANFAVS; b[4].fsState = TBSTATE_ENABLED; b[4].fsStyle = TBSTYLE_BUTTON;   // channel favorites
-        b[5].iBitmap = 7; b[5].idCommand = IDM_ABOOK; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;   // address book
-        b[6].iBitmap = 8; b[6].idCommand = IDM_ONLINETIMER; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;   // online timer
-        b[7].iBitmap = 9; b[7].idCommand = IDM_COLORS; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;    // colors
-        b[8].fsStyle = TBSTYLE_SEP;
-        b[9].iBitmap = 3; b[9].idCommand = IDM_CASCADE; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;
-        b[10].iBitmap = 4; b[10].idCommand = IDM_TILE; b[10].fsState = TBSTATE_ENABLED; b[10].fsStyle = TBSTYLE_BUTTON;
-        b[11].fsStyle = TBSTYLE_SEP;
-        b[12].iBitmap = 5; b[12].idCommand = IDM_ABOUT; b[12].fsState = TBSTATE_ENABLED; b[12].fsStyle = TBSTYLE_BUTTON;
-        b[13].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(14, b);
+        b[5].iBitmap = 7; b[5].idCommand = IDM_SCRIPTEDITOR; b[5].fsState = TBSTATE_ENABLED; b[5].fsStyle = TBSTYLE_BUTTON;   // scripts editor
+        b[6].iBitmap = 8; b[6].idCommand = IDM_ABOOK; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;   // address book
+        b[7].iBitmap = 9; b[7].idCommand = IDM_ONLINETIMER; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;   // online timer
+        b[8].iBitmap = 10; b[8].idCommand = IDM_COLORS; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;    // colors
+        b[9].fsStyle = TBSTYLE_SEP;
+        b[10].iBitmap = 3; b[10].idCommand = IDM_CASCADE; b[10].fsState = TBSTATE_ENABLED; b[10].fsStyle = TBSTYLE_BUTTON;
+        b[11].iBitmap = 4; b[11].idCommand = IDM_TILE; b[11].fsState = TBSTATE_ENABLED; b[11].fsStyle = TBSTYLE_BUTTON;
+        b[12].fsStyle = TBSTYLE_SEP;
+        b[13].iBitmap = 5; b[13].idCommand = IDM_ABOUT; b[13].fsState = TBSTATE_ENABLED; b[13].fsStyle = TBSTYLE_BUTTON;
+        b[14].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(15, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
@@ -8088,6 +8569,7 @@ public:
 		LoadAliases();
 		LoadVars();
 		LoadPopups();
+		LoadRemote();
 		LoadColors(); PushSchemeColors(CurScheme());
 		LoadLogging();
 		LoadTimestamp();
@@ -8129,6 +8611,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_DISCONNECT, L"&Disconnect");
         f.AppendMenu(MF_SEPARATOR); 
         f.AppendMenu(MF_STRING, IDM_FONT, L"&Font...");
+        f.AppendMenu(MF_STRING, IDM_SCRIPTEDITOR, L"&Scripts Editor...");
         f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
         f.AppendMenu(MF_STRING, IDM_COLORS, L"&Colors...");
         f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
@@ -8266,7 +8749,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
