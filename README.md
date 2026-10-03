@@ -20,6 +20,7 @@ you may get random bugs, glitches, or crashes.
 ~~multi server~~  
 ~~colors (colors for background/texts)~~  
 ~~background images on toolbar and switchbar~~  
+~~drag-able toolbar and switchbar~~    
 ~~change background of mdi windows like I did with toolbar and switchbar~~  
 ~~aliases system~~  
 ~~popup system~~  
@@ -34,10 +35,11 @@ scripting
 DCC chat/file send/server      
 ~~address book~~      
 ~~notify~~  
-~~play sounds via /splay~~    
+~~play sounds via /splay~~  
 ~~tip notify balloon~~  
 ~~theme colors for text and background~~  
 ~~logging of status and chat - it will have option to disable and enable logging and location of logs~~  
+~~check update (check git commit rehash against version.h)~~  
 more commands  
 many more.....  
 
