@@ -1767,6 +1767,8 @@ public:
     std::function<void(int, CPoint)> onMenu;
     std::function<void(CPoint)> onBarMenu;   // right-click on empty space (not a button)
     std::function<void(CPoint)> onDragEnd;   // a drag that started on the grip (see InGrip) ended at this screen point; the frame decides which edge to redock to
+    std::function<void(CPoint)> onDragMove;  // fires on every mouse move during a drag, so the frame can update a live preview outline
+    std::function<void()> onDragCancel;      // Escape was pressed, or capture was lost unexpectedly, during a drag -- frame should hide any preview and leave position unchanged
     Gdiplus::Bitmap* skin = nullptr;   // background skin image, owned by the frame; nullptr = plain color
     BOOL Create(CWnd* parent) {
         return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_BTNFACE + 1)), nullptr,
@@ -1819,9 +1821,19 @@ protected:
         if (InGrip(c, vert, p)) { m_dragging = true; SetCapture(); ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); return; }
         int i = Hit(p); if (i >= 0 && onSel) onSel(i);
     }
-    afx_msg void OnMouseMove(UINT, CPoint) { if (m_dragging) ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL)); }   // re-applied every move: the default WM_SETCURSOR processing would otherwise keep resetting it to the arrow
+    afx_msg void OnMouseMove(UINT, CPoint p) {
+        if (!m_dragging) return;
+        ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL));   // re-applied every move: the default WM_SETCURSOR processing would otherwise keep resetting it to the arrow
+        if (onDragMove) { CPoint sp = p; ClientToScreen(&sp); onDragMove(sp); }
+    }
     afx_msg void OnLButtonUp(UINT, CPoint p) {
         if (m_dragging) { m_dragging = false; ReleaseCapture(); CPoint sp = p; ClientToScreen(&sp); if (onDragEnd) onDragEnd(sp); }
+    }
+    afx_msg void OnKeyDown(UINT vk, UINT, UINT) {
+        if (m_dragging && vk == VK_ESCAPE) { m_dragging = false; ReleaseCapture(); if (onDragCancel) onDragCancel(); }
+    }
+    afx_msg void OnCaptureChanged(CWnd*) {   // safety net: capture lost some other way mid-drag (e.g. Alt+Tab), not through our own ReleaseCapture above
+        if (m_dragging) { m_dragging = false; if (onDragCancel) onDragCancel(); }
     }
     afx_msg void OnRButtonUp(UINT, CPoint p) {
         int i = Hit(p); CPoint sp = p; ClientToScreen(&sp);
@@ -1837,7 +1849,7 @@ BEGIN_MESSAGE_MAP(CSwitchBar, CWnd)
     ON_WM_RBUTTONUP() 
     ON_WM_MBUTTONUP()
     ON_WM_ERASEBKGND()
-    ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP()
+    ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP() ON_WM_KEYDOWN() ON_WM_CAPTURECHANGED()
 END_MESSAGE_MAP()
 
 // ---------------- Toolbar: a thin CToolBar subclass, only to detect a drag starting on empty space (not a button)
@@ -1848,6 +1860,8 @@ END_MESSAGE_MAP()
 class CDraggableToolBar : public CToolBar {
 public:
     std::function<void(CPoint)> onDragEnd;   // a drag that started on empty toolbar space ended at this screen point
+    std::function<void(CPoint)> onDragMove;  // fires on every mouse move during a drag, so the frame can update a live preview outline
+    std::function<void()> onDragCancel;      // Escape pressed, or capture lost unexpectedly, during a drag
 protected:
     bool m_dragging = false;
     afx_msg void OnLButtonDown(UINT flags, CPoint p) {
@@ -1856,17 +1870,26 @@ protected:
         CToolBar::OnLButtonDown(flags, p);
     }
     afx_msg void OnMouseMove(UINT flags, CPoint p) {
-        if (m_dragging) ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL));   // re-applied every move, same reason as CSwitchBar's version
+        if (m_dragging) {
+            ::SetCursor(::LoadCursor(nullptr, IDC_SIZEALL));   // re-applied every move, same reason as CSwitchBar's version
+            if (onDragMove) { CPoint sp = p; ClientToScreen(&sp); onDragMove(sp); }
+        }
         CToolBar::OnMouseMove(flags, p);
     }
     afx_msg void OnLButtonUp(UINT flags, CPoint p) {
         if (m_dragging) { m_dragging = false; ReleaseCapture(); CPoint sp = p; ClientToScreen(&sp); if (onDragEnd) onDragEnd(sp); }
         CToolBar::OnLButtonUp(flags, p);
     }
+    afx_msg void OnKeyDown(UINT vk, UINT, UINT) {
+        if (m_dragging && vk == VK_ESCAPE) { m_dragging = false; ReleaseCapture(); if (onDragCancel) onDragCancel(); }
+    }
+    afx_msg void OnCaptureChanged(CWnd*) {
+        if (m_dragging) { m_dragging = false; if (onDragCancel) onDragCancel(); }
+    }
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CDraggableToolBar, CToolBar)
-    ON_WM_LBUTTONDOWN() ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP()
+    ON_WM_LBUTTONDOWN() ON_WM_MOUSEMOVE() ON_WM_LBUTTONUP() ON_WM_KEYDOWN() ON_WM_CAPTURECHANGED()
 END_MESSAGE_MAP()
 
 // ---------------- MDI client area: subclassed only to add an optional background image behind the child windows ----------------
@@ -8482,7 +8505,9 @@ class CMainFrame : public CMDIFrameWnd {
         // the same hand-rolled approach already used for the switchbar, so both bars behave consistently.
         m_tb.CreateEx(this, TBSTYLE_FLAT | TBSTYLE_WRAPABLE, WS_CHILD | WS_VISIBLE | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
-        m_tb.onDragEnd = [this](CPoint sp) { if (!m_barsLocked) SetTbPos(DetermineEdge(sp)); };
+        m_tb.onDragMove = [this](CPoint sp) { if (!m_barsLocked) ShowDragGhost(ComputeGhostRect(true, DetermineEdge(sp))); };
+        m_tb.onDragEnd = [this](CPoint sp) { HideDragGhost(); if (!m_barsLocked) SetTbPos(DetermineEdge(sp)); };
+        m_tb.onDragCancel = [this] { HideDragGhost(); };
         TBBUTTON b[15] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
@@ -8695,6 +8720,37 @@ class CMainFrame : public CMDIFrameWnd {
         if (m == distBottom) return 2;
         return 3;
     }
+    // Live drag preview: a simple XOR-drawn outline on the screen DC, the same lightweight technique classic Win32
+    // rebar/toolbar dragging has always used. Two calls at the same rect cancel out (draw, then draw again = erased),
+    // so updating the preview is just "erase the old rect, draw the new one" in one pass -- never leaves artifacts
+    // as long as every show is eventually matched by a hide, which HideDragGhost()/the cancel paths all guarantee.
+    bool m_dragGhostShown = false; CRect m_dragGhostRect;
+    void XorGhostRect(const CRect& r) {
+        CWindowDC dc(nullptr);
+        CBrush* ob = (CBrush*)dc.SelectStockObject(NULL_BRUSH);
+        CPen pen(PS_SOLID, 2, RGB(0, 0, 0)); CPen* op = dc.SelectObject(&pen);
+        int om = dc.SetROP2(R2_NOT);
+        dc.Rectangle(r.left, r.top, r.right, r.bottom);
+        dc.SetROP2(om); dc.SelectObject(op); dc.SelectObject(ob);
+    }
+    void ShowDragGhost(const CRect& r) {
+        if (m_dragGhostShown && r == m_dragGhostRect) return;   // nothing moved since the last update -- redrawing would just erase it (two XORs = gone)
+        if (m_dragGhostShown) XorGhostRect(m_dragGhostRect);
+        XorGhostRect(r);
+        m_dragGhostRect = r; m_dragGhostShown = true;
+    }
+    void HideDragGhost() { if (m_dragGhostShown) { XorGhostRect(m_dragGhostRect); m_dragGhostShown = false; } }
+    CRect ComputeGhostRect(bool isToolbar, int edge) const {   // edge uses DetermineEdge's convention (0=top,1=left,2=bottom,3=right) regardless of bar
+        CRect fr; GetClientRect(&fr); ClientToScreen(&fr);
+        int thickH = isToolbar ? (m_tbNaturalSize.cy > 0 ? m_tbNaturalSize.cy : 30) : (int)CSwitchBar::HEIGHT;
+        int thickV = isToolbar ? 84 : (int)CSwitchBar::VWIDTH;
+        switch (edge) {
+            case 1: return CRect(fr.left, fr.top, fr.left + thickV, fr.bottom);
+            case 2: return CRect(fr.left, fr.bottom - thickH, fr.right, fr.bottom);
+            case 3: return CRect(fr.right - thickV, fr.top, fr.right, fr.bottom);
+            default: return CRect(fr.left, fr.top, fr.right, fr.top + thickH);
+        }
+    }
     void SetTbPos(int pos) {   // 0=top,1=left,2=bottom,3=right -- positioned manually in LayoutBars(), not via MFC docking (see BuildToolbar's comment)
         m_tbPos = pos;
         AfxGetApp()->WriteProfileInt(L"Conn", L"TbPos", pos);
@@ -8801,11 +8857,14 @@ public:
         m_bar.SetPaneInfo(2, 0, SBPS_NORMAL, 170); m_bar.SetPaneInfo(3, 0, SBPS_NORMAL, 280);
         BuildToolbar();
         m_sw.Create(this);
+        m_sw.onDragMove = [this](CPoint sp) { if (!m_barsLocked) ShowDragGhost(ComputeGhostRect(false, DetermineEdge(sp))); };
         m_sw.onDragEnd = [this](CPoint sp) {   // DetermineEdge returns 0=top,1=left,2=bottom,3=right; m_swPos uses a different order (0=top,1=bottom,2=left,3=right) -- map between them
+            HideDragGhost();
             if (m_barsLocked) return;
             static const int edgeToSwPos[4] = { 0, 2, 1, 3 };
             SetSwPos(edgeToSwPos[DetermineEdge(sp)]);
         };
+        m_sw.onDragCancel = [this] { HideDragGhost(); };
         m_sw.onBarMenu = [this](CPoint pt) {
             CMenu m; m.CreatePopupMenu();
             CMenu pos; pos.CreatePopupMenu();
