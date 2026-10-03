@@ -551,6 +551,7 @@ public:
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
 enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
+    IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -1241,7 +1242,7 @@ public:
         ItemRes(SS_ICON, 10, 10, 24, 24, 500, 101);          // the app icon
         ItemRes(SS_BITMAP | SS_NOTIFY, 10, 40, 300, 300, 501, 103);  // banner image, moved/resized to fit inside the enlarged dialog
         Item(SS_LEFT, 10, 350, 300, 20, 0xFFFF, 0x0082, L"IRC a mIRC-style IRC client for Windows, built with MFC.");
-        ///Item(SS_LEFT, 10, 400, 300, 20, 0xFFFF, 0x0082, L"https://github.com/ELY3M/IRC-Client");
+        Item(SS_CENTER, 10, 400, 400, 20, 0xFFFF, 0x0082, L"https://github.com/ELY3M/IRC-Client");
         Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 136, 374, 48, 16, IDOK, 0x0080, L"OK");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
@@ -1771,22 +1772,34 @@ public:
                             WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, CRect(0, 0, 0, 0), parent, 1401);
     }
     void Set(const std::vector<Btn>& b) { if (!(b == btns)) { btns = b; Invalidate(); } }
-    enum { HEIGHT = 28 };
+    enum { HEIGHT = 28, VWIDTH = 150, GRIP = 10 };   // HEIGHT: thickness when docked top/bottom; VWIDTH: when left/right; GRIP: space
+                                                      // reserved at the bar's leading edge for the drag-handle dots
 protected:
-    enum { BW = 112 };
-    CRect BtnRect(int i, int h) const { int x = 2 + i * (BW + 2); return CRect(x, 2, x + BW, h - 2); }
+    enum { BW = 112, BH = 22 };
+    bool IsVertical(const CRect& c) const { return c.Height() > c.Width(); }   // the bar's own shape tells us its orientation -- no separate flag to keep in sync
+    CRect BtnRect(int i, const CRect& c, bool vert) const {
+        if (vert) { int y = GRIP + 2 + i * (BH + 2); return CRect(2, y, c.Width() - 2, y + BH); }
+        int x = GRIP + 2 + i * (BW + 2); return CRect(x, 2, x + BW, c.Height() - 2);
+    }
     int Hit(CPoint p) {
-        CRect c; GetClientRect(c);
-        for (int i = 0; i < (int)btns.size(); i++) if (BtnRect(i, c.Height()).PtInRect(p)) return i;
+        CRect c; GetClientRect(c); bool vert = IsVertical(c);
+        for (int i = 0; i < (int)btns.size(); i++) if (BtnRect(i, c, vert).PtInRect(p)) return i;
         return -1;
     }
+    void DrawGrip(CDC& dc, const CRect& c, bool vert) {   // a small cluster of dots at the leading edge, like a standard Win32 rebar gripper --
+        CBrush br(::GetSysColor(COLOR_BTNSHADOW)); CBrush* ob = dc.SelectObject(&br);   // visual only (see onBarMenu for how repositioning actually happens)
+        if (vert) { for (int x = c.Width() / 2 - 4; x <= c.Width() / 2 + 4; x += 4) for (int y = 3; y < GRIP - 1; y += 4) dc.Ellipse(x, y, x + 2, y + 2); }
+        else { for (int y = c.Height() / 2 - 4; y <= c.Height() / 2 + 4; y += 4) for (int x = 3; x < GRIP - 1; x += 4) dc.Ellipse(x, y, x + 2, y + 2); }
+        dc.SelectObject(ob);
+    }
     afx_msg void OnPaint() {   // grey dot = idle, blue = events, red = new messages (like mIRC's window list)
-        CPaintDC dc(this); CRect c; GetClientRect(c);
+        CPaintDC dc(this); CRect c; GetClientRect(c); bool vert = IsVertical(c);
         if (skin) { Gdiplus::Graphics g(dc.m_hDC); g.DrawImage(skin, 0, 0, c.Width(), c.Height()); }
         else dc.FillSolidRect(c, ::GetSysColor(COLOR_BTNFACE));
+        DrawGrip(dc, c, vert);
         dc.SelectObject(CFont::FromHandle((HFONT)::GetStockObject(DEFAULT_GUI_FONT))); dc.SetBkMode(TRANSPARENT);
         for (int i = 0; i < (int)btns.size(); i++) {
-            const Btn& b = btns[i]; CRect r = BtnRect(i, c.Height());
+            const Btn& b = btns[i]; CRect r = BtnRect(i, c, vert);
             if (!skin || b.sel) dc.FillSolidRect(r, ::GetSysColor(b.sel ? COLOR_WINDOW : COLOR_BTNFACE));   // skinned: let idle buttons show the image through
             dc.Draw3dRect(r, ::GetSysColor(b.sel ? COLOR_BTNSHADOW : COLOR_BTNHIGHLIGHT), ::GetSysColor(b.sel ? COLOR_BTNHIGHLIGHT : COLOR_BTNSHADOW));
             COLORREF dotc = b.act == 2 ? RGB(220, 0, 0) : b.act == 1 ? RGB(0, 0, 220) : RGB(150, 150, 150);
@@ -3799,7 +3812,12 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<std::unique_ptr<Net>> m_nets; int m_netSeq = 0; Opts m_defOpts;   // m_defOpts: last-used settings, pre-fills each new Connect dialog
     std::vector<Bookmark> m_bookmarks;   // saved server list (servers.ini)
     std::vector<ChanFav> m_favs;         // saved channel favorites (channels.ini)
-    CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg; bool m_swTop = true; LOGFONT m_chatFont = {};
+    CMenu m_menu; CChanBar m_bar; CSwitchBar m_sw; CToolBar m_tb; CImageList m_tbImg;
+    int m_swPos = 0;        // 0=top, 1=bottom, 2=left, 3=right
+    int m_tbPos = 0;        // 0=top, 1=left, 2=bottom, 3=right
+    CSize m_tbNaturalSize;  // the toolbar's own natural (horizontal, unwrapped) size, captured once in BuildToolbar()
+    bool m_barsLocked = false;   // when true, the Position submenu on both bars is disabled (nothing to drag, so "locked" just means "can't be repositioned via the menu either")
+    LOGFONT m_chatFont = {};
     int m_tbIcon = 16;   // toolbar icon edge in pixels (24 with the resource strip, 16 for the drawn fallback)
     CString m_swSkinPath, m_tbSkinPath, m_mdiSkinPath;   // as stored in the ini: relative to the exe when possible, e.g. "images\skin.png"
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp;
@@ -8205,7 +8223,9 @@ class CMainFrame : public CMDIFrameWnd {
         m_defOpts.nick = a->GetProfileString(L"Conn", L"Nick", m_defOpts.nick); m_defOpts.user = a->GetProfileString(L"Conn", L"User", m_defOpts.user);
         m_defOpts.real = a->GetProfileString(L"Conn", L"Real", m_defOpts.real); m_defOpts.autojoin = a->GetProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         m_defOpts.tls = a->GetProfileInt(L"Conn", L"TLS", 0); m_defOpts.lax = a->GetProfileInt(L"Conn", L"Lax", 0);
-        m_swTop = a->GetProfileInt(L"Conn", L"SwTop", 1) != 0;
+        m_swPos = a->GetProfileInt(L"Conn", L"SwPos", a->GetProfileInt(L"Conn", L"SwTop", 1) != 0 ? 0 : 1);   // falls back to the old SwTop bool if SwPos was never saved, so existing ini files upgrade smoothly
+        m_barsLocked = a->GetProfileInt(L"Conn", L"BarsLocked", 0) != 0;
+        m_tbPos = a->GetProfileInt(L"Conn", L"TbPos", 0);   // 0=top,1=left,2=bottom,3=right -- matches CBRS_ALIGN_* ordering used below
     }
     void SaveOpts() {   // password is deliberately not saved; this is just the template that pre-fills the next Connect dialog
         CWinApp* a = AfxGetApp();
@@ -8414,7 +8434,12 @@ class CMainFrame : public CMDIFrameWnd {
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
-        m_tb.CreateEx(this, TBSTYLE_FLAT, WS_CHILD | WS_VISIBLE | CBRS_TOP | CBRS_TOOLTIPS);
+        // Plain, non-docking creation -- MFC's native EnableDocking/DockControlBar was tried here and reverted: it
+        // wraps the toolbar in an internal CDockBar container whose own size doesn't necessarily match the
+        // toolbar's actual button layout, leaving a gap with the wrong background and intercepting right-clicks
+        // before they reach the toolbar itself. Position switching below is handled manually instead (LayoutBars()),
+        // the same hand-rolled approach already used for the switchbar, so both bars behave consistently.
+        m_tb.CreateEx(this, TBSTYLE_FLAT | TBSTYLE_WRAPABLE, WS_CHILD | WS_VISIBLE | CBRS_TOOLTIPS);
         m_tb.GetToolBarCtrl().SetImageList(&m_tbImg);
         TBBUTTON b[15] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
@@ -8434,6 +8459,8 @@ class CMainFrame : public CMDIFrameWnd {
         b[14].fsStyle = TBSTYLE_SEP;
         m_tb.GetToolBarCtrl().AddButtons(15, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
+        m_tb.GetToolBarCtrl().AutoSize();
+        CRect tbr; m_tb.GetWindowRect(&tbr); m_tbNaturalSize = tbr.Size();   // the toolbar's natural (unwrapped, horizontal) size, used by LayoutBars() for every position
     }
     afx_msg void OnConnectDlg() {   // reuses the active window's network if it's idle/disconnected; otherwise adds a new one (like /server -m)
         auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
@@ -8460,10 +8487,41 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnCascade() { MDICascade(); }
     afx_msg void OnTile() { MDITile(MDITILE_HORIZONTAL); }
     afx_msg void OnExit() { PostMessage(WM_CLOSE); }
-    afx_msg void OnSwTop() { SetSwPos(true); }
-    afx_msg void OnSwBottom() { SetSwPos(false); }
-    afx_msg void OnUpdateSwTop(CCmdUI* u) { u->SetCheck(m_swTop); }
-    afx_msg void OnUpdateSwBottom(CCmdUI* u) { u->SetCheck(!m_swTop); }
+    afx_msg void OnSwTop() { SetSwPos(0); }
+    afx_msg void OnSwBottom() { SetSwPos(1); }
+    afx_msg void OnSwLeft() { SetSwPos(2); }
+    afx_msg void OnSwRight() { SetSwPos(3); }
+    afx_msg void OnUpdateSwTop(CCmdUI* u) { u->SetCheck(m_swPos == 0); }
+    afx_msg void OnUpdateSwBottom(CCmdUI* u) { u->SetCheck(m_swPos == 1); }
+    afx_msg void OnUpdateSwLeft(CCmdUI* u) { u->SetCheck(m_swPos == 2); }
+    afx_msg void OnUpdateSwRight(CCmdUI* u) { u->SetCheck(m_swPos == 3); }
+    afx_msg void OnLockBars() { SetBarsLocked(!m_barsLocked); }
+    afx_msg void OnUpdateLockBars(CCmdUI* u) { u->SetCheck(m_barsLocked); }
+    afx_msg void OnTbPosTop() { SetTbPos(0); }
+    afx_msg void OnTbPosLeft() { SetTbPos(1); }
+    afx_msg void OnTbPosBottom() { SetTbPos(2); }
+    afx_msg void OnTbPosRight() { SetTbPos(3); }
+    afx_msg void OnUpdateTbPosTop(CCmdUI* u) { u->SetCheck(m_tbPos == 0); }
+    afx_msg void OnUpdateTbPosLeft(CCmdUI* u) { u->SetCheck(m_tbPos == 1); }
+    afx_msg void OnUpdateTbPosBottom(CCmdUI* u) { u->SetCheck(m_tbPos == 2); }
+    afx_msg void OnUpdateTbPosRight(CCmdUI* u) { u->SetCheck(m_tbPos == 3); }
+    afx_msg void OnContextMenu(CWnd* pWnd, CPoint pt) {   // only the toolbar cares; the switchbar has its own onBarMenu callback, and everything else (log windows, etc.) handles its own right-click
+        if (!pWnd || pWnd->GetSafeHwnd() != m_tb.GetSafeHwnd()) return;   // compare by HWND, not CWnd* identity -- safer in case MFC hands back a different wrapper for the same window
+        if (pt.x == -1 && pt.y == -1) { CRect r; m_tb.GetWindowRect(r); pt = r.CenterPoint(); }
+        CMenu m; m.CreatePopupMenu();
+        CMenu pos; pos.CreatePopupMenu();
+        pos.AppendMenu(MF_STRING | (m_tbPos == 0 ? MF_CHECKED : 0), IDM_TBPOSTOP, L"&Top");
+        pos.AppendMenu(MF_STRING | (m_tbPos == 1 ? MF_CHECKED : 0), IDM_TBPOSLEFT, L"&Left");
+        pos.AppendMenu(MF_STRING | (m_tbPos == 2 ? MF_CHECKED : 0), IDM_TBPOSBOTTOM, L"&Bottom");
+        pos.AppendMenu(MF_STRING | (m_tbPos == 3 ? MF_CHECKED : 0), IDM_TBPOSRIGHT, L"&Right");
+        m.AppendMenu(MF_POPUP | (m_barsLocked ? MF_GRAYED : 0), (UINT_PTR)pos.Detach(), L"&Position");
+        m.AppendMenu(MF_SEPARATOR);
+        m.AppendMenu(MF_STRING | (m_barsLocked ? MF_CHECKED : 0), IDM_LOCKBARS, L"&Lock Bars");
+        SetForegroundWindow(); m_menuOpen = true;
+        m.TrackPopupMenu(TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        m_menuOpen = false;
+        PostMessage(WM_NULL, 0, 0);
+    }
     bool m_menuOpen = false;   // true while a TrackPopupMenu is showing; our timer must not touch layout/bars during that
     afx_msg void OnTimer(UINT_PTR id) {
         if (id == 2001) { PlayTick(); return; }   // /play: ticks independently of the UI-refresh timer below, and even while a menu is open
@@ -8535,15 +8593,42 @@ class CMainFrame : public CMDIFrameWnd {
     }
     CRect m_lastSw, m_lastCli;   // the rects we last placed things at, so CheckLayout() can tell if something else moved them
     void LayoutBars() {   // full recompute + carve: only call this for a real resize/explicit change, never blindly on a timer
-        RecalcLayout();   // resets the MDI client to its full size first, with no knowledge of our switchbar, so this is the expensive path
-        if (!m_sw.m_hWnd || !m_hWndMDIClient) return;
+        RecalcLayout();   // handles the status bar and (since neither the toolbar nor switchbar are docked CControl
+        if (!m_sw.m_hWnd || !m_hWndMDIClient) return;   // bars) hands everything below it to the MDI client -- we then carve toolbar and switchbar space out of that ourselves
         CRect r; ::GetWindowRect(m_hWndMDIClient, &r); ScreenToClient(&r);
-        int h = CSwitchBar::HEIGHT;
-        int swY = m_swTop ? r.top : r.bottom - h;
-        CRect want(r.left, swY, r.left + r.Width(), swY + h);
+
+        // Carve out the toolbar first (manually positioned -- see BuildToolbar()'s comment on why this isn't MFC docking)
+        if (m_tb.m_hWnd) {
+            int th = m_tbNaturalSize.cy > 0 ? m_tbNaturalSize.cy : 30;
+            int tvw = 84;   // narrow strip width when docked left/right; TBSTYLE_WRAPABLE lets its buttons wrap into rows to fit
+            CRect tbWant;
+            switch (m_tbPos) {
+                case 1: tbWant = CRect(r.left, r.top, r.left + tvw, r.bottom); r.left += tvw; break;            // left
+                case 2: tbWant = CRect(r.left, r.bottom - th, r.right, r.bottom); r.bottom -= th; break;        // bottom
+                case 3: tbWant = CRect(r.right - tvw, r.top, r.right, r.bottom); r.right -= tvw; break;         // right
+                default: tbWant = CRect(r.left, r.top, r.right, r.top + th); r.top += th; break;                // top
+            }
+            m_tb.SetWindowPos(nullptr, tbWant.left, tbWant.top, tbWant.Width(), tbWant.Height(), SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        // Then carve out the switchbar from whatever space the toolbar left behind
+        CRect want, wantCli;
+        switch (m_swPos) {
+            case 1:   // bottom
+                { int h = CSwitchBar::HEIGHT; want = CRect(r.left, r.bottom - h, r.right, r.bottom); wantCli = CRect(r.left, r.top, r.right, r.bottom - h); }
+                break;
+            case 2:   // left
+                { int w = CSwitchBar::VWIDTH; want = CRect(r.left, r.top, r.left + w, r.bottom); wantCli = CRect(r.left + w, r.top, r.right, r.bottom); }
+                break;
+            case 3:   // right
+                { int w = CSwitchBar::VWIDTH; want = CRect(r.right - w, r.top, r.right, r.bottom); wantCli = CRect(r.left, r.top, r.right - w, r.bottom); }
+                break;
+            default:  // top
+                { int h = CSwitchBar::HEIGHT; want = CRect(r.left, r.top, r.right, r.top + h); wantCli = CRect(r.left, r.top + h, r.right, r.bottom); }
+                break;
+        }
+        wantCli.right = (std::max)(wantCli.left, (long)wantCli.right); wantCli.bottom = (std::max)(wantCli.top, (long)wantCli.bottom);
         m_sw.SetWindowPos(nullptr, want.left, want.top, want.Width(), want.Height(), SWP_NOZORDER | SWP_NOACTIVATE);
-        int cliY = m_swTop ? r.top + h : r.top;
-        CRect wantCli(r.left, cliY, r.left + r.Width(), cliY + (std::max)(0L, (long)r.Height() - h));
         ::SetWindowPos(m_hWndMDIClient, nullptr, wantCli.left, wantCli.top, wantCli.Width(), wantCli.Height(), SWP_NOZORDER | SWP_NOACTIVATE);
         m_lastSw = want; m_lastCli = wantCli;   // remember what we just set, so the cheap check below has a baseline
     }
@@ -8553,10 +8638,19 @@ class CMainFrame : public CMDIFrameWnd {
         CRect cli; ::GetWindowRect(m_hWndMDIClient, &cli); ScreenToClient(&cli);
         if (sw != m_lastSw || cli != m_lastCli) LayoutBars();
     }
-    void SetSwPos(bool top) { 
-        m_swTop = top; 
-        AfxGetApp()->WriteProfileInt(L"Conn", L"SwTop", top); 
-        LayoutBars(); 
+    void SetSwPos(int pos) {
+        m_swPos = pos;
+        AfxGetApp()->WriteProfileInt(L"Conn", L"SwPos", pos);
+        LayoutBars();
+    }
+    void SetTbPos(int pos) {   // 0=top,1=left,2=bottom,3=right -- positioned manually in LayoutBars(), not via MFC docking (see BuildToolbar's comment)
+        m_tbPos = pos;
+        AfxGetApp()->WriteProfileInt(L"Conn", L"TbPos", pos);
+        LayoutBars();
+    }
+    void SetBarsLocked(bool locked) {   // nothing to actually enable/disable here now (no MFC docking in play) -- the lock just grays out the Position submenus on both bars
+        m_barsLocked = locked;
+        AfxGetApp()->WriteProfileInt(L"Conn", L"BarsLocked", locked);
     }
     DECLARE_MESSAGE_MAP()
 public:
@@ -8637,6 +8731,8 @@ public:
         w.AppendMenu(MF_STRING, IDM_TILE, L"&Tile");
         w.AppendMenu(MF_SEPARATOR); w.AppendMenu(MF_STRING, IDM_SWTOP, L"Switchbar at &Top"); 
         w.AppendMenu(MF_STRING, IDM_SWBOTTOM, L"Switchbar at &Bottom");
+        w.AppendMenu(MF_STRING, IDM_SWLEFT, L"Switchbar at &Left");
+        w.AppendMenu(MF_STRING, IDM_SWRIGHT, L"Switchbar at &Right");
         h.CreatePopupMenu(); 
         h.AppendMenu(MF_STRING, IDM_ABOUT, L"&About IRC...");
         m_menu.CreateMenu();
@@ -8655,19 +8751,28 @@ public:
         m_sw.Create(this);
         m_sw.onBarMenu = [this](CPoint pt) {
             CMenu m; m.CreatePopupMenu();
-            m.AppendMenu(MF_STRING | (m_swTop ? MF_CHECKED : 0), 1, L"Switchbar at Top");
-            m.AppendMenu(MF_STRING | (!m_swTop ? MF_CHECKED : 0), 2, L"Switchbar at Bottom");
-            m.AppendMenu(MF_SEPARATOR); m.AppendMenu(MF_STRING, 3, L"Set Background Image...");
-            if (!m_swSkinPath.IsEmpty()) m.AppendMenu(MF_STRING, 4, L"Clear Background Image");
+            CMenu pos; pos.CreatePopupMenu();
+            pos.AppendMenu(MF_STRING | (m_swPos == 0 ? MF_CHECKED : 0), 1, L"&Top");
+            pos.AppendMenu(MF_STRING | (m_swPos == 2 ? MF_CHECKED : 0), 2, L"&Left");
+            pos.AppendMenu(MF_STRING | (m_swPos == 1 ? MF_CHECKED : 0), 3, L"&Bottom");
+            pos.AppendMenu(MF_STRING | (m_swPos == 3 ? MF_CHECKED : 0), 4, L"&Right");
+            m.AppendMenu(MF_POPUP | (m_barsLocked ? MF_GRAYED : 0), (UINT_PTR)pos.Detach(), L"&Position");
+            m.AppendMenu(MF_SEPARATOR); m.AppendMenu(MF_STRING, 5, L"Set &Background Image...");
+            if (!m_swSkinPath.IsEmpty()) m.AppendMenu(MF_STRING, 6, L"&Clear Background Image");
+            m.AppendMenu(MF_SEPARATOR);
+            m.AppendMenu(MF_STRING | (m_barsLocked ? MF_CHECKED : 0), 7, L"&Lock Bars");
             SetForegroundWindow();   // required by Windows for the popup to reliably receive clicks at all
             m_menuOpen = true;
             int r = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
             m_menuOpen = false;
             PostMessage(WM_NULL, 0, 0);   // MSDN-documented pairing for the above; without it the window can be left in a bad activation state
-            if (r == 1) SetSwPos(true);
-            else if (r == 2) SetSwPos(false);
-            else if (r == 3) { CString f = PickSkinFile(); if (!f.IsEmpty()) SetSkin(false, f); }
-            else if (r == 4) SetSkin(false, CString());
+            if (r == 1) SetSwPos(0);
+            else if (r == 2) SetSwPos(2);
+            else if (r == 3) SetSwPos(1);
+            else if (r == 4) SetSwPos(3);
+            else if (r == 5) { CString f = PickSkinFile(); if (!f.IsEmpty()) SetSkin(false, f); }
+            else if (r == 6) SetSkin(false, CString());
+            else if (r == 7) SetBarsLocked(!m_barsLocked);
         };
         m_bar.onChan = [this](CString c) {   // clicking a channel name in the status bar's "Channels:" pane
             auto* a = dynamic_cast<CChatWnd*>(MDIGetActive());
@@ -8759,7 +8864,14 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
 	ON_NOTIFY(NM_CUSTOMDRAW, AFX_IDW_TOOLBAR, OnTbCustomDraw)
     ON_COMMAND(IDM_SWTOP, OnSwTop) 
     ON_COMMAND(IDM_SWBOTTOM, OnSwBottom)
-    ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom) ON_WM_INITMENUPOPUP()
+    ON_COMMAND(IDM_SWLEFT, OnSwLeft) ON_COMMAND(IDM_SWRIGHT, OnSwRight)
+    ON_UPDATE_COMMAND_UI(IDM_SWTOP, OnUpdateSwTop) ON_UPDATE_COMMAND_UI(IDM_SWBOTTOM, OnUpdateSwBottom)
+    ON_UPDATE_COMMAND_UI(IDM_SWLEFT, OnUpdateSwLeft) ON_UPDATE_COMMAND_UI(IDM_SWRIGHT, OnUpdateSwRight)
+    ON_COMMAND(IDM_LOCKBARS, OnLockBars) ON_UPDATE_COMMAND_UI(IDM_LOCKBARS, OnUpdateLockBars)
+    ON_COMMAND(IDM_TBPOSTOP, OnTbPosTop) ON_COMMAND(IDM_TBPOSLEFT, OnTbPosLeft) ON_COMMAND(IDM_TBPOSBOTTOM, OnTbPosBottom) ON_COMMAND(IDM_TBPOSRIGHT, OnTbPosRight)
+    ON_UPDATE_COMMAND_UI(IDM_TBPOSTOP, OnUpdateTbPosTop) ON_UPDATE_COMMAND_UI(IDM_TBPOSLEFT, OnUpdateTbPosLeft)
+    ON_UPDATE_COMMAND_UI(IDM_TBPOSBOTTOM, OnUpdateTbPosBottom) ON_UPDATE_COMMAND_UI(IDM_TBPOSRIGHT, OnUpdateTbPosRight)
+    ON_WM_CONTEXTMENU() ON_WM_INITMENUPOPUP()
 END_MESSAGE_MAP()
 
 class CIRCClientApp : public CWinApp {
