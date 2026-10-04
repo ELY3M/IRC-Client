@@ -2,6 +2,8 @@
 /!backup/
 !backup/
 !backup
+files
+files/
 .vs
 IRC
 x64

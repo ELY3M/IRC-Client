@@ -553,7 +553,7 @@ public:
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
-enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
+enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_LOCALSETTINGS, IDM_DCCOPTIONS, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
     IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
@@ -1442,6 +1442,7 @@ public:
     std::function<void()> onAccept;                // listening socket: a peer is ready to be accepted
     std::function<void(const char*, int)> onData;   // raw bytes received
     std::function<void()> onClose;
+    std::function<void()> onSend;                  // the socket is writable again -- DCC Send uses this to resume pushing file data after a partial/blocked write
     void OnConnect(int e) override { if (onConnect) onConnect(e); }
     void OnAccept(int) override { if (onAccept) onAccept(); }
     void OnReceive(int) override {
@@ -1449,6 +1450,7 @@ public:
         if (n > 0) { if (onData) onData(b, n); }
         else if (onClose) onClose();
     }
+    void OnSend(int) override { if (onSend) onSend(); }
     void OnClose(int) override { if (onClose) onClose(); }
 };
 // DCC's wire format for an IP address is a decimal string of the 4 octets packed big-endian into a 32-bit integer
@@ -1465,6 +1467,41 @@ static CString DccUintToIp(unsigned long v) {
 static CString DccParseIpToken(const CString& tok) {   // tok may be dotted-decimal already, or the packed-integer form -- always returns dotted-decimal
     if (tok.Find(L'.') >= 0) return tok;
     return DccUintToIp((unsigned long)_wtoi64(tok));
+}
+// Confirms s is a well-formed IPv4 dotted-decimal address (four 0-255 octets, nothing more). DCC's classic wire
+// format has no way to encode anything else -- in particular no IPv6 -- so anything handed to DccIpToUint needs to
+// pass this first; it can't just parse-and-hope, since a malformed/non-IPv4 string silently becomes 0 ("0.0.0.0"
+// to whoever's on the receiving end of the CTCP), not an error.
+static bool LooksLikeIpv4(const CString& s) {
+    unsigned int a = 0, b = 0, c = 0, d = 0; wchar_t extra = 0;
+    return swscanf_s(s, L"%u.%u.%u.%u%c", &a, &b, &c, &d, &extra, 1) == 4 && a < 256 && b < 256 && c < 256 && d < 256;
+}
+// A well-formed IPv4 address can still be useless for DCC: 192.168.x.x, 10.x.x.x, 172.16-31.x.x, 127.x.x.x
+// (loopback), and 169.254.x.x (link-local) are never reachable by a peer over the internet. This matters most for
+// Local Settings' "Server" lookup method: it forward-resolves whatever hostname the IRC server reports, and
+// nothing stopped that resolution from landing on a private address (e.g. via Windows' own NetBIOS name
+// resolution, if the reported "hostname" turns out to just be a local machine name) and silently overwriting a
+// previously-correct public IP with one that would break every future DCC offer.
+static bool IsPrivateOrReservedIpv4(const CString& ip) {
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    if (swscanf_s(ip, L"%u.%u.%u.%u", &a, &b, &c, &d) != 4) return true;   // unparseable -- treat as unusable rather than risk it
+    if (a == 10 || a == 127 || a == 0) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 169 && b == 254) return true;
+    return false;
+}
+// A client-side PTR (reverse-DNS) lookup of a public IP -- this, not anything the IRC server itself reports, is
+// what actually produces an ISP-style hostname like "syn-066-188-192-105.res.spectrum.com": it's a standard DNS
+// query against whatever resolver this machine uses, completely independent of the IRC connection, so an IRCd's
+// own hostname-masking/cloaking (Rizon's "Your host is masked (...)", for instance) has no bearing on it at all.
+// NI_NAMEREQD means this returns empty rather than falling back to the numeric IP string when no PTR record exists.
+static CString ReverseDnsLookup(const CString& ip) {
+    sockaddr_in sa = {}; sa.sin_family = AF_INET;
+    if (InetPtonW(AF_INET, ip, &sa.sin_addr) != 1) return CString();
+    wchar_t hostBuf[NI_MAXHOST] = {};
+    if (::GetNameInfoW((sockaddr*)&sa, sizeof(sa), hostBuf, NI_MAXHOST, nullptr, 0, NI_NAMEREQD) == 0) return hostBuf;
+    return CString();
 }
 
 // ---------------- Chat log: single-click a #channel to join/open it ----------------
@@ -1597,6 +1634,17 @@ public:
     // here (rather than a real DccSession*) avoids CChatWnd needing that type's full definition, which is declared
     // later in the file alongside CMainFrame -- only CMainFrame ever casts this back to what it actually is. ----
     void* m_dccSession = nullptr;
+    // ---- DCC Send/Get progress windows also reuse this class: m_out still shows the Sending/To/From/Status text
+    // (as log lines, updated in place -- see CMainFrame::DccProgressSetStatus), but a progress bar and buttons
+    // replace the input box area instead of a nicklist/editbox. ----
+    bool m_dccProgress = false;
+    CProgressCtrl m_dccBar;
+    CButton m_dccCancel, m_dccOpenFolder, m_dccOpen, m_dccClose;
+    std::function<void(CChatWnd*, int)> onDccBtn;   // 0=Cancel, 1=Open Folder, 2=Open, 3=Close
+    void DccShowFinishedButtons(bool canOpen) {   // swap Cancel out for Open Folder/Open/Close once a transfer finishes (success or failure) -- called from CMainFrame, so this needs to be public, unlike the afx_msg handlers it sits near in spirit
+        m_dccCancel.ShowWindow(SW_HIDE);
+        m_dccOpenFolder.ShowWindow(SW_SHOW); m_dccOpen.ShowWindow(canOpen ? SW_SHOW : SW_HIDE); m_dccClose.ShowWindow(SW_SHOW);
+    }
     // ---- /window: custom @windows reuse this class (net stays null unless -i is used) ----
     bool m_custom = false;        // true for an @window created via /window
     bool m_hasEdit = true;        // false = no editbox row at all (mIRC's default for a new custom window, unless -e is given)
@@ -1780,11 +1828,35 @@ protected:
             m_nicks.onRClick = [this](CString n, CPoint pt) { if (onNickMenu) onNickMenu(this, n, pt); };
             m_topic.SetFont(&m_font); m_nicks.SetFont(&m_font);
         }
+        if (m_dccProgress) {
+            m_in.ShowWindow(SW_HIDE);   // no editbox for a progress window
+            m_dccBar.Create(WS_CHILD | WS_VISIBLE | PBS_SMOOTH, z, this, 10);
+            m_dccCancel.Create(L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, z, this, 11);
+            m_dccOpenFolder.Create(L"Open Folder", WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, z, this, 12);
+            m_dccOpen.Create(L"Open", WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, z, this, 13);
+            m_dccClose.Create(L"Close", WS_CHILD | BS_PUSHBUTTON | WS_TABSTOP, z, this, 14);
+            m_dccCancel.SetFont(&m_font); m_dccOpenFolder.SetFont(&m_font); m_dccOpen.SetFont(&m_font); m_dccClose.SetFont(&m_font);
+        }
         return 0;
     }
+    afx_msg void OnDccCancelClick() { if (onDccBtn) onDccBtn(this, 0); }
+    afx_msg void OnDccOpenFolderClick() { if (onDccBtn) onDccBtn(this, 1); }
+    afx_msg void OnDccOpenClick() { if (onDccBtn) onDccBtn(this, 2); }
+    afx_msg void OnDccCloseClick() { if (onDccBtn) onDccBtn(this, 3); }
     afx_msg void OnSize(UINT t, int cx, int cy) {
         CMDIChildWnd::OnSize(t, cx, cy);
         if (!m_in.m_hWnd) return;
+        if (m_dccProgress) {
+            int barH = 20, btnH = 22, pad = 8;
+            m_out.MoveWindow(0, 0, cx, cy - barH - btnH - pad * 3);
+            m_dccBar.MoveWindow(pad, cy - barH - btnH - pad, cx - pad * 2, barH);
+            int by = cy - btnH - pad / 2, bw = 90;
+            m_dccCancel.MoveWindow(pad, by, bw, btnH);
+            m_dccOpenFolder.MoveWindow(pad, by, bw, btnH);
+            m_dccOpen.MoveWindow(pad + bw + pad, by, bw, btnH);
+            m_dccClose.MoveWindow(pad + (bw + pad) * 2, by, bw, btnH);
+            return;
+        }
         int topicH = 22, inH = m_hasEdit ? 22 : 0, top = m_chan ? topicH : 0, nw = m_chan ? 140 : 0;
         if (m_chan) m_topic.MoveWindow(0, 0, cx, topicH);
         m_out.MoveWindow(0, top, cx - nw, cy - top - inH);
@@ -1858,6 +1930,7 @@ BEGIN_MESSAGE_MAP(CChatWnd, CMDIChildWnd)
     ON_WM_DESTROY()
     ON_WM_CTLCOLOR()
     ON_LBN_DBLCLK(4, OnNickDbl)
+    ON_BN_CLICKED(11, OnDccCancelClick) ON_BN_CLICKED(12, OnDccOpenFolderClick) ON_BN_CLICKED(13, OnDccOpenClick) ON_BN_CLICKED(14, OnDccCloseClick)
 END_MESSAGE_MAP()
 
 // ---------------- Status bar: click a channel name in the "Channels:" pane to open it ----------------
@@ -2092,8 +2165,16 @@ struct DccSession {
     bool weOffered = false;         // true: we sent the CTCP and are listening; false: we received it and connect out
     std::unique_ptr<CDccSock> sock; // weOffered: the listening socket until a peer connects, then unused (see live)
     std::unique_ptr<CDccSock> live; // the actual data connection: weOffered's accepted peer, or !weOffered's own outbound connect
-    CChatWnd* win = nullptr;        // the chat window for this session
+    CChatWnd* win = nullptr;        // the chat (CHAT) or progress (SEND/GET) window for this session
     std::string inbuf;              // CHAT: partial (not yet newline-terminated) incoming bytes
+    // ---- SEND/GET only ----
+    CString filename;               // the bare filename (no path) as offered/requested
+    CString localPath;              // SEND: the real file being read from disk; GET: where it's being saved to
+    unsigned __int64 fileSize = 0, bytesDone = 0;
+    std::unique_ptr<CFile> file;
+    ULONGLONG startTick = 0;        // GetTickCount64() when the transfer actually started, for the rate display
+    ULONGLONG lastUiTick = 0;       // throttles DccUpdateProgressDisplay -- a large file can generate acks/data far faster than the UI needs to repaint
+    bool overwriteConfirmed = false;
 };
 
 // ---------------- DCC Chat incoming-request dialog: Accept / Ignore / Cancel, matching mIRC's own layout ----------------
@@ -2110,7 +2191,13 @@ class CDccChatAcceptDlg : public CDialog {
 public:
     CString nick, address;
     bool minimizeWindow = false;
-    CDccChatAcceptDlg(CWnd* parent) {
+    // nick/address are needed here, baked directly into the raw dialog template, rather than left as plain member
+    // variables the caller sets after construction (as DoModal()-time-only members like minimizeWindow can be) --
+    // the template bytes are built once, inside this constructor, so anything that needs to appear as pre-filled
+    // text has to be known before that point. A caller setting dlg.nick = ... after this runs is too late and
+    // silently has no effect, which is exactly the bug this shape is here to avoid.
+    CDccChatAcceptDlg(CWnd* parent, const CString& nickIn, const CString& addressIn) {
+        nick = nickIn; address = addressIn;
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(150);
         t.push_back(0); t.push_back(0); S(L"mIRC DCC Chat"); t.push_back(9); S(DEFAULT_FONT);
@@ -2132,6 +2219,98 @@ public:
 };
 BEGIN_MESSAGE_MAP(CDccChatAcceptDlg, CDialog)
     ON_BN_CLICKED(604, OnIgnoreClick)
+END_MESSAGE_MAP()
+
+// ---------------- DCC file-send general safety warning, shown once per request unless "Always show" is unchecked ----------------
+class CDccFileWarningDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    bool alwaysShow = true;
+    CDccFileWarningDlg(CWnd* parent) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(260); t.push_back(160);
+        t.push_back(0); t.push_back(0); S(L"mIRC File Warning"); t.push_back(9); S(DEFAULT_FONT);
+        // Plain static text controls need \r\n (not a bare \n) for an explicit line break -- a lone \n is just
+        // ignored, a well-known Win32 gotcha for SS_LEFT text.
+        Item(SS_LEFT, 10, 8, 240, 70, 0xFFFF, 0x0082,
+            L"Someone is attempting to send you a file. You should not accept this file unless:\r\n\r\n"
+            L"You are expecting this file\r\nYou know the person sending the file\r\nYou know what the file does\r\n\r\n"
+            L"It is dangerous to accept files from people you do not know.");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 10, 114, 170, 12, 701, 0x0080, L"Always show this message");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 130, 132, 55, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 190, 132, 55, 14, 702, 0x0080, L"Help");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override { CDialog::OnInitDialog(); CheckDlgButton(701, alwaysShow ? BST_CHECKED : BST_UNCHECKED); return TRUE; }
+    void OnOK() override { alwaysShow = IsDlgButtonChecked(701) != 0; CDialog::OnOK(); }
+    void OnHelpClick() { ::ShellExecuteW(nullptr, L"open", L"https://www.mirc.com/help/html/dcc.html", nullptr, nullptr, SW_SHOWNORMAL); }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CDccFileWarningDlg, CDialog)
+    ON_BN_CLICKED(702, OnHelpClick)
+END_MESSAGE_MAP()
+
+// ---------------- DCC Get incoming-file dialog: Accept / Ignore / Cancel, with a Save As path -- matches mIRC's own layout ----------------
+class CDccGetAcceptDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    CString nick, address, filename, sizeText, savePath;
+    bool minimizeWindow = false;
+    // All five of these are baked straight into the raw dialog template inside this constructor -- most critically
+    // savePath, which becomes the "Save As" editbox's actual starting text. Setting dlg.savePath = ... after
+    // construction (as previously written) is too late: the template bytes are already built by then, so the
+    // field opened blank, and a filename-only Accept click saved relative to the app's own working directory
+    // instead of the intended downloads folder. Taking everything as constructor parameters closes that gap.
+    CDccGetAcceptDlg(CWnd* parent, const CString& nickIn, const CString& addressIn, const CString& filenameIn, const CString& sizeTextIn, const CString& savePathIn) {
+        nick = nickIn; address = addressIn; filename = filenameIn; sizeText = sizeTextIn; savePath = savePathIn;
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(260); t.push_back(180);
+        t.push_back(0); t.push_back(0); S(L"mIRC DCC Get"); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 10, 8, 220, 20, 0xFFFF, 0x0082, L"This nickname is attempting to send you a file:");
+        Item(SS_LEFT, 10, 32, 100, 10, 0xFFFF, 0x0082, L"Nickname:");
+        Item(SS_LEFT | SS_NOPREFIX, 20, 44, 230, 10, 0xFFFF, 0x0082, nick + L" (" + address + L")");
+        Item(SS_LEFT, 10, 58, 100, 10, 0xFFFF, 0x0082, L"File:");
+        Item(SS_LEFT | SS_NOPREFIX, 20, 70, 230, 10, 0xFFFF, 0x0082, filename);
+        Item(SS_LEFT, 10, 84, 100, 10, 0xFFFF, 0x0082, L"Size:");
+        Item(SS_LEFT | SS_NOPREFIX, 20, 96, 230, 10, 0xFFFF, 0x0082, sizeText);
+        Item(SS_LEFT, 10, 112, 100, 10, 0xFFFF, 0x0082, L"Save As:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 10, 124, 206, 14, 804, 0x0081, savePath);
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 220, 124, 30, 14, 807, 0x0080, L"...");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 10, 144, 150, 12, 805, 0x0080, L"Minimize window");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 160, 60, 14, IDOK, 0x0080, L"Accept");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 76, 160, 60, 14, 806, 0x0080, L"Ignore");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 142, 160, 60, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    void OnOK() override { GetDlgItemText(804, savePath); minimizeWindow = IsDlgButtonChecked(805) != 0; CDialog::OnOK(); }
+    void OnIgnoreClick() { EndDialog(IDNO); }   // IDOK=accept, IDNO=ignore, IDCANCEL=cancel, same convention as CDccChatAcceptDlg
+    void OnBrowseClick() {
+        CString cur; GetDlgItemText(804, cur);
+        CFileDialog dlg(FALSE, nullptr, cur, OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST, L"All Files (*.*)|*.*||", this);
+        if (dlg.DoModal() == IDOK) SetDlgItemText(804, dlg.GetPathName());
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CDccGetAcceptDlg, CDialog)
+    ON_BN_CLICKED(806, OnIgnoreClick) ON_BN_CLICKED(807, OnBrowseClick)
 END_MESSAGE_MAP()
 
 // ---------------- Channel List: /list results, sortable, right-click/double-click to join ----------------
@@ -3317,6 +3496,108 @@ BEGIN_MESSAGE_MAP(CIdentdDlg, CDialog)
     ON_BN_CLICKED(IDC_ID_USEEMAIL, OnUseEmail) ON_BN_CLICKED(IDC_ID_HELP, OnHelpBtn)
 END_MESSAGE_MAP()
 
+// ---------------- Local settings (File > Local Settings): where this client's own hostname/IP, used to offer DCC
+// Chat/Send connections to a peer, comes from -- the direct fix for the NAT limitation noted when DCC was built:
+// a raw local-socket address is often a private LAN address a remote peer can't actually reach. All five fields
+// (two checkboxes, method radios, website, hostname, IP) are baked into the raw dialog template inside the
+// constructor, so -- same lesson as the DCC accept dialogs -- they're taken as constructor parameters rather than
+// set on the object afterward, which would silently have no effect on what's displayed. ----
+class CLocalSettingsDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    bool getHost, getIp; int method; CString website, hostName, ipAddress;   // method: 0=Normal, 1=Server, 2=Website
+    CLocalSettingsDlg(CWnd* parent, bool getHostIn, bool getIpIn, int methodIn, const CString& websiteIn, const CString& hostIn, const CString& ipIn)
+        : getHost(getHostIn), getIp(getIpIn), method(methodIn), website(websiteIn), hostName(hostIn), ipAddress(ipIn) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(260);
+        t.push_back(0); t.push_back(0); S(L"Local Settings"); t.push_back(9); S(DEFAULT_FONT);
+
+        Item(BS_GROUPBOX, 8, 6, 214, 42, 0xFFFF, 0x0080, L"On Connect:");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 18, 18, 190, 12, 901, 0x0080, L"Get host name");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 18, 32, 190, 12, 902, 0x0080, L"Get IP address");
+
+        Item(BS_GROUPBOX, 8, 54, 214, 98, 0xFFFF, 0x0080, L"Lookup Method:");
+        Item(BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 18, 66, 100, 12, 903, 0x0080, L"Normal");
+        Item(BS_AUTORADIOBUTTON | WS_TABSTOP, 18, 80, 100, 12, 904, 0x0080, L"Server");
+        Item(BS_AUTORADIOBUTTON | WS_TABSTOP, 18, 94, 100, 12, 905, 0x0080, L"Website:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 18, 108, 194, 14, 906, 0x0081, website);
+
+        Item(SS_LEFT, 10, 162, 150, 10, 0xFFFF, 0x0082, L"Host name:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 10, 174, 212, 14, 907, 0x0081, hostName);
+        Item(SS_LEFT, 10, 194, 150, 10, 0xFFFF, 0x0082, L"IP address:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 10, 206, 212, 14, 908, 0x0081, ipAddress);
+
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 24, 232, 58, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 90, 232, 58, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 156, 232, 58, 14, 909, 0x0080, L"Help");
+
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        CheckDlgButton(901, getHost ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(902, getIp ? BST_CHECKED : BST_UNCHECKED);
+        CheckRadioButton(903, 905, 903 + method);
+        return TRUE;
+    }
+    void OnOK() override {
+        getHost = IsDlgButtonChecked(901) != 0; getIp = IsDlgButtonChecked(902) != 0;
+        method = IsDlgButtonChecked(903) ? 0 : IsDlgButtonChecked(904) ? 1 : 2;
+        GetDlgItemText(906, website); GetDlgItemText(907, hostName); GetDlgItemText(908, ipAddress);
+        CDialog::OnOK();
+    }
+    void OnHelpClick() { ::ShellExecuteW(nullptr, L"open", L"https://www.mirc.com/help/html/connect.html", nullptr, nullptr, SW_SHOWNORMAL); }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CLocalSettingsDlg, CDialog)
+    ON_BN_CLICKED(909, OnHelpClick)
+END_MESSAGE_MAP()
+
+// ---------------- DCC Options: just the listen port range for now. A fixed range is what actually makes DCC
+// reachable across two separate networks -- without it, every offer listens on a random port, so there's nothing
+// consistent to forward through a router even if someone goes and sets up port forwarding. No custom button
+// handlers are needed here (IDOK/IDCANCEL are handled by CDialog's own base message map), so this class has no
+// message map of its own at all, unlike the other raw-template dialogs in this file. ----
+class CDccOptionsDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    CString firstPort, lastPort;
+    CDccOptionsDlg(CWnd* parent, const CString& firstIn, const CString& lastIn) : firstPort(firstIn), lastPort(lastIn) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(150);
+        t.push_back(0); t.push_back(0); S(L"DCC Options"); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 10, 8, 212, 50, 0xFFFF, 0x0082,
+            L"Ports used for listening when offering a DCC Chat or Send. Leave both at 0 to let Windows pick a "
+            L"random port each time (the default) -- but then there's nothing fixed to forward through your router.");
+        Item(SS_LEFT, 10, 66, 80, 12, 0xFFFF, 0x0082, L"First port:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 100, 64, 100, 14, 950, 0x0081, firstPort);
+        Item(SS_LEFT, 10, 86, 80, 12, 0xFFFF, 0x0082, L"Last port:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 100, 84, 100, 14, 951, 0x0081, lastPort);
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 40, 116, 60, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 116, 60, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    void OnOK() override { GetDlgItemText(950, firstPort); GetDlgItemText(951, lastPort); CDialog::OnOK(); }
+};
+
 // A small square that just draws whatever HICON it's given, centered -- used by the Tray dialog's icon preview.
 class CIconPreview : public CStatic {
 public:
@@ -4183,6 +4464,7 @@ class CMainFrame : public CMDIFrameWnd {
             }
             net->conn = true; Note(net, L"Connected. Registering...");
             SetState(net, L"Connected to " + net->o.host + (net->o.tls ? L" (TLS)" : L"") + L", registering...");
+            m_localCapturedThisConnect = false;   // Local Settings' "Server" method: fresh connection, so its pre-registration hostname/mask notice (if this server sends one) is worth capturing again
             if (!net->o.pass.IsEmpty()) Send(net, L"PASS " + net->o.pass);
             Send(net, L"NICK " + net->nick); Send(net, L"USER " + net->o.user + L" 0 * :" + net->o.real);
         };
@@ -6611,7 +6893,8 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"dcc") {
             CString a = arg; CString sub = Word(a); sub.MakeLower();
             if (sub == L"chat") { CString nk = a; nk.Trim(); if (nk.IsEmpty()) Show(w, L"* Usage: /dcc chat <nickname>", cPart); else DccChatInitiate(net, w, nk); }
-            else Show(w, L"* Usage: /dcc chat <nickname>  (/dcc send isn't implemented yet)", cPart);
+            else if (sub == L"send") { CString nk = a; nk.Trim(); if (nk.IsEmpty()) Show(w, L"* Usage: /dcc send <nickname>  (a file picker opens next)", cPart); else DccSendInitiate(net, w, nk); }
+            else Show(w, L"* Usage: /dcc chat <nickname> | /dcc send <nickname>", cPart);
         }
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
@@ -6686,7 +6969,26 @@ class CMainFrame : public CMDIFrameWnd {
             bool evSuppress = FireTextEvent(w, evName, priv, priv ? nick : tgt, nick, host, evBody);
             if (evSuppress) { /* a ^-event halted the default display for this message */ }
             else if (ctcp) Show(w, L"* " + nick + txt.Mid(6), hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cAction));   // ACTION (/me): a real chat message, so it still uses the normal window
-            else if (notice) Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
+            else if (notice) {
+                // Local Settings' "Server" lookup method: most IRCds send one of these unprompted, during
+                // registration, before 001 -- the server's own, authoritative hostname/cloak decision for this
+                // connection, which is what real mIRC's own "Server" method evidently reads (unlike USERHOST,
+                // queried after the fact, which can return something else -- see LocalApplyServerReportedHost).
+                // Only ever acted on for a server-sourced line (nick.IsEmpty()), never a real user's notice text.
+                if (nick.IsEmpty() && m_localLookupMethod == 1 && (m_localGetHostOnConnect || m_localGetIpOnConnect)) {
+                    int p1 = txt.Find(L"Found your hostname");
+                    int p2 = p1 < 0 ? txt.Find(L"Your host is masked (") : -1;
+                    if (p1 >= 0) {
+                        int colon = txt.Find(L':', p1);
+                        if (colon >= 0) { CString h = txt.Mid(colon + 1); h.Trim(); int comma = h.Find(L','); if (comma >= 0) h = h.Left(comma); if (!h.IsEmpty()) LocalApplyServerReportedHost(net, h); }
+                    } else if (p2 >= 0) {
+                        int open = p2 + (int)wcslen(L"Your host is masked (");
+                        int close = txt.Find(L')', open);
+                        if (close > open) { CString h = txt.Mid(open, close - open); h.Trim(); if (!h.IsEmpty()) LocalApplyServerReportedHost(net, h); }
+                    }
+                }
+                Show(w, L"-" + (nick.IsEmpty() ? prefix : nick) + L"- " + txt, cNotice);
+            }
             else Show(w, L"<" + nick + L"> " + txt, hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cText));
             if (hle) FireHighlight(w, *hle, nick, txt);
             if (!notice && !IsIgnored(net, nick, prefix, L'y')) {   // see Tips: only real messages (including /me) trigger a balloon, never notices/CTCP noise
@@ -6782,6 +7084,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
             m_autojoinSkip = false; m_autojoinDelayS = 0; m_autojoinDelayNet = nullptr;   // reset before on CONNECT runs, so /autojoin inside it starts from a clean slate every time
+            LocalLookupNow(net);   // File > Local Settings' "On Connect" checkboxes -- refreshes host/IP for this connection before DCC might need them
             FireSimpleEvent(Status(net), L"CONNECT", net->nick, CString(), CString());   // real mIRC fires this at end-of-MOTD; 001 (just-registered) is close enough here and much simpler to hook
             // /autojoin, if called from the on CONNECT handler just above, can skip or delay the autojoin about to happen here -- see CmdAutojoin
             if (!net->o.autojoin.IsEmpty() && !m_autojoinSkip) {
@@ -6863,7 +7166,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
             Note(net, j.IsEmpty() ? raw : j, cWhois);
         }
-        else if (cmd == L"302" && !m_pendingUserhost.empty()) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated; only relevant here for a pending /dns nickname lookup
+        else if (cmd == L"302" && (!m_pendingUserhost.empty() || !m_localLookupPendingNick.IsEmpty())) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated -- relevant to a pending /dns nickname lookup and/or Local Settings' "Server" lookup method
             CString trailing = P(1); int tp = 0;
             for (CString entry = trailing.Tokenize(L" ", tp); !entry.IsEmpty(); entry = trailing.Tokenize(L" ", tp)) {
                 int eq = entry.Find(L'='); if (eq < 0) continue;
@@ -6875,6 +7178,10 @@ class CMainFrame : public CMDIFrameWnd {
                 if (it != m_pendingUserhost.end()) {
                     int reqId = it->second; m_pendingUserhost.erase(it);
                     for (auto& r : m_dnsQueue) if (r.id == reqId) { r.isNickname = false; r.resolvedHost = host; r.status = L"queued"; break; }
+                }
+                if (!m_localLookupPendingNick.IsEmpty() && key == m_localLookupPendingNick) {
+                    m_localLookupPendingNick.Empty();
+                    if (!m_localCapturedThisConnect) LocalApplyServerReportedHost(net, host);   // only acts as a fallback: if this server already sent a pre-registration hostname/mask notice this connection, that's the authoritative source and USERHOST isn't consulted at all
                 }
             }
             StartNextDnsIfIdle();
@@ -8113,11 +8420,397 @@ class CMainFrame : public CMDIFrameWnd {
         }
         Show(w, m_highlightOn ? L"* Highlighting is on." : L"* Highlighting is off.", cInfo);
     }
-    // ---------------- DCC Chat ----------------
+    // ---------------- Local Settings (File > Local Settings): this client's own hostname/IP for DCC offers ----------------
+    bool m_localGetHostOnConnect = true, m_localGetIpOnConnect = true;
+    int m_localLookupMethod = 0;   // 0=Normal, 1=Server, 2=Website
+    CString m_localWebsite = L"icanhazip.com";
+    CString m_localHostName, m_localIpAddress;   // the looked-up (or manually overridden) values; m_localIpAddress, once non-empty, is what DccLocalIp prefers over a raw socket address
+    CString m_localLookupPendingNick;   // non-empty while waiting for a USERHOST reply triggered by the "Server" lookup method -- see the "302" handler
+    // Most IRCds send a hostname/host-mask notice unprompted during connection registration, before 001 -- e.g.
+    // "*** Found your hostname: ..." or, when lookup fails, "*** Your host is masked (...)". That's the actual,
+    // authoritative result of the server's own reverse-DNS/cloaking decision for this connection, and it's what
+    // real mIRC's "Server" method evidently reads. USERHOST, queried after the fact, isn't the same thing -- on at
+    // least one tested network it returned something else (stale cache or otherwise) rather than this value.
+    // USERHOST is now only a fallback for a server that doesn't send one of these notices at all.
+    bool m_localCapturedThisConnect = false;
+    // Takes a host/mask string from either source (the connection notice or a USERHOST reply) and applies it the
+    // same way regardless of where it came from: IPv4 -> straight into the IP address field (after the
+    // private/reserved check); IPv6 -> can't be used for DCC at all, noted but not stored as the IP; anything else
+    // -> treated as a real hostname, shown as-is and forward-resolved to an IPv4 address the same way.
+    void LocalApplyServerReportedHost(Net* net, const CString& host) {
+        // m_localCapturedThisConnect is only set true when this actually yields a usable public IPv4 address --
+        // NOT merely "a notice was seen and parsed". A masked cloak (Rizon-style) or an IPv6 address are both real
+        // things the server told us, worth showing, but neither gives DCC anything it can use; treating "we saw
+        // something" as "we're done" would wrongly block the USERHOST fallback from ever getting a chance to
+        // succeed where the notice didn't -- which on at least one tested network (Rizon) it reliably does: a
+        // manual //userhost $me there returns the real IP directly, even though the connection-time notice only
+        // ever reveals the cloak.
+        bool looksLikeIpv6 = host.Find(L':') >= 0;
+        bool looksLikeIpv4 = !looksLikeIpv6 && LooksLikeIpv4(host);
+        if (looksLikeIpv4) {
+            if (m_localGetIpOnConnect) {
+                if (!IsPrivateOrReservedIpv4(host)) { m_localIpAddress = host; m_localCapturedThisConnect = true; }
+                else Note(net, L"* Local Settings: the server reported a private/local address (" + host + L") for this connection, which isn't usable for DCC across the internet -- keeping the previous IP address setting.", cPart);
+            }
+        } else if (looksLikeIpv6) {
+            if (m_localGetHostOnConnect) m_localHostName = host;   // shown for reference even though it can't be used as a DCC offer address
+            Note(net, L"* Local Settings: the server reported an IPv6 address (" + host + L") for this connection. DCC's classic protocol only supports IPv4, so this can't be used as a DCC offer address; trying USERHOST next.", cPart);
+        } else {
+            if (m_localGetHostOnConnect) m_localHostName = host;
+            if (m_localGetIpOnConnect) {
+                ADDRINFOW h2 = {}; h2.ai_family = AF_INET; h2.ai_socktype = SOCK_STREAM; PADDRINFOW res2 = nullptr;
+                if (::GetAddrInfoW(host, nullptr, &h2, &res2) == 0 && res2) {
+                    sockaddr_in* sa = (sockaddr_in*)res2->ai_addr;
+                    wchar_t ipbuf[64] = {};
+                    if (InetNtopW(AF_INET, &sa->sin_addr, ipbuf, 64)) {
+                        CString resolvedIp = ipbuf;
+                        if (!IsPrivateOrReservedIpv4(resolvedIp)) { m_localIpAddress = resolvedIp; m_localCapturedThisConnect = true; }
+                        else Note(net, L"* Local Settings: \"" + host + L"\" resolved to a private/local address (" + resolvedIp + L"), which isn't usable for DCC across the internet -- keeping the previous IP address setting.", cPart);
+                    }
+                    ::FreeAddrInfoW(res2);
+                }
+                // A masked cloak (e.g. Rizon-style "B0195337.56C6777F.27CBFF65.IP") won't resolve via DNS at all --
+                // GetAddrInfoW simply fails above, m_localCapturedThisConnect is correctly left false, and USERHOST
+                // still gets a chance to succeed where this didn't, exactly as on Rizon.
+            }
+        }
+        // Once a usable public IP is actually in hand (from whichever source), do a client-side reverse-DNS lookup
+        // of it -- this is what actually produces the ISP-style hostname mIRC shows, entirely independent of
+        // anything the IRC server itself reports (see ReverseDnsLookup). Then announce it the same way mIRC does,
+        // as a plain status line, since that's what was specifically asked for.
+        if (m_localCapturedThisConnect) {
+            if (m_localGetHostOnConnect) { CString ptr = ReverseDnsLookup(m_localIpAddress); if (!ptr.IsEmpty()) m_localHostName = ptr; }
+            Note(net, L"* Local host: " + (m_localHostName.IsEmpty() ? m_localIpAddress : m_localHostName) + L" (" + m_localIpAddress + L")", cJoin);
+        }
+        SaveLocalSettings();
+    }
+    void LoadLocalSettings() {
+        CWinApp* a = AfxGetApp();
+        m_localGetHostOnConnect = a->GetProfileInt(L"Local", L"GetHostOnConnect", 1) != 0;
+        m_localGetIpOnConnect = a->GetProfileInt(L"Local", L"GetIpOnConnect", 1) != 0;
+        m_localLookupMethod = a->GetProfileInt(L"Local", L"LookupMethod", 0);
+        m_localWebsite = a->GetProfileString(L"Local", L"Website", L"icanhazip.com");
+        m_localHostName = a->GetProfileString(L"Local", L"HostName", L"");
+        m_localIpAddress = a->GetProfileString(L"Local", L"IpAddress", L"");
+    }
+    void SaveLocalSettings() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Local", L"GetHostOnConnect", m_localGetHostOnConnect);
+        a->WriteProfileInt(L"Local", L"GetIpOnConnect", m_localGetIpOnConnect);
+        a->WriteProfileInt(L"Local", L"LookupMethod", m_localLookupMethod);
+        a->WriteProfileString(L"Local", L"Website", m_localWebsite);
+        a->WriteProfileString(L"Local", L"HostName", m_localHostName);
+        a->WriteProfileString(L"Local", L"IpAddress", m_localIpAddress);
+    }
+    Net* FirstConnectedNet() { for (auto& n : m_nets) if (n->conn) return n.get(); return nullptr; }
+    // Normal and Website resolve synchronously (Website does a blocking HTTP GET, same trade-off already accepted
+    // for the About dialog's "Check for Update" -- acceptable for an infrequent, explicit action, less so if it
+    // ever stalls on an unreachable site, which is a known, honest limitation). Server is asynchronous: it only
+    // sends the USERHOST request here and the actual values land later, in the "302" handler.
+    void LocalLookupNow(Net* net) {
+        if (m_localLookupMethod == 0) {
+            // Deliberately does NOT reverse-DNS anything here: "Normal" means the local machine's own idea of
+            // itself (GetComputerNameExW, the socket's own address), which is a different, distinct thing from
+            // "Server"'s externally-visible public IP and ISP hostname -- blurring the two would make the two
+            // methods redundant with each other.
+            if (m_localGetHostOnConnect) { wchar_t host[256] = {}; DWORD n = 256; if (GetComputerNameExW(ComputerNamePhysicalDnsHostname, host, &n)) m_localHostName = host; }
+            if (m_localGetIpOnConnect && net) { CString addr; UINT port; if (net->sock.GetSockName(addr, port) && !addr.IsEmpty()) m_localIpAddress = addr; }
+            SaveLocalSettings();
+        } else if (m_localLookupMethod == 1) {
+            if (net && net->conn && (m_localGetHostOnConnect || m_localGetIpOnConnect)) {
+                m_localLookupPendingNick = net->nick; m_localLookupPendingNick.MakeLower();
+                Send(net, L"USERHOST " + net->nick);
+            }
+        } else if (m_localLookupMethod == 2) {
+            if (m_localGetIpOnConnect) {
+                CString host = m_localWebsite, path = L"/"; int slash = host.Find(L'/');
+                if (slash >= 0) { path = host.Mid(slash); host = host.Left(slash); }
+                std::string body; CString err;
+                if (HttpGetText(host, path, body, err)) {
+                    CString ip = CString(CA2W(body.c_str(), CP_UTF8)); ip.Trim();
+                    if (!ip.IsEmpty() && LooksLikeIpv4(ip) && !IsPrivateOrReservedIpv4(ip)) {
+                        m_localIpAddress = ip;
+                        if (m_localGetHostOnConnect) { CString ptr = ReverseDnsLookup(ip); if (!ptr.IsEmpty()) m_localHostName = ptr; }   // same reverse-DNS step as "Server", so Website gives a matching hostname too instead of leaving it blank
+                        if (net) Note(net, L"* Local host: " + (m_localHostName.IsEmpty() ? m_localIpAddress : m_localHostName) + L" (" + m_localIpAddress + L")", cJoin);
+                    }
+                }
+            }
+            SaveLocalSettings();
+        }
+    }
+    void OnLocalSettingsDialog() {
+        int oldMethod = m_localLookupMethod;
+        CLocalSettingsDlg dlg(this, m_localGetHostOnConnect, m_localGetIpOnConnect, m_localLookupMethod, m_localWebsite, m_localHostName, m_localIpAddress);
+        if (dlg.DoModal() != IDOK) return;
+        m_localGetHostOnConnect = dlg.getHost; m_localGetIpOnConnect = dlg.getIp; m_localLookupMethod = dlg.method;
+        m_localWebsite = dlg.website; m_localHostName = dlg.hostName; m_localIpAddress = dlg.ipAddress;
+        SaveLocalSettings();
+        if (m_localLookupMethod != oldMethod) LocalLookupNow(FirstConnectedNet());   // only auto-refresh when the method itself changed, so editing the host/IP fields by hand with the method unchanged isn't immediately overwritten
+    }
+    void OnDccOptionsDialog() {
+        CString firstS, lastS; firstS.Format(L"%d", m_dccPortMin); lastS.Format(L"%d", m_dccPortMax);
+        CDccOptionsDlg dlg(this, firstS, lastS);
+        if (dlg.DoModal() != IDOK) return;
+        int first = _wtoi(dlg.firstPort), last = _wtoi(dlg.lastPort);
+        if (first > 0 && last > 0 && last < first) std::swap(first, last);   // a reversed range is an easy typo to make and an easy one to just fix rather than reject
+        m_dccPortMin = first; m_dccPortMax = last;
+        SaveDccSettings();
+    }
+    // ---------------- DCC Chat / Send ----------------
     std::vector<std::unique_ptr<DccSession>> m_dcc;
-    CString DccLocalIp(Net* net) {   // the IP our own socket to the IRC server is using -- behind a home router without port
-        if (net) { CString addr; UINT port; if (net->sock.GetSockName(addr, port) && !addr.IsEmpty()) return addr; }   // forwarding, this will be a private LAN address a remote peer can't actually reach; there's no UPnP/public-IP detection here
-        return L"127.0.0.1";
+    bool m_dccShowFileWarning = true;   // the general "someone is trying to send you a file" safety dialog
+    CString m_dccDownloadFolder;        // empty = defaults to the exe's folder, under a downloads subfolder
+    // 0/0 = let Windows assign a random free port for each DCC listen, same as before this setting existed -- which
+    // means there's nothing fixed for the person to forward through their router, so DCC across separate networks
+    // (not sharing a LAN) can't work at all regardless of how correct the offered IP is. A real range here is what
+    // actually makes that possible: forward that range once, and every future DCC offer listens inside it.
+    int m_dccPortMin = 0, m_dccPortMax = 0;
+    void LoadDccSettings() {
+        CWinApp* a = AfxGetApp();
+        m_dccShowFileWarning = a->GetProfileInt(L"DCC", L"ShowFileWarning", 1) != 0;
+        m_dccDownloadFolder = a->GetProfileString(L"DCC", L"DownloadFolder", L"");
+        m_dccPortMin = a->GetProfileInt(L"DCC", L"PortMin", 0);
+        m_dccPortMax = a->GetProfileInt(L"DCC", L"PortMax", 0);
+    }
+    void SaveDccSettings() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"DCC", L"ShowFileWarning", m_dccShowFileWarning);
+        a->WriteProfileString(L"DCC", L"DownloadFolder", m_dccDownloadFolder);
+        a->WriteProfileInt(L"DCC", L"PortMin", m_dccPortMin);
+        a->WriteProfileInt(L"DCC", L"PortMax", m_dccPortMax);
+    }
+    // Tries each port in the configured range in turn (a given port might already be in use by something else on
+    // this machine) until one succeeds; with no range configured, falls back to the original random-port behavior.
+    // CAsyncSocket::Create() asserts/fails if called again on a socket that's already been created, so a failed
+    // attempt is explicitly closed before retrying with the next port.
+    bool DccBindListenPort(CDccSock* sock) {
+        if (m_dccPortMin > 0 && m_dccPortMax >= m_dccPortMin) {
+            for (int p = m_dccPortMin; p <= m_dccPortMax; p++) {
+                if (sock->Create((UINT)p, SOCK_STREAM) && sock->Listen()) return true;
+                sock->Close();
+            }
+            return false;
+        }
+        return sock->Create(0, SOCK_STREAM) && sock->Listen();
+    }
+    CString DccDownloadPath(const CString& filename) {
+        CString folder = m_dccDownloadFolder.IsEmpty() ? (ExeDir() + L"downloads") : m_dccDownloadFolder;
+        SHCreateDirectoryExW(nullptr, folder, nullptr);
+        return folder + L"\\" + filename;
+    }
+    static CString DccFormatBytes(unsigned __int64 b) {
+        if (b >= 1024ULL * 1024 * 1024) { CString s; s.Format(L"%.2f GB", b / (1024.0 * 1024 * 1024)); return s; }
+        if (b >= 1024ULL * 1024) { CString s; s.Format(L"%.2f MB", b / (1024.0 * 1024)); return s; }
+        if (b >= 1024ULL) { CString s; s.Format(L"%.1f KB", b / 1024.0); return s; }
+        CString s; s.Format(L"%llu B", b); return s;
+    }
+    CChatWnd* OpenDccProgressWindow(const CString& name) {
+        if (auto* e = Find(nullptr, name)) return e;
+        BOOL wasMax = FALSE; MDIGetActive(&wasMax);
+        auto* w = new CChatWnd(name, false);
+        w->net = nullptr; w->m_dccProgress = true;
+        w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };   // no editbox is shown, but kept wired for consistency (e.g. a /close typed via some other path)
+        w->onClose = [this](CChatWnd* c) { DccSessionForgetWindow(c); Forget(c); };
+        w->onDccBtn = [this](CChatWnd* c, int which) { OnDccProgressBtn(c, which); };
+        w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
+        w->tsFormat = [this]() { return m_tsEventFmt; };
+        w->m_seq = ++m_seqn;
+        w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        if (wasMax) w->ShowWindow(SW_SHOWMAXIMIZED);
+        w->ApplyFont(m_chatFont);
+        { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
+        m_w[Key(nullptr, name)] = w;
+        return w;
+    }
+    void DccProgressSetStatus(DccSession* sess, const CString& text) {   // m_out is protected on CChatWnd -- GetDlgItem(1) (its control id) sidesteps that, same fix used for /findtext earlier
+        if (sess->win) sess->win->GetDlgItem(1)->SetWindowText(text);
+    }
+    void DccUpdateProgressDisplay(DccSession* sess) {
+        if (!sess->win) return;
+        ULONGLONG now = ::GetTickCount64();
+        // Throttled to at most ~10 updates/sec: a fast transfer can deliver acks/data far more often than that (a
+        // 5GB file at 8KB chunks is on the order of 650,000 callbacks), and repainting the progress text and bar
+        // on every single one adds real, needless overhead for no visible benefit -- the always-final update when
+        // the transfer completes (bytesDone >= fileSize) bypasses the throttle so 100% never gets skipped.
+        bool isFinal = sess->fileSize > 0 && sess->bytesDone >= sess->fileSize;
+        if (!isFinal && sess->lastUiTick != 0 && now - sess->lastUiTick < 100) return;
+        sess->lastUiTick = now;
+        double secs = (std::max)(0.001, (now - sess->startTick) / 1000.0);
+        double rate = sess->bytesDone / secs;
+        int pct = sess->fileSize > 0 ? (int)((sess->bytesDone * 100) / sess->fileSize) : 0;
+        if (sess->win->m_dccBar.m_hWnd) sess->win->m_dccBar.SetPos(pct);
+        bool isSend = sess->kind == DccSession::SEND;
+        CString label = isSend ? L"Sending" : L"Receiving";
+        CString other = isSend ? (L"To:       " + sess->nick) : (L"From:     " + sess->nick);
+        CString path = isSend ? (L"From:     " + NoFilePart(sess->localPath)) : (L"To:       " + NoFilePart(sess->localPath));
+        CString doneLbl = isSend ? L"Estimate:" : L"Received:";
+        CString text; text.Format(L"%s: %s\r\n%s\r\n%s\r\n\r\n%s %s (%.0f sec)\r\nRate:     %s/sec\r\nStatus:   Transferring (%d%%)",
+            (LPCWSTR)label, (LPCWSTR)sess->filename, (LPCWSTR)other, (LPCWSTR)path,
+            (LPCWSTR)doneLbl, (LPCWSTR)DccFormatBytes(sess->bytesDone), secs, (LPCWSTR)DccFormatBytes((unsigned __int64)rate), pct);
+        DccProgressSetStatus(sess, text);
+    }
+    void DccProgressDone(DccSession* sess) {
+        sess->state = DccSession::DONE;
+        if (sess->win) {
+            if (sess->win->m_dccBar.m_hWnd) sess->win->m_dccBar.SetPos(100);
+            bool isSend = sess->kind == DccSession::SEND;
+            CString text; text.Format(L"%s: %s\r\n\r\nStatus:   Transfer complete", isSend ? L"Sending" : L"Receiving", (LPCWSTR)sess->filename);
+            DccProgressSetStatus(sess, text);
+            sess->win->DccShowFinishedButtons(true);
+        }
+    }
+    void DccProgressFail(DccSession* sess, const CString& reason) {
+        sess->state = DccSession::FAILED;
+        if (sess->file) { sess->file->Close(); sess->file.reset(); }
+        if (sess->win) {
+            bool isSend = sess->kind == DccSession::SEND;
+            DccProgressSetStatus(sess, (isSend ? CString(L"Sending: ") : CString(L"Receiving: ")) + sess->filename + L"\r\n\r\nStatus:   Failed - " + reason);
+            sess->win->DccShowFinishedButtons(false);   // no "Open" (nothing complete), but Open Folder/Close still make sense
+        }
+    }
+    void OnDccProgressBtn(CChatWnd* w, int which) {
+        DccSession* sess = (DccSession*)w->m_dccSession;
+        if (!sess) return;
+        if (which == 0) {   // Cancel
+            if (sess->live) sess->live->Close();
+            if (sess->sock) sess->sock->Close();
+            DccProgressFail(sess, L"Cancelled.");
+        } else if (which == 1) {   // Open Folder
+            ::ShellExecuteW(m_hWnd, L"open", NoFilePart(sess->localPath), nullptr, nullptr, SW_SHOWNORMAL);
+        } else if (which == 2) {   // Open
+            ::ShellExecuteW(m_hWnd, L"open", sess->localPath, nullptr, nullptr, SW_SHOWNORMAL);
+        } else if (which == 3) {   // Close
+            w->DestroyWindow();
+        }
+    }
+    // ---- DCC Send: reads the file and pushes it into the socket's send buffer as fast as it'll accept, resuming
+    // via onSend whenever a chunk is only partially accepted or briefly blocked (WSAEWOULDBLOCK) -- TCP itself
+    // handles the actual flow control; progress (bytesDone) is driven by the receiver's 4-byte acks, not by how
+    // much we've merely queued locally, since that doesn't reflect what's actually landed on their disk. ----
+    void DccSendPump(DccSession* sess) {
+        if (!sess->live || !sess->file) return;
+        char buf[8192];
+        // Capped at 256 KB (32 chunks) per call: on a fast local/LAN connection the OS will happily absorb many
+        // megabytes into its kernel send buffer before Send() ever actually blocks with WSAEWOULDBLOCK, so looping
+        // until genuinely blocked or EOF -- the original approach -- could push an entire multi-gigabyte file
+        // through in one single synchronous call, freezing the whole UI (no message processing at all) for as
+        // long as that takes. Capping the loop and posting a continuation message yields back to the message loop
+        // between bursts, same idea as any chunked-work-on-the-UI-thread pattern. The receiving side (DccGetOnData)
+        // never had this problem: it's only ever called with however much one OnReceive batch delivered (at most
+        // CDccSock's own 8192-byte read buffer), never a whole file at once.
+        for (int i = 0; i < 32; i++) {
+            UINT n = sess->file->Read(buf, sizeof(buf));
+            if (n == 0) return;   // EOF: everything's been queued; wait for the receiver's acks and eventual close
+            int sentN = sess->live->Send(buf, (int)n);
+            if (sentN == SOCKET_ERROR) {
+                if (sess->live->GetLastError() == WSAEWOULDBLOCK) { sess->file->Seek(-(LONGLONG)n, CFile::current); return; }   // back up and resume on OnSend
+                DccProgressFail(sess, L"Send error."); return;
+            }
+            if ((UINT)sentN < n) { sess->file->Seek(-(LONGLONG)(n - sentN), CFile::current); return; }   // partial send: back up the unsent remainder, resume on OnSend
+        }
+        PostMessage(WM_APP + 53, (WPARAM)sess, 0);   // hit the per-call cap without EOF or blocking -- schedule the next burst as a fresh message-queue entry instead of continuing to loop right now
+    }
+    afx_msg LRESULT OnDccPumpMsg(WPARAM wp, LPARAM) {
+        DccSession* sess = (DccSession*)wp;
+        for (auto& s : m_dcc) if (s.get() == sess) { DccSendPump(sess); break; }   // the session may have been cancelled/closed since this was posted, so it's only touched if still found alive in m_dcc
+        return 0;
+    }
+    void DccSendOnAck(DccSession* sess, const char* data, int n) {
+        sess->inbuf.append(data, n);   // CHAT's line-buffer field, reused here as a generic byte buffer -- a session is only ever CHAT or SEND/GET, never both, so this is safe
+        while (sess->inbuf.size() >= 4) {
+            const unsigned char* b = (const unsigned char*)sess->inbuf.data();
+            unsigned __int64 ack = ((unsigned __int64)b[0] << 24) | ((unsigned __int64)b[1] << 16) | ((unsigned __int64)b[2] << 8) | b[3];
+            sess->inbuf.erase(0, 4);
+            sess->bytesDone = ack;
+            DccUpdateProgressDisplay(sess);
+            if (sess->fileSize > 0 && sess->bytesDone >= sess->fileSize) { DccProgressDone(sess); return; }
+        }
+    }
+    void DccSendOnClose(DccSession* sess) { if (sess->state != DccSession::DONE) DccProgressFail(sess, L"Connection closed before the transfer finished."); }
+    void DccSendPeerConnected(DccSession* sess) {
+        auto newSock = std::make_unique<CDccSock>();
+        if (!sess->sock->Accept(*newSock)) { DccProgressFail(sess, L"Accept failed."); return; }
+        sess->live = std::move(newSock);
+        sess->file = std::make_unique<CFile>();
+        if (!sess->file->Open(sess->localPath, CFile::modeRead)) { DccProgressFail(sess, L"Couldn't reopen the file."); return; }
+        sess->startTick = ::GetTickCount64();
+        sess->live->onData = [this, sess](const char* data, int n) { DccSendOnAck(sess, data, n); };
+        sess->live->onClose = [this, sess]() { DccSendOnClose(sess); };
+        sess->live->onSend = [this, sess]() { DccSendPump(sess); };
+        sess->state = DccSession::ACTIVE;
+        DccSendPump(sess);
+    }
+    // ---- DCC Get ----
+    void DccGetOnData(DccSession* sess, const char* data, int n) {
+        if (sess->file) sess->file->Write(data, n);
+        sess->bytesDone += n;
+        unsigned long ack32 = (unsigned long)sess->bytesDone;   // classic DCC's ack is a plain 32-bit counter -- files over ~4GB can't be precisely acked this way; a real limitation of the original protocol, not something fixable on one side alone
+        unsigned char ackBuf[4] = { (unsigned char)(ack32 >> 24), (unsigned char)(ack32 >> 16), (unsigned char)(ack32 >> 8), (unsigned char)ack32 };
+        if (sess->live) sess->live->Send(ackBuf, 4);
+        DccUpdateProgressDisplay(sess);
+        if (sess->fileSize > 0 && sess->bytesDone >= sess->fileSize) {
+            if (sess->file) { sess->file->Close(); sess->file.reset(); }
+            DccProgressDone(sess);
+        }
+    }
+    void DccGetOnClose(DccSession* sess) {
+        if (sess->state != DccSession::DONE) {
+            if (sess->file) { sess->file->Close(); sess->file.reset(); }
+            DccProgressFail(sess, L"Connection closed before the transfer finished.");
+        }
+    }
+    void DccGetConnectResult(DccSession* sess, int e) {
+        if (e != 0) { DccProgressFail(sess, L"Connection failed."); return; }
+        sess->live = std::move(sess->sock);
+        sess->startTick = ::GetTickCount64();
+        sess->live->onData = [this, sess](const char* data, int n) { DccGetOnData(sess, data, n); };
+        sess->live->onClose = [this, sess]() { DccGetOnClose(sess); };
+        sess->state = DccSession::ACTIVE;
+        DccUpdateProgressDisplay(sess);
+    }
+    void DccSendInitiate(Net* net, CChatWnd* fromWin, const CString& nick) {
+        if (!net || !net->conn) { Show(fromWin, L"* Not connected.", cPart); return; }
+        CFileDialog fdlg(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"All Files (*.*)|*.*||", this);
+        if (fdlg.DoModal() != IDOK) return;
+        CString path = fdlg.GetPathName();
+        CFile probe; if (!probe.Open(path, CFile::modeRead)) { Show(fromWin, L"* Couldn't open " + path, cPart); return; }
+        unsigned __int64 size = probe.GetLength(); probe.Close();
+        CString filename = NoPathPart(path);
+
+        auto sess = std::make_unique<DccSession>();
+        sess->kind = DccSession::SEND; sess->net = net; sess->nick = nick; sess->weOffered = true; sess->state = DccSession::LISTENING;
+        sess->filename = filename; sess->localPath = path; sess->fileSize = size;
+        sess->sock = std::make_unique<CDccSock>();
+        if (!DccBindListenPort(sess->sock.get())) { Show(fromWin, L"* DCC Send: couldn't start listening (every port tried was unavailable).", cPart); return; }
+        CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
+
+        CChatWnd* w = OpenDccProgressWindow(L"Send " + nick + L" " + filename);
+        w->m_dccSession = sess.get(); sess->win = w;
+        DccProgressSetStatus(sess.get(), L"Sending:  " + filename + L"\r\nTo:       " + nick + L"\r\nFrom:     " + NoFilePart(path) +
+            L"\r\n\r\nEstimate:\r\nRate:\r\nStatus:   Awaiting reply");
+
+        DccSession* raw = sess.get();
+        sess->sock->onAccept = [this, raw]() { DccSendPeerConnected(raw); };
+        unsigned long ipInt = DccIpToUint(DccLocalIp(net));
+        CString ctcpFilename = filename; ctcpFilename.Replace(L' ', L'_');   // DCC's wire format has no quoting for spaces; replacing them is the standard convention (mIRC's own "Fill Spaces" option)
+        CString ctcp; ctcp.Format(L"DCC SEND %s %lu %u %llu", (LPCWSTR)ctcpFilename, ipInt, (unsigned)localPort, size);
+        Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + ctcp + CString(wchar_t(1)));
+        m_dcc.push_back(std::move(sess));
+    }
+    // If an incoming DCC offer's address is the exact same public IP we'd offer ourselves (DccLocalIp), the peer
+    // is on this same machine or behind this same router/NAT -- real mIRC evidently detects this and substitutes
+    // loopback when connecting out, rather than dialing back through the router to its own public-facing address,
+    // which many routers simply don't route (hairpin NAT support is inconsistent at best). Without this, a same-
+    // network test can end up asymmetric: the direction that only needs the listening side to accept a connection
+    // may work, while the direction that requires actually dialing back out through the router to itself doesn't.
+    CString DccMapSelfIp(Net* net, const CString& offeredIp) {
+        if (!offeredIp.IsEmpty() && offeredIp == DccLocalIp(net)) return L"127.0.0.1";
+        return offeredIp;
+    }
+    CString DccLocalIp(Net* net) {
+        if (!m_localIpAddress.IsEmpty() && LooksLikeIpv4(m_localIpAddress)) return m_localIpAddress;   // File > Local Settings' looked-up/manual public IP, when set and a valid IPv4 address, is what actually makes DCC work across NAT
+        if (net) { CString addr; UINT port; if (net->sock.GetSockName(addr, port) && LooksLikeIpv4(addr)) return addr; }   // fallback: our own socket's local address -- behind a home router without port forwarding this
+        return L"127.0.0.1";   // will be a private LAN address a remote peer can't actually reach; and if the IRC connection itself is over IPv6, GetSockName() returns an IPv6 address DCC's wire format can't encode at all, so this is the last resort either way
     }
     CChatWnd* OpenDccChatWindow(const CString& nick) {
         CString name = L"Chat " + nick;
@@ -8155,7 +8848,7 @@ class CMainFrame : public CMDIFrameWnd {
         auto sess = std::make_unique<DccSession>();
         sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->weOffered = true; sess->state = DccSession::LISTENING;
         sess->sock = std::make_unique<CDccSock>();
-        if (!sess->sock->Create(0, SOCK_STREAM) || !sess->sock->Listen()) { Show(fromWin, L"* DCC Chat: couldn't start listening.", cPart); return; }
+        if (!DccBindListenPort(sess->sock.get())) { Show(fromWin, L"* DCC Chat: couldn't start listening (every port tried was unavailable).", cPart); return; }
         CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
         CChatWnd* w = OpenDccChatWindow(nick);
         w->m_dccSession = sess.get();
@@ -8173,35 +8866,77 @@ class CMainFrame : public CMDIFrameWnd {
         if (IsIgnored(net, nick, host, L'd')) return;   // silently drop DCC requests from an address on the ignore list's "d" (DCC) type
         rest.Trim();
         CString type = Word(rest); type.MakeUpper();
-        if (type != L"CHAT") { Show(Status(net), L"* " + nick + L" sent a DCC " + type + L" request (not implemented in this client yet).", cPart); return; }   // SEND/GET: a planned follow-up
-        Word(rest);   // the literal protocol name "chat" -- not otherwise used
-        CString ipTok = Word(rest), portTok = rest; portTok.Trim();
-        CString ip = DccParseIpToken(ipTok);
-        UINT port = (UINT)_wtoi(portTok);
-        if (ip.IsEmpty() || port == 0) { Show(Status(net), L"* Malformed DCC CHAT request from " + nick, cPart); return; }
-        CDccChatAcceptDlg dlg(this); dlg.nick = nick; dlg.address = host;
-        int r = dlg.DoModal();
-        if (r == IDCANCEL) return;
-        if (r == IDNO) {   // Ignore: add this address to the ignore list's DCC type specifically, leaving their normal chat untouched
-            IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
-            e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
-            m_ignoreList.push_back(e); SaveIgnore();
+        if (type == L"CHAT") {
+            Word(rest);   // the literal protocol name "chat" -- not otherwise used
+            CString ipTok = Word(rest), portTok = rest; portTok.Trim();
+            CString ip = DccMapSelfIp(net, DccParseIpToken(ipTok));
+            UINT port = (UINT)_wtoi(portTok);
+            if (ip.IsEmpty() || port == 0) { Show(Status(net), L"* Malformed DCC CHAT request from " + nick, cPart); return; }
+            CDccChatAcceptDlg dlg(this, nick, host);
+            int r = dlg.DoModal();
+            if (r == IDCANCEL) return;
+            if (r == IDNO) {   // Ignore: add this address to the ignore list's DCC type specifically, leaving their normal chat untouched
+                IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
+                e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
+                m_ignoreList.push_back(e); SaveIgnore();
+                return;
+            }
+            auto sess = std::make_unique<DccSession>();
+            sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false; sess->state = DccSession::CONNECTING;
+            sess->sock = std::make_unique<CDccSock>();
+            sess->sock->Create();
+            CChatWnd* w = OpenDccChatWindow(nick);
+            w->m_dccSession = sess.get();
+            sess->win = w;
+            Show(w, L"Chat with " + nick, cJoin);
+            Show(w, L"Trying to connect...", cPart);
+            if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+            DccSession* raw = sess.get();
+            sess->sock->onConnect = [this, raw](int e) { DccChatConnectResult(raw, e); };
+            sess->sock->Connect(ip, port);
+            m_dcc.push_back(std::move(sess));
             return;
         }
-        auto sess = std::make_unique<DccSession>();
-        sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false; sess->state = DccSession::CONNECTING;
-        sess->sock = std::make_unique<CDccSock>();
-        sess->sock->Create();
-        CChatWnd* w = OpenDccChatWindow(nick);
-        w->m_dccSession = sess.get();
-        sess->win = w;
-        Show(w, L"Chat with " + nick, cJoin);
-        Show(w, L"Trying to connect...", cPart);
-        if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
-        DccSession* raw = sess.get();
-        sess->sock->onConnect = [this, raw](int e) { DccChatConnectResult(raw, e); };
-        sess->sock->Connect(ip, port);
-        m_dcc.push_back(std::move(sess));
+        if (type == L"SEND") {
+            CString fname = Word(rest);
+            CString ipTok = Word(rest), portTok = Word(rest), sizeTok = rest; sizeTok.Trim();
+            CString ip = DccMapSelfIp(net, DccParseIpToken(ipTok));
+            UINT port = (UINT)_wtoi(portTok);
+            unsigned __int64 size = _wtoi64(sizeTok);
+            if (ip.IsEmpty() || port == 0 || fname.IsEmpty()) { Show(Status(net), L"* Malformed DCC SEND request from " + nick, cPart); return; }
+            if (m_dccShowFileWarning) {
+                CDccFileWarningDlg warnDlg(this); warnDlg.alwaysShow = m_dccShowFileWarning;
+                warnDlg.DoModal();   // only has an OK (and Help) button -- nothing to decline here, it's purely informational
+                m_dccShowFileWarning = warnDlg.alwaysShow; SaveDccSettings();
+            }
+            CDccGetAcceptDlg dlg(this, nick, host, fname, DccFormatBytes(size), DccDownloadPath(fname));
+            int r = dlg.DoModal();
+            if (r == IDCANCEL) return;
+            if (r == IDNO) {
+                IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
+                e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
+                m_ignoreList.push_back(e); SaveIgnore();
+                return;
+            }
+            auto sess = std::make_unique<DccSession>();
+            sess->kind = DccSession::GET; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false; sess->state = DccSession::CONNECTING;
+            sess->filename = fname; sess->localPath = dlg.savePath; sess->fileSize = size;
+            sess->file = std::make_unique<CFile>();
+            if (!sess->file->Open(dlg.savePath, CFile::modeCreate | CFile::modeWrite)) { Show(Status(net), L"* DCC Get: couldn't create " + dlg.savePath, cPart); return; }
+            sess->sock = std::make_unique<CDccSock>();
+            sess->sock->Create();
+            CChatWnd* w = OpenDccProgressWindow(L"Get " + nick + L" " + fname);
+            w->m_dccSession = sess.get(); sess->win = w;
+            DccProgressSetStatus(sess.get(), L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + dlg.savePath +
+                L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Connecting...");
+            if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+            DccSession* raw = sess.get();
+            sess->sock->onConnect = [this, raw](int e) { DccGetConnectResult(raw, e); };
+            sess->sock->Connect(ip, port);
+            m_dcc.push_back(std::move(sess));
+            return;
+        }
+        Show(Status(net), L"* " + nick + L" sent a DCC " + type + L" request (not implemented in this client).", cPart);
     }
     void DccChatPeerConnected(DccSession* sess) {   // listening side: a peer is ready to be accepted
         auto newSock = std::make_unique<CDccSock>();
@@ -9458,6 +10193,8 @@ public:
 		LoadVars();
 		LoadPopups();
 		LoadRemote();
+		LoadDccSettings();
+		LoadLocalSettings();
 		LoadColors(); PushSchemeColors(CurScheme());
 		LoadLogging();
 		LoadTimestamp();
@@ -9505,6 +10242,8 @@ public:
         f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
         f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
         f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
+        f.AppendMenu(MF_STRING, IDM_LOCALSETTINGS, L"&Local Settings...");
+        f.AppendMenu(MF_STRING, IDM_DCCOPTIONS, L"DCC &Options...");
         f.AppendMenu(MF_STRING, IDM_TRAY, L"&Tray...");
         f.AppendMenu(MF_STRING, IDM_TIPS, L"T&ips...");
         f.AppendMenu(MF_STRING, IDM_ABOOK, L"&Address Book...\tAlt+B");
@@ -9651,12 +10390,13 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_MESSAGE(WM_APP + 50, OnDnsResult)
     ON_MESSAGE(WM_APP + 51, OnIdentdRequest)
     ON_MESSAGE(WM_APP + 52, OnTrayNotify)
+    ON_MESSAGE(WM_APP + 53, OnDccPumpMsg)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_LOCALSETTINGS, OnLocalSettingsDialog) ON_COMMAND(IDM_DCCOPTIONS, OnDccOptionsDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
