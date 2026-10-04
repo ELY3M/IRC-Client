@@ -25,6 +25,7 @@ you may get random bugs, glitches, or crashes.
 ~~aliases system~~  
 ~~popup system~~  
 ~~variables system~~  
+~~Re-do favorites and add history~~    
 identifiers  
 ~~script editor to let you to edit aliases/vars/scripts~~  
 scripting  

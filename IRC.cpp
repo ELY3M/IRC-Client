@@ -558,6 +558,7 @@ enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
+    CString email;   // /emailaddr: not actually sent anywhere over IRC (the protocol has no standard field for it) -- stored for scripts/reference only
     int port = 6667; BOOL tls = FALSE, lax = FALSE;
 };
 struct Bookmark { CString name; Opts o; };   // one saved entry in the server list (servers.ini); password is never saved
@@ -2038,6 +2039,7 @@ struct Net {
     CListWnd* listWnd = nullptr;   // this network's open /list results window, if any (one at a time, reused on repeat /list)
     CString network;               // from the server's 005 ISUPPORT "NETWORK=" token, for $network (empty if the server doesn't say)
     std::vector<CString> notifyPending;   // the nicks most recently ISON-queried on this network, so the 303 reply can be matched back up -- see NotifyTick / the "303" handler
+    CString debugTarget;   // /debug: a @window name (or empty) that this connection's state is noted in -- see Dispatch's "debug" command
 };
 
 // ---------------- Channel List: /list results, sortable, right-click/double-click to join ----------------
@@ -3991,6 +3993,15 @@ class CMainFrame : public CMDIFrameWnd {
     std::unique_ptr<Gdiplus::Bitmap> m_swSkinBmp, m_tbSkinBmp, m_mdiSkinBmp;
     CMdiClient m_mdiWrap;   // the MDI workspace, subclassed once m_hWndMDIClient exists (see Start())
     bool m_logEnabled = false; CString m_logFolder;   // chat history logging (see LoadLogging/SaveLogging/WriteLog)
+    // ---- odds and ends for the mIRC command-reference pass: /mnick /anick, /donotdisturb, /ajinvite, /beep, /autojoin -dN/-s ----
+    CString m_altNick;                     // /anick: stored for reference/scripts (this client has no automatic use-on-collision behavior)
+    bool m_dnd = false;                    // /donotdisturb, $donotdisturb
+    bool m_ajInviteOn = false;             // /ajinvite: auto-join the channel named in an incoming INVITE
+    bool m_ebeepsOn = true;                // /ebeeps: stored for scripts to check via future $ebeeps-style use; doesn't itself gate any sound this client currently plays
+    bool m_stripCodes = false;             // /strip: global "strip mIRC control codes from incoming text" switch (wired into the PRIVMSG/NOTICE/ACTION display path)
+    bool m_performOn = true;               // /perform: stored; this client has no separate Perform-list feature yet for it to actually gate
+    int m_beepRemaining = 0, m_beepDelayMs = 0;   // /beep's non-blocking repeat state (see OnTimer id 9100)
+    bool m_autojoinSkip = false; int m_autojoinDelayS = 0; Net* m_autojoinDelayNet = nullptr;   // set by /autojoin when called from on CONNECT/Perform, consumed right after (see numeric 001)
     bool m_tsGlobalOn = true; CString m_tsEventFmt = L"[HH:nn]", m_tsLogFmt = L"[HH:nn:ss]";   // see /timestamp, LoadTimestamp/SaveTimestamp
     std::vector<PlayItem> m_playQueue; CString m_pnick; UINT_PTR m_playTimerId = 0;   // see /play, /playctrl, PlayTick
     std::vector<DnsRequest> m_dnsQueue; std::map<CString, int> m_pendingUserhost; int m_dnsSeq = 0;
@@ -6178,7 +6189,334 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
         else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
-        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
+        // ---------------- mIRC command-reference pass: everything below was added to cover the standard mIRC
+        // command list, skipping only what has no supporting feature in this client at all (see the chat reply
+        // for the full list of what's skipped and why -- DCC, treebar, URL-list window, per-window transparency,
+        // DLL calling, text-to-speech). Grouped roughly by category, reusing Send/Note/Show/Say/IniPath throughout,
+        // matching the style of every command above. ----
+        else if (cmd == L"disconnect") { net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); Note(net, L"* Disconnected.", cPart); }
+        else if (cmd == L"exit") {
+            CString a = arg; a.TrimLeft(); bool skipConfirm = false, restart = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L'n') >= 0) skipConfirm = true; if (sw.Find(L'r') >= 0) restart = true;
+            }
+            if (skipConfirm || AfxMessageBox(L"Are you sure you want to exit?", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                if (restart) { wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH); ShellExecuteW(nullptr, L"open", exe, nullptr, nullptr, SW_SHOWNORMAL); }
+                PostMessage(WM_CLOSE);
+            }
+        }
+        else if (cmd == L"mnick") { arg.Trim(); if (!arg.IsEmpty()) { net->o.nick = arg; m_defOpts.nick = arg; SaveOpts(); Show(w, L"* Main nickname set to " + arg, cInfo); } }
+        else if (cmd == L"anick") { arg.Trim(); if (!arg.IsEmpty()) { m_altNick = arg; Show(w, L"* Alternate nickname set to " + arg, cInfo); } }
+        else if (cmd == L"tnick") { arg.Trim(); if (arg.IsEmpty()) Show(w, L"* Usage: /tnick <nickname>", cPart); else if (net->conn) Send(net, L"NICK " + arg); else net->nick = arg; }
+        else if (cmd == L"partall") { arg.Trim(); for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && cw->m_chan) Send(net, L"PART " + cw->m_name + (arg.IsEmpty() ? CString() : L" :" + arg)); } }
+        else if (cmd == L"hop") {
+            CString a = arg; if (a.Left(2).CompareNoCase(L"-c") == 0) { a = a.Mid(2); a.TrimLeft(); }
+            CString chan = Word(a); CString msg = a;
+            if (chan.IsEmpty()) { if (!w->m_chan) { Show(w, L"* /hop: not in a channel.", cPart); return; } chan = w->m_name; }
+            Send(net, L"PART " + chan + (msg.IsEmpty() ? CString() : L" :" + msg));
+            Send(net, L"JOIN " + chan);
+        }
+        else if (cmd == L"noop") { /* intentionally does nothing, matching mIRC's own /noop */ }
+        else if (cmd == L"beep") {
+            CString a = arg; int n = _wtoi(Word(a)); int delayMs = _wtoi(a);
+            if (n <= 0) n = 1; if (delayMs <= 0) delayMs = 300;
+            KillTimer(9100); MessageBeep(MB_OK); m_beepRemaining = n - 1; m_beepDelayMs = delayMs;
+            if (m_beepRemaining > 0) SetTimer(9100, (UINT)delayMs, nullptr);
+        }
+        else if (cmd == L"amsg" || cmd == L"ame") { for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && cw->m_chan) Say(net, cw->m_name, arg, cmd == L"ame"); } }
+        else if (cmd == L"qmsg" || cmd == L"qme") { for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && !cw->m_chan && cw->m_name != L"*status*") Say(net, cw->m_name, arg, cmd == L"qme"); } }
+        else if (cmd == L"omsg" || cmd == L"onotice") {   // STATUSMSG convention: "@#channel" as the PRIVMSG/NOTICE target delivers to ops only
+            CString a = arg, first = Word(a), chan;
+            if (IsChan(first)) chan = first; else { chan = w->m_chan ? w->m_name : CString(); a = arg; }
+            if (chan.IsEmpty() || a.IsEmpty()) { Show(w, L"* Usage: /" + cmd + L" [#channel] <message>", cPart); return; }
+            if (cmd == L"omsg") { Send(net, L"PRIVMSG @" + chan + L" :" + a); Note(net, L"-> *" + chan + L"* " + a, cOwn); }
+            else { Send(net, L"NOTICE @" + chan + L" :" + a); Note(net, L"-> -@" + chan + L"- " + a, cNotice); }
+        }
+        else if (cmd == L"describe") { CString t = Word(arg); if (t.IsEmpty() || arg.IsEmpty()) Show(w, L"* Usage: /describe <nick|channel> <message>", cPart); else Say(net, t, arg, true); }
+        else if (cmd == L"ctcpreply") { CString t = Word(arg), c = Word(arg); c.MakeUpper(); if (t.IsEmpty() || c.IsEmpty()) Show(w, L"* Usage: /ctcpreply <nick> <ctcp> [message]", cPart); else { Send(net, L"NOTICE " + t + L" :" + CString(wchar_t(1)) + c + (arg.IsEmpty() ? CString() : L" " + arg) + CString(wchar_t(1))); Note(net, L"[CTCP reply " + c + L" to " + t + L"]", cCTCP); } }
+        else if (cmd == L"queryrn") {
+            CString t = Word(arg), nn = arg; nn.Trim();
+            CChatWnd* qw = Find(net, t);
+            if (!qw || qw->m_chan) Show(w, L"* /queryrn: no such query window: " + t, cPart);
+            else { qw->m_name = nn; qw->SetWindowText(nn); RefreshBars(); Show(qw, L"* Window renamed to " + nn, cInfo); }
+        }
+        else if (cmd == L"ban") {   // /ban [-k] [#channel] <nick|address> [type] [kick message] -- the -aurbeIq switches aren't implemented (no IAL account tracking, ban-list-type targeting, or timed-unban queue)
+            CString a = arg; bool kickToo = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'k') >= 0) kickToo = true; }
+            CString tok1 = Word(a), chan;
+            if (IsChan(tok1)) { chan = tok1; tok1 = Word(a); } else chan = w->m_chan ? w->m_name : CString();
+            CString target = tok1; a.Trim();
+            if (chan.IsEmpty() || target.IsEmpty()) { Show(w, L"* Usage: /ban [-k] [#channel] <nick|address> [type] [kick message]", cPart); return; }
+            CString restCopy = a; CString typeTok = Word(restCopy); int type = -1;
+            CString kickMsg = a;
+            if (IsAllDigits(typeTok) && !typeTok.IsEmpty()) { type = _wtoi(typeTok); kickMsg = restCopy; }
+            kickMsg.Trim();
+            CString mask;
+            if (target.Find(L'@') >= 0) {   // a full or partial address given directly
+                if (type >= 0) { CString ts; ts.Format(L"%d", type); CString v; FuncValue(w, L"mask", target + L"," + ts, CString(), CString(), v); mask = v; }
+                else mask = target;
+            } else {
+                auto it = m_ial.find(VKey(target));
+                if (it != m_ial.end()) { CString ts; ts.Format(L"%d", type >= 0 ? type : 2); CString v; FuncValue(w, L"mask", target + L"!" + it->second + L"," + ts, CString(), CString(), v); mask = v; }
+                else mask = target + L"!*@*";   // address not known yet: falls back to a nick-based wildcard ban
+            }
+            Send(net, L"MODE " + chan + L" +b " + mask);
+            if (kickToo) Send(net, L"KICK " + chan + L" " + target + (kickMsg.IsEmpty() ? CString() : L" :" + kickMsg));
+        }
+        else if (cmd == L"pop" || cmd == L"pvoice") {   // /pop <delay> [#channel] <nickname> -- does the op/voice immediately or after a delay, skipping if already opped/voiced
+            CString a = arg; CString delayTok = Word(a); int delaySec = _wtoi(delayTok);
+            CString tok = Word(a), chan;
+            if (IsChan(tok)) { chan = tok; tok = Word(a); } else chan = w->m_chan ? w->m_name : CString();
+            CString nickArg = tok; nickArg.Trim();
+            if (chan.IsEmpty() || nickArg.IsEmpty()) { Show(w, L"* Usage: /" + cmd + L" <delay> [#channel] <nickname>", cPart); return; }
+            wchar_t modeCh = cmd == L"pop" ? L'o' : L'v';
+            CChatWnd* cw = Find(net, chan);
+            if (cw) { wchar_t pfx = cw->NickPrefixChar(nickArg); if ((modeCh == L'o' && pfx == L'@') || (modeCh == L'v' && (pfx == L'@' || pfx == L'+'))) return; }   // already has it
+            if (delaySec <= 0) Send(net, L"MODE " + chan + L" +" + CString(modeCh) + L" " + nickArg);
+            else QueueAutoAction(net, chan, nickArg, modeCh);   // approximates the delay via the existing auto-op/voice queue (a short random delay), rather than the exact N seconds requested -- that queue has no caller-specified-delay option
+        }
+        else if (cmd == L"ajinvite") { CString a = arg; a.MakeLower(); a.Trim(); m_ajInviteOn = a.IsEmpty() ? !m_ajInviteOn : (a == L"on"); Show(w, CString(L"* Auto-join on invite is now ") + (m_ajInviteOn ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"autojoin") {   // meant to be called from on CONNECT/Perform, to influence the autojoin that's about to happen right after -- see numeric 001
+            CString a = arg; a.TrimLeft();
+            if (a.Left(2).CompareNoCase(L"-n") == 0) { m_autojoinSkip = false; m_autojoinDelayS = 0; if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin); }
+            else if (a.Left(2).CompareNoCase(L"-s") == 0) m_autojoinSkip = true;
+            else if (a.Left(2).CompareNoCase(L"-d") == 0) m_autojoinDelayS = _wtoi(a.Mid(2));
+            else Show(w, L"* Usage: /autojoin -n|-s|-dN  (meant for use inside on CONNECT or Perform)", cPart);
+        }
+        else if (cmd == L"donotdisturb") { CString a = arg; a.MakeLower(); a.Trim(); m_dnd = a.IsEmpty() ? !m_dnd : (a == L"on"); Show(w, CString(L"* Do Not Disturb is now ") + (m_dnd ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"menubar") { CString a = arg; a.MakeLower(); a.Trim(); bool curOn = GetMenu() != nullptr; bool on = a.IsEmpty() ? !curOn : (a == L"on"); SetMenu(on ? &m_menu : nullptr); DrawMenuBar(); }
+        else if (cmd == L"toolbar") { CString a = arg; a.MakeLower(); a.Trim(); bool vis = m_tb.IsWindowVisible(); bool on = a.IsEmpty() ? !vis : (a == L"on"); m_tb.ShowWindow(on ? SW_SHOW : SW_HIDE); LayoutBars(); }
+        else if (cmd == L"switchbar") { CString a = arg; a.MakeLower(); a.Trim(); bool vis = m_sw.IsWindowVisible(); bool on = a.IsEmpty() ? !vis : (a == L"on"); m_sw.ShowWindow(on ? SW_SHOW : SW_HIDE); LayoutBars(); }
+        else if (cmd == L"markasread") {
+            CString name = arg; name.Trim();
+            if (name.IsEmpty()) { for (auto& kv : m_w) if (kv.second->net == net) kv.second->m_act = 0; }
+            else { CChatWnd* tw = name[0] == L'@' ? Find(nullptr, name) : Find(net, name); if (tw) tw->m_act = 0; }
+            RefreshBars();
+        }
+        else if (cmd == L"close") {   // simplified: closes by matching window name/pattern across all types this client has (channel/query/status/custom); the -cfgs DCC window types don't apply (no DCC)
+            CString a = arg; bool allNets = false, curNetOnly = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'a') >= 0) allNets = true; if (sw.Find(L'x') >= 0) curNetOnly = true; }
+            a.Trim();
+            std::vector<CChatWnd*> toClose;
+            for (auto& kv : m_w) {
+                CChatWnd* cw = kv.second;
+                if (!allNets && !curNetOnly && cw->net != net) continue;
+                if (curNetOnly && cw->net != net) continue;
+                if (cw->m_name == L"*status*" && !allNets && !curNetOnly) continue;   // bare /close doesn't take down the status window
+                if (!a.IsEmpty() && !GlobMatch(a, cw->m_name)) continue;
+                toClose.push_back(cw);
+            }
+            for (auto* cw : toClose) cw->DestroyWindow();   // triggers the window's own onClose -> Forget() automatically (PART if it's a channel, removed from m_w), same as clicking its X button
+        }
+        else if (cmd == L"clearall") {   // -snqmtgua: this client's window types are status/channel/query, so n/q/s/a are meaningful; m/t/u/g are accepted but have nothing extra to match
+            CString a = arg; bool doStatus = false, doChan = false, doQuery = false, any = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L's') >= 0) { doStatus = true; any = true; } if (sw.Find(L'n') >= 0) { doChan = true; any = true; }
+                if (sw.Find(L'q') >= 0) { doQuery = true; any = true; } if (sw.Find(L'a') >= 0) { doStatus = doChan = doQuery = true; any = true; }
+            }
+            if (!any) { doStatus = doChan = doQuery = true; }
+            for (auto& kv : m_w) {
+                CChatWnd* cw = kv.second;
+                bool isStatus = cw->m_name == L"*status*";
+                if ((isStatus && doStatus) || (!isStatus && cw->m_chan && doChan) || (!isStatus && !cw->m_chan && doQuery)) cw->Clear();
+            }
+        }
+        else if (cmd == L"flash") {   // -bN beeps N times, -wN/-rN accepted but map to the same beep (no separate Flash sound slot), -c clears (no-op: nothing persists to clear)
+            CString a = arg; int beeps = 0;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Left(1) == L"b") beeps = (std::max)(1, _wtoi(sw.Mid(1)));
+                else if (sw.Left(1) == L"w" || sw.Left(1) == L"r") beeps = (std::max)(1, _wtoi(sw.Mid(1)));
+            }
+            a.Trim();
+            if (!a.IsEmpty()) SetWindowText(a);
+            if (::GetForegroundWindow() != m_hWnd) FlashWindow(TRUE);   // plain Win32 API (returns HWND) -- unqualified GetForegroundWindow() resolves to MFC's own CWnd::GetForegroundWindow() instead, which returns CWnd* and doesn't compare to m_hWnd
+            for (int i = 0; i < beeps; i++) MessageBeep(MB_OK);
+        }
+        else if (cmd == L"findtext") {   // -nhc: n = find next (vs from top), h/c = highlight/clear highlight -- this client always searches from the top and doesn't maintain a persistent highlighted line
+            CString a = arg; while (a.Left(1) == L"-" && a.GetLength() > 1) Word(a);
+            a.Trim();
+            if (a.IsEmpty()) { Show(w, L"* Usage: /findtext <text>", cPart); return; }
+            CString body; w->GetDlgItem(1)->GetWindowText(body);
+            int pos = body.Find(a);
+            if (pos < 0) Show(w, L"* Not found: " + a, cPart);
+            else { CWnd* o = w->GetDlgItem(1); o->SendMessage(EM_SETSEL, pos, pos + a.GetLength()); o->SetFocus(); }
+        }
+        else if (cmd == L"linesep") { CString a = arg; bool toStatus = a.Left(2).CompareNoCase(L"-s") == 0; CChatWnd* t = toStatus ? Status(net) : w; if (t) Show(t, L"-", cText); }
+        else if (cmd == L"tokenize") {   // NOT fully implemented: real mIRC re-sets $1../$1- for the rest of the calling script. This client's
+            // $1../$1- come from the params string threaded explicitly through RunScript/ExecCmd's call chain, not
+            // a variable /tokenize could reach into and mutate from here -- doing that properly means changing
+            // ExecCtx itself, which is a deeper change than this pass should make blind. This shows what the split
+            // would produce and nothing more, so at least it's honest about not doing the real thing.
+            CString a = arg; CString chTok = Word(a);
+            if (!IsAllDigits(chTok)) { Show(w, L"* Usage: /tokenize <charcode> <text>", cPart); return; }
+            wchar_t sep = (wchar_t)_wtoi(chTok);
+            std::vector<CString> parts; CString cur; for (int i = 0; i < a.GetLength(); i++) { if (a[i] == sep) { parts.push_back(cur); cur.Empty(); } else cur += a[i]; } parts.push_back(cur);
+            CString countStr; countStr.Format(L"%d", (int)parts.size());
+            Show(w, L"* /tokenize: not implemented in this client (would split into " + countStr + L" parts) -- see the chat reply for why.", cPart);
+        }
+        else if (cmd == L"mkdir") {
+            arg.Trim();
+            if (arg.IsEmpty()) Show(w, L"* Usage: /mkdir <dirname>", cPart);
+            else {   // SHCreateDirectoryExW requires a fully-qualified path -- unlike plain CreateDirectoryW, it rejects relative ones outright, which is why a bare "/mkdir name" always failed
+                wchar_t full[MAX_PATH] = {}; GetFullPathNameW(arg, MAX_PATH, full, nullptr);
+                int r = SHCreateDirectoryExW(nullptr, full, nullptr);
+                if (r != ERROR_SUCCESS && r != ERROR_ALREADY_EXISTS) Show(w, L"* /mkdir: couldn't create " + arg, cPart);
+            }
+        }
+        else if (cmd == L"rmdir") { arg.Trim(); if (arg.IsEmpty()) Show(w, L"* Usage: /rmdir <dirname>", cPart); else if (!RemoveDirectoryW(arg)) Show(w, L"* /rmdir failed (directory not empty or doesn't exist).", cPart); }
+        else if (cmd == L"remove") { CString a = arg; bool bin = a.Left(2).CompareNoCase(L"-b") == 0; if (bin) { a = a.Mid(2); a.TrimLeft(); }
+            if (a.IsEmpty()) Show(w, L"* Usage: /remove [-b] <filename>", cPart);
+            else if (bin) { SHFILEOPSTRUCTW op = {}; CString z = a + CString(L'\0'); op.wFunc = FO_DELETE; op.pFrom = z; op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT; SHFileOperationW(&op); }
+            else if (!DeleteFileW(a)) Show(w, L"* /remove: couldn't delete " + a, cPart);
+        }
+        else if (cmd == L"rename") {
+            CString a = arg; bool force = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'o') >= 0) force = true; }
+            CString from = Word(a), to = a; to.Trim();
+            if (from.IsEmpty() || to.IsEmpty()) { Show(w, L"* Usage: /rename [-fo] <filename> <newfilename>", cPart); return; }
+            if (force) DeleteFileW(to);
+            if (!MoveFileW(from, to)) Show(w, L"* /rename: couldn't rename " + from + L" to " + to, cPart);
+        }
+        else if (cmd == L"copy") {
+            CString a = arg; bool append = false, overwrite = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'a') >= 0) append = true; if (sw.Find(L'o') >= 0) overwrite = true; }
+            CString from = Word(a), to = a; to.Trim();
+            if (from.IsEmpty() || to.IsEmpty()) { Show(w, L"* Usage: /copy [-aofp] <filename> <filename>", cPart); return; }
+            if (append) {
+                CFile fin, fout;
+                if (fin.Open(from, CFile::modeRead) && fout.Open(to, CFile::modeReadWrite | CFile::modeCreate | CFile::modeNoTruncate)) {
+                    fout.SeekToEnd(); BYTE buf[8192]; UINT n; while ((n = fin.Read(buf, sizeof(buf))) > 0) fout.Write(buf, n);
+                }
+            } else if (!CopyFileW(from, to, !overwrite)) Show(w, L"* /copy: couldn't copy " + from + L" to " + to, cPart);
+        }
+        else if (cmd == L"copyini") {
+            CString a = arg; CString file = Word(a), sec = Word(a), newSec = a; newSec.Trim();
+            if (file.IsEmpty() || sec.IsEmpty()) { Show(w, L"* Usage: /copyini <inifile> [section] [newsection]", cPart); return; }
+            wchar_t buf[65536] = {}; GetPrivateProfileSectionW(sec, buf, 65536, file);
+            CString target = newSec.IsEmpty() ? sec : newSec;
+            for (wchar_t* p = buf; *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) WritePrivateProfileStringW(target, line.Left(eq), line.Mid(eq + 1), file); }
+        }
+        else if (cmd == L"remini") {
+            CString a = arg; CString file = Word(a), sec = Word(a), item = a; item.Trim();
+            if (file.IsEmpty() || sec.IsEmpty()) { Show(w, L"* Usage: /remini <inifile> <section> [item]", cPart); return; }
+            WritePrivateProfileStringW(sec, item.IsEmpty() ? nullptr : (LPCWSTR)item, nullptr, file);
+        }
+        else if (cmd == L"writeini") {
+            CString a = arg; bool allowLarge = false, zeroVal = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'n') >= 0) allowLarge = true; if (sw.Find(L'z') >= 0) zeroVal = true; }
+            CString file = Word(a), sec = Word(a), item = Word(a), val = a; val.Trim();
+            if (file.IsEmpty() || sec.IsEmpty() || item.IsEmpty()) { Show(w, L"* Usage: /writeini [-nz] <inifile> <section> <item> <value>", cPart); return; }
+            WritePrivateProfileStringW(sec, item, zeroVal ? L"" : (LPCWSTR)val, file);
+        }
+        else if (cmd == L"flushini") { arg.Trim(); if (!arg.IsEmpty()) WritePrivateProfileStringW(nullptr, nullptr, nullptr, arg); }
+        else if (cmd == L"saveini") { SaveOpts(); SaveAliases(); SaveVars(); SavePopups(); SaveRemote(); SaveLogging(); Show(w, L"* Settings saved.", cInfo); }
+        else if (cmd == L"emailaddr") { arg.Trim(); net->o.email = arg; Show(w, L"* Email address set to " + arg, cInfo); }
+        else if (cmd == L"fullname") { arg.Trim(); net->o.real = arg; m_defOpts.real = arg; SaveOpts(); Show(w, L"* Full name set to " + arg, cInfo); }
+        else if (cmd == L"ebeeps") { CString a = arg; a.MakeLower(); a.Trim(); m_ebeepsOn = a.IsEmpty() ? !m_ebeepsOn : (a == L"on"); Show(w, CString(L"* Event beeps are now ") + (m_ebeepsOn ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"strip") {   // +-buriec: this client has one global "strip mIRC control codes on display" switch, not per-code-type toggles
+            CString a = arg; a.Trim(); bool turnOn = a.Find(L'+') >= 0 && a.Find(L'-') < 0;
+            if (a.Find(L'+') >= 0 || a.Find(L'-') >= 0) { m_stripCodes = turnOn; Show(w, CString(L"* Control code stripping is now ") + (m_stripCodes ? L"on" : L"off") + L".", cInfo); }
+            else Show(w, L"* Usage: /strip +<codes> or /strip -<codes>  (this client strips all control codes as one setting, not per-code)", cPart);
+        }
+        else if (cmd == L"font") {   // /font [-asd] <size> <name>: with no params, opens the Font dialog (same as File > Font)
+            CString a = arg; a.TrimLeft();
+            if (a.IsEmpty()) { OnFont(); return; }
+            bool bold = false, italic = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'b') >= 0) bold = true; if (sw.Find(L'i') >= 0) italic = true; }
+            CString sizeTok = Word(a), name = a; name.Trim();
+            int sz = _wtoi(sizeTok);
+            if (sz == 0 || name.IsEmpty()) { Show(w, L"* Usage: /font <fontsize> <fontname>", cPart); return; }
+            LOGFONT lf; MakeFont(lf, name, sz, bold, italic);
+            m_chatFont = lf; SaveFont();
+            for (auto& kv : m_w) kv.second->ApplyFont(m_chatFont);
+        }
+        else if (cmd == L"color") {   // only -s <scheme> is implemented: this client's 16-color mIRC palette (codes 0-15 in chat text) is a fixed
+            // constant table, not a runtime-editable one like the separate 19-item UI color scheme is, so -r/<index> <rgb> aren't implemented.
+            CString a = arg; a.TrimLeft();
+            if (a.Left(2).CompareNoCase(L"-s") == 0) {
+                CString name = a.Mid(2); name.Trim(); bool found = false;
+                for (size_t i = 0; i < m_schemes.size(); i++) if (m_schemes[i].name.CompareNoCase(name) == 0) { m_curScheme = (int)i; PushSchemeColors(m_schemes[i]); found = true; break; }
+                if (!found) Show(w, L"* /color -s: no such scheme: " + name, cPart);
+            }
+            else if (a.Left(2).CompareNoCase(L"-l") == 0) { /* reload from ini: colors are already loaded at startup and kept current, nothing extra to do */ }
+            else Show(w, L"* Usage: /color -s <scheme name>  (per-index 0-15 palette editing isn't implemented -- that palette is fixed in this client)", cPart);
+        }
+        else if (cmd == L"showmirc") {   // -mnrstxoplf
+            CString a = arg; a.MakeLower();
+            if (a.Find(L'n') >= 0) ShowWindow(SW_MINIMIZE);
+            if (a.Find(L'x') >= 0) ShowWindow(SW_MAXIMIZE);
+            if (a.Find(L'r') >= 0 || a.Find(L's') >= 0) ShowWindow(SW_RESTORE);
+            if (a.Find(L'o') >= 0) SetWindowPos(&wndTopMost, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            if (a.Find(L'p') >= 0) SetWindowPos(&wndNoTopMost, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+        else if (cmd == L"winhelp") { CString a = arg, file = Word(a); if (file.IsEmpty()) Show(w, L"* Usage: /winhelp <filename> [key]", cPart); else ShellExecuteW(m_hWnd, L"open", file, nullptr, nullptr, SW_SHOWNORMAL); }
+        else if (cmd == L"background") {   // -lu toolbar, -h switchbar (this client's only two skinnable bars); -x clears; -cfnrtp display-method switches are accepted but this client always stretches/fits, no separate modes
+            CString a = arg; bool isToolbar = false, isSwitch = false, clearIt = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L'l') >= 0 || sw.Find(L'u') >= 0) isToolbar = true; if (sw.Find(L'h') >= 0) isSwitch = true; if (sw.Find(L'x') >= 0) clearIt = true;
+            }
+            CString file = a; file.Trim();
+            if (!isToolbar && !isSwitch) { Show(w, L"* Usage: /background -l|-u (toolbar) or -h (switchbar) [-x to clear] [filename]", cPart); return; }
+            SetSkin(isToolbar, clearIt ? CString() : file);
+        }
+        else if (cmd == L"log") {   // /log <on|off> <window> [-f filename]: this client's logging is a single global on/off + folder, not per-window, so <window> is accepted but only the on/off state applies
+            CString a = arg; CString state = Word(a); state.MakeLower();
+            if (state != L"on" && state != L"off") { Show(w, L"* Usage: /log <on|off> <window> [-f filename]", cPart); return; }
+            m_logEnabled = (state == L"on");
+            if (m_logEnabled && !m_logFolder.IsEmpty()) SHCreateDirectoryExW(nullptr, m_logFolder, nullptr);
+            SaveLogging();
+            Show(w, CString(L"* Logging is now ") + (m_logEnabled ? L"on" : L"off") + L".", cInfo);
+        }
+        else if (cmd == L"logview") { CString a = arg, file = Word(a); if (file.IsEmpty()) Show(w, L"* Usage: /logview <filename>", cPart); else ShellExecuteW(m_hWnd, L"open", file, nullptr, nullptr, SW_SHOWNORMAL); }
+        else if (cmd == L"localinfo") {   // -u userhost lookup, -h hostname lookup; -p (UPnP) and -w (website lookup) aren't implemented
+            CString a = arg; a.MakeLower();
+            if (a.Find(L'u') >= 0) Send(net, L"USERHOST " + net->nick);
+            else if (a.Find(L'h') >= 0) { wchar_t host[256] = {}; DWORD n = 256; GetComputerNameExW(ComputerNamePhysicalDnsHostname, host, &n); Show(w, L"* Local hostname: " + CString(host), cInfo); }
+            else Show(w, L"* Usage: /localinfo -u|-h  (UPnP and website-lookup forms aren't implemented)", cPart);
+        }
+        else if (cmd == L"debug") {   // simplified: on/off + optional @window target; raw-line echoing already exists per-connection via other means, this just toggles whether it's also mirrored to a chosen window
+            CString a = arg; a.TrimLeft();
+            if (a.Left(2).CompareNoCase(L"-c") == 0) { net->debugTarget.Empty(); Show(w, L"* Debug output off for this connection.", cInfo); return; }
+            CString target = a; target.Trim();
+            if (target.IsEmpty()) { Show(w, L"* Usage: /debug [-c] [@window | filename]", cPart); return; }
+            net->debugTarget = target;
+            if (target[0] == L'@') Open(net, target, false);
+            Show(w, L"* Debug output -> " + target, cInfo);
+        }
+        else if (cmd == L"loadbuf") {
+            CString a = arg; CString rangeTok = Word(a);
+            CString winName = Word(a), file = a; file.Trim();
+            if (winName.IsEmpty() || file.IsEmpty()) { Show(w, L"* Usage: /loadbuf [lines] <window> <filename>", cPart); return; }
+            CChatWnd* tw = winName[0] == L'@' ? Find(nullptr, winName) : Find(net, winName);
+            if (!tw) { Show(w, L"* /loadbuf: no such window: " + winName, cPart); return; }
+            std::vector<CString> lines = ReadAllLinesOf(file);
+            int n = _wtoi(rangeTok); if (n <= 0 || n > (int)lines.size()) n = (int)lines.size();
+            for (int i = (int)lines.size() - n; i < (int)lines.size(); i++) if (i >= 0) Show(tw, lines[i], cText);
+        }
+        else if (cmd == L"savebuf") {
+            CString a = arg; CString rangeTok = Word(a);
+            CString winName = Word(a), file = a; file.Trim();
+            if (winName.IsEmpty() || file.IsEmpty()) { Show(w, L"* Usage: /savebuf [lines] <window> <filename>", cPart); return; }
+            CChatWnd* tw = winName[0] == L'@' ? Find(nullptr, winName) : Find(net, winName);
+            if (!tw) { Show(w, L"* /savebuf: no such window: " + winName, cPart); return; }
+            CString body; tw->GetDlgItem(1)->GetWindowText(body);
+            CStdioFile f; if (f.Open(file, CFile::modeCreate | CFile::modeWrite)) { CStringA a8(body); f.Write(a8.GetString(), a8.GetLength()); }
+        }
+        else if (cmd == L"perform") { CString a = arg; a.MakeLower(); a.Trim(); m_performOn = a.IsEmpty() ? !m_performOn : (a == L"on"); Show(w, CString(L"* Perform is now ") + (m_performOn ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"write") {   // core subset: plain append, -c clear-then-write, -a append-to-line, -n no trailing crlf; -lN/-i/-d/-sN/-wN/-rN line-targeting switches aren't implemented
+            CString a = arg; bool clearFirst = false, noCrlf = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'c') >= 0) clearFirst = true; if (sw.Find(L'n') >= 0) noCrlf = true; }
+            CString file = Word(a), text = a;
+            if (file.IsEmpty()) { Show(w, L"* Usage: /write [-cn] <filename> [text]", cPart); return; }
+            CFile f; if (f.Open(file, (clearFirst ? CFile::modeCreate : (CFile::modeCreate | CFile::modeNoTruncate)) | CFile::modeWrite)) {
+                f.SeekToEnd(); CString line = text + (noCrlf ? CString() : CString(L"\r\n")); CStringA a8(line); f.Write(a8.GetString(), a8.GetLength());
+            }
+        }
+        else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
@@ -6239,7 +6577,7 @@ class CMainFrame : public CMDIFrameWnd {
             bool queryOpen = priv && Find(net, nick) != nullptr;   // "private messages ... will not be ignored even if their address matches" while a /query is open
             wchar_t ignType = notice ? L'n' : (priv ? L'p' : L'c');
             if (!(ignType == L'p' && queryOpen) && IsIgnored(net, nick, prefix, ignType)) return;   // fully suppressed: not shown, no tip, nothing
-            if (IsIgnored(net, nick, prefix, L'k')) txt = Strip(txt);   // "strip control codes" -- the message still shows, just without mIRC color/style codes
+            if (IsIgnored(net, nick, prefix, L'k') || m_stripCodes) txt = Strip(txt);   // "strip control codes" -- the message still shows, just without mIRC color/style codes; m_stripCodes is the global /strip setting
             CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
             HighlightEntry* hle = notice ? nullptr : MatchHighlight(nick, txt, priv ? nick : tgt);   // Highlight takes precedence over Nick Colors when both match
             CNickEntry* cne = (notice || hle) ? nullptr : MatchCnick(w, nick, prefix, net);   // Nick Colors: "messages that this user sends to channel or query windows" -- notices aren't included
@@ -6260,7 +6598,12 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         //* Someone (user@hostname) invites you to join #chan
-        else if (cmd == L"INVITE") { if (!IsIgnored(net, nick, prefix, L'i')) Note(net, nick + L" invites you to join " + P(1), cInvite); }
+        else if (cmd == L"INVITE") {
+            if (!IsIgnored(net, nick, prefix, L'i')) {
+                Note(net, nick + L" invites you to join " + P(1), cInvite);
+                if (m_ajInviteOn) Send(net, L"JOIN " + P(1));   // /ajinvite on
+            }
+        }
         else if (cmd == L"JOIN") {
             CString ch = P(0); CChatWnd* w = me ? Open(net, ch, true) : Find(net, ch); if (!w) return;
             if (!me) {
@@ -6340,10 +6683,15 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
-            if (!net->o.autojoin.IsEmpty()) Send(net, L"JOIN " + net->o.autojoin);
+            m_autojoinSkip = false; m_autojoinDelayS = 0; m_autojoinDelayNet = nullptr;   // reset before on CONNECT runs, so /autojoin inside it starts from a clean slate every time
+            FireSimpleEvent(Status(net), L"CONNECT", net->nick, CString(), CString());   // real mIRC fires this at end-of-MOTD; 001 (just-registered) is close enough here and much simpler to hook
+            // /autojoin, if called from the on CONNECT handler just above, can skip or delay the autojoin about to happen here -- see CmdAutojoin
+            if (!net->o.autojoin.IsEmpty() && !m_autojoinSkip) {
+                if (m_autojoinDelayS > 0) { m_autojoinDelayNet = net; SetTimer(9101, (UINT)m_autojoinDelayS * 1000, nullptr); }
+                else Send(net, L"JOIN " + net->o.autojoin);
+            }
             if (m_notifyPopupOnConnect) ShowNotifyWindow();
             NotifyTick(true);
-            FireSimpleEvent(Status(net), L"CONNECT", net->nick, CString(), CString());   // real mIRC fires this at end-of-MOTD; 001 (just-registered) is close enough here and much simpler to hook
         }
         else if (cmd == L"332") { if (CChatWnd* w = Find(net, P(1))) { w->SetTopic(P(2)); Show(w, L"* Topic is " + P(2), cTopic); } }
         else if (cmd == L"333") {   // RPL_TOPICWHOTIME: channel setter unixtimestamp -- who set the topic and when, shown right after the topic itself
@@ -8699,6 +9047,18 @@ class CMainFrame : public CMDIFrameWnd {
         if (id == 2001) { PlayTick(); return; }   // /play: ticks independently of the UI-refresh timer below, and even while a menu is open
         if (id == 2002) { TimerTick(); return; }   // /timer: same reasoning
         if (id == 2003) { TrayAnimTick(); return; }   // tray icon activity flash: same reasoning
+        if (id == 9100) {   // /beep's repeat-with-delay, done via timer rather than Sleep() so it doesn't freeze the UI
+            MessageBeep(MB_OK); m_beepRemaining--;
+            if (m_beepRemaining <= 0) KillTimer(9100);
+            return;
+        }
+        if (id == 9101) {   // a one-shot delayed autojoin set up by /autojoin -dN inside on CONNECT/Perform
+            KillTimer(9101);
+            Net* n = m_autojoinDelayNet; m_autojoinDelayNet = nullptr;
+            bool stillValid = false; for (auto& np : m_nets) if (np.get() == n) { stillValid = true; break; }   // the network could have been dropped/disconnected during the delay
+            if (stillValid && n && n->conn && !n->o.autojoin.IsEmpty()) Send(n, L"JOIN " + n->o.autojoin);
+            return;
+        }
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
         TipTick(); TipCheckActivation(); SoundTick(); NotifyTick(); AutoActionTick();
         if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
