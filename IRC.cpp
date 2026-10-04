@@ -1432,6 +1432,41 @@ public:
     void OnClose(int) override { Close(); if (onDrop) onDrop(); }
 };
 
+// ---------------- DCC: a plain async socket, no TLS and no line-buffering of its own (DCC Chat does its own simple
+// line splitting on the raw bytes). Whichever side offers the DCC (sends the CTCP) listens for the other to connect
+// in; this is "active"/direct DCC, the traditional model. Passive/reverse DCC (for when both peers are behind NAT
+// with no port forwarding) isn't implemented -- that's a real, separate feature, not a small addition to this one. ----
+class CDccSock : public CAsyncSocket {
+public:
+    std::function<void(int)> onConnect;            // outgoing connect finished (0 = success)
+    std::function<void()> onAccept;                // listening socket: a peer is ready to be accepted
+    std::function<void(const char*, int)> onData;   // raw bytes received
+    std::function<void()> onClose;
+    void OnConnect(int e) override { if (onConnect) onConnect(e); }
+    void OnAccept(int) override { if (onAccept) onAccept(); }
+    void OnReceive(int) override {
+        char b[8192]; int n = Receive(b, sizeof b);
+        if (n > 0) { if (onData) onData(b, n); }
+        else if (onClose) onClose();
+    }
+    void OnClose(int) override { if (onClose) onClose(); }
+};
+// DCC's wire format for an IP address is a decimal string of the 4 octets packed big-endian into a 32-bit integer
+// (e.g. 192.168.1.1 -> 3232235777), not dotted-decimal -- this is what real mIRC and most other clients still send
+// for maximum compatibility, even though some newer clients send dotted-decimal instead. Parsing accepts either.
+static unsigned long DccIpToUint(const CString& dotted) {
+    unsigned int a = 0, b = 0, c = 0, d = 0; swscanf_s(dotted, L"%u.%u.%u.%u", &a, &b, &c, &d);
+    return (a << 24) | (b << 16) | (c << 8) | d;
+}
+static CString DccUintToIp(unsigned long v) {
+    CString s; s.Format(L"%u.%u.%u.%u", (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+    return s;
+}
+static CString DccParseIpToken(const CString& tok) {   // tok may be dotted-decimal already, or the packed-integer form -- always returns dotted-decimal
+    if (tok.Find(L'.') >= 0) return tok;
+    return DccUintToIp((unsigned long)_wtoi64(tok));
+}
+
 // ---------------- Chat log: single-click a #channel to join/open it ----------------
 class CLogEdit : public CRichEditCtrl {
 public:
@@ -1558,6 +1593,10 @@ public:
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
     std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped, un-timestamped) text of each new line, for history logging
     int m_tsMode = -1;   // this window's /timestamp override: -1 = follow the global setting, 0 = off, 1 = on
+    // ---- DCC Chat / Send windows reuse this class too, net stays null same as a custom @window; an opaque pointer
+    // here (rather than a real DccSession*) avoids CChatWnd needing that type's full definition, which is declared
+    // later in the file alongside CMainFrame -- only CMainFrame ever casts this back to what it actually is. ----
+    void* m_dccSession = nullptr;
     // ---- /window: custom @windows reuse this class (net stays null unless -i is used) ----
     bool m_custom = false;        // true for an @window created via /window
     bool m_hasEdit = true;        // false = no editbox row at all (mIRC's default for a new custom window, unless -e is given)
@@ -2041,6 +2080,59 @@ struct Net {
     std::vector<CString> notifyPending;   // the nicks most recently ISON-queried on this network, so the 303 reply can be matched back up -- see NotifyTick / the "303" handler
     CString debugTarget;   // /debug: a @window name (or empty) that this connection's state is noted in -- see Dispatch's "debug" command
 };
+
+// ---------------- One DCC Chat (or, in a later pass, Send/Get) session. The CTCP negotiation happens over the
+// regular IRC connection (net), but once connected the actual chat/file data flows entirely peer-to-peer over sock
+// -- the IRC server is never involved in it at all. ----
+struct DccSession {
+    enum Kind { CHAT, SEND, GET } kind = CHAT;
+    enum State { AWAITING_ACCEPT, LISTENING, CONNECTING, ACTIVE, DONE, FAILED } state = AWAITING_ACCEPT;
+    Net* net = nullptr;             // which connection the CTCP request/offer was exchanged over
+    CString nick, address;          // the peer: nick and "user@host" (address is for display only)
+    bool weOffered = false;         // true: we sent the CTCP and are listening; false: we received it and connect out
+    std::unique_ptr<CDccSock> sock; // weOffered: the listening socket until a peer connects, then unused (see live)
+    std::unique_ptr<CDccSock> live; // the actual data connection: weOffered's accepted peer, or !weOffered's own outbound connect
+    CChatWnd* win = nullptr;        // the chat window for this session
+    std::string inbuf;              // CHAT: partial (not yet newline-terminated) incoming bytes
+};
+
+// ---------------- DCC Chat incoming-request dialog: Accept / Ignore / Cancel, matching mIRC's own layout ----------------
+class CDccChatAcceptDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    CString nick, address;
+    bool minimizeWindow = false;
+    CDccChatAcceptDlg(CWnd* parent) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(150);
+        t.push_back(0); t.push_back(0); S(L"mIRC DCC Chat"); t.push_back(9); S(DEFAULT_FONT);
+        Item(SS_LEFT, 10, 8, 150, 20, 0xFFFF, 0x0082, L"This nickname is requesting a private chat with you:");
+        Item(SS_LEFT, 10, 32, 100, 10, 0xFFFF, 0x0082, L"Nickname:");
+        Item(SS_LEFT, 20, 44, 200, 10, 601, 0x0082, nick);
+        Item(SS_LEFT, 10, 58, 100, 10, 0xFFFF, 0x0082, L"Address:");
+        Item(SS_LEFT, 20, 70, 200, 10, 602, 0x0082, address);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 10, 108, 150, 12, 603, 0x0080, L"Minimize window");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 10, 124, 64, 14, IDOK, 0x0080, L"Accept");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 82, 124, 64, 14, 604, 0x0080, L"Ignore");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 154, 124, 64, 14, IDCANCEL, 0x0080, L"Cancel");
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    void OnOK() override { minimizeWindow = IsDlgButtonChecked(603) != 0; CDialog::OnOK(); }
+    void OnIgnoreClick() { EndDialog(IDNO); }   // distinct from Cancel: IDOK=accept, IDNO=ignore, IDCANCEL=cancel
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CDccChatAcceptDlg, CDialog)
+    ON_BN_CLICKED(604, OnIgnoreClick)
+END_MESSAGE_MAP()
 
 // ---------------- Channel List: /list results, sortable, right-click/double-click to join ----------------
 class CListWnd : public CMDIChildWnd {
@@ -6516,6 +6608,11 @@ class CMainFrame : public CMDIFrameWnd {
                 f.SeekToEnd(); CString line = text + (noCrlf ? CString() : CString(L"\r\n")); CStringA a8(line); f.Write(a8.GetString(), a8.GetLength());
             }
         }
+        else if (cmd == L"dcc") {
+            CString a = arg; CString sub = Word(a); sub.MakeLower();
+            if (sub == L"chat") { CString nk = a; nk.Trim(); if (nk.IsEmpty()) Show(w, L"* Usage: /dcc chat <nickname>", cPart); else DccChatInitiate(net, w, nk); }
+            else Show(w, L"* Usage: /dcc chat <nickname>  (/dcc send isn't implemented yet)", cPart);
+        }
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
@@ -6549,6 +6646,7 @@ class CMainFrame : public CMDIFrameWnd {
             bool priv = tgt.CompareNoCase(net->nick) == 0;
             bool ctcp = !txt.IsEmpty() && txt[0] == 1;
             if (ctcp) txt.Trim(CString(wchar_t(1)));
+            if (ctcp && txt.Left(4) == L"DCC ") { if (!notice) HandleDccCtcp(net, nick, host, txt.Mid(4)); return; }   // DCC requests arrive as a PRIVMSG CTCP, never a NOTICE
             if (ctcp && txt.Left(6) != L"ACTION") {
                 // Any CTCP other than ACTION (VERSION, PING, TIME, and replies to them) is protocol noise,
                 // not a conversation: goes to the Status window only, in red, and never opens a query window
@@ -8014,6 +8112,129 @@ class CMainFrame : public CMDIFrameWnd {
             return;
         }
         Show(w, m_highlightOn ? L"* Highlighting is on." : L"* Highlighting is off.", cInfo);
+    }
+    // ---------------- DCC Chat ----------------
+    std::vector<std::unique_ptr<DccSession>> m_dcc;
+    CString DccLocalIp(Net* net) {   // the IP our own socket to the IRC server is using -- behind a home router without port
+        if (net) { CString addr; UINT port; if (net->sock.GetSockName(addr, port) && !addr.IsEmpty()) return addr; }   // forwarding, this will be a private LAN address a remote peer can't actually reach; there's no UPnP/public-IP detection here
+        return L"127.0.0.1";
+    }
+    CChatWnd* OpenDccChatWindow(const CString& nick) {
+        CString name = L"Chat " + nick;
+        if (auto* e = Find(nullptr, name)) return e;
+        BOOL wasMax = FALSE; MDIGetActive(&wasMax);
+        auto* w = new CChatWnd(name, false);
+        w->net = nullptr;
+        w->onInput = [this](CChatWnd* c, CString s) { OnDccChatInput(c, s); };
+        w->onClose = [this](CChatWnd* c) { DccSessionForgetWindow(c); Forget(c); };
+        w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
+        w->tsFormat = [this]() { return m_tsEventFmt; };
+        w->m_seq = ++m_seqn;
+        w->Create(nullptr, name, WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+        if (wasMax) w->ShowWindow(SW_SHOWMAXIMIZED);
+        w->ApplyFont(m_chatFont);
+        { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
+        m_w[Key(nullptr, name)] = w;
+        return w;
+    }
+    void OnDccChatInput(CChatWnd* w, CString s) {
+        if (s.Left(1) == L"/") { OnInput(w, s); return; }   // commands (e.g. /close) still work in a DCC chat window, same convention as everywhere else
+        DccSession* sess = (DccSession*)w->m_dccSession;
+        if (!sess || sess->state != DccSession::ACTIVE || !sess->live) { Show(w, L"* Not connected.", cPart); return; }
+        std::string utf8 = Utf8FromCString(s) + "\n";
+        sess->live->Send(utf8.data(), (int)utf8.size());
+        Show(w, L"<" + (sess->net ? sess->net->nick : CString(L"Me")) + L"> " + s, cOwn);
+    }
+    void DccSessionForgetWindow(CChatWnd* w) {   // the window is closing: drop its session (this closes the socket too, via DccSession's unique_ptr destructors)
+        DccSession* sess = (DccSession*)w->m_dccSession;
+        if (!sess) return;
+        for (auto it = m_dcc.begin(); it != m_dcc.end(); ++it) if (it->get() == sess) { m_dcc.erase(it); break; }
+    }
+    void DccChatInitiate(Net* net, CChatWnd* fromWin, const CString& nick) {
+        if (!net || !net->conn) { Show(fromWin, L"* Not connected.", cPart); return; }
+        auto sess = std::make_unique<DccSession>();
+        sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->weOffered = true; sess->state = DccSession::LISTENING;
+        sess->sock = std::make_unique<CDccSock>();
+        if (!sess->sock->Create(0, SOCK_STREAM) || !sess->sock->Listen()) { Show(fromWin, L"* DCC Chat: couldn't start listening.", cPart); return; }
+        CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
+        CChatWnd* w = OpenDccChatWindow(nick);
+        w->m_dccSession = sess.get();
+        sess->win = w;
+        Show(w, L"Chat with " + nick, cJoin);
+        Show(w, L"Waiting for acknowledgement...", cPart);
+        DccSession* raw = sess.get();
+        sess->sock->onAccept = [this, raw]() { DccChatPeerConnected(raw); };
+        unsigned long ipInt = DccIpToUint(DccLocalIp(net));
+        CString ctcp; ctcp.Format(L"DCC CHAT chat %lu %u", ipInt, (unsigned)localPort);
+        Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + ctcp + CString(wchar_t(1)));
+        m_dcc.push_back(std::move(sess));
+    }
+    void HandleDccCtcp(Net* net, const CString& nick, const CString& host, CString rest) {
+        if (IsIgnored(net, nick, host, L'd')) return;   // silently drop DCC requests from an address on the ignore list's "d" (DCC) type
+        rest.Trim();
+        CString type = Word(rest); type.MakeUpper();
+        if (type != L"CHAT") { Show(Status(net), L"* " + nick + L" sent a DCC " + type + L" request (not implemented in this client yet).", cPart); return; }   // SEND/GET: a planned follow-up
+        Word(rest);   // the literal protocol name "chat" -- not otherwise used
+        CString ipTok = Word(rest), portTok = rest; portTok.Trim();
+        CString ip = DccParseIpToken(ipTok);
+        UINT port = (UINT)_wtoi(portTok);
+        if (ip.IsEmpty() || port == 0) { Show(Status(net), L"* Malformed DCC CHAT request from " + nick, cPart); return; }
+        CDccChatAcceptDlg dlg(this); dlg.nick = nick; dlg.address = host;
+        int r = dlg.DoModal();
+        if (r == IDCANCEL) return;
+        if (r == IDNO) {   // Ignore: add this address to the ignore list's DCC type specifically, leaving their normal chat untouched
+            IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
+            e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
+            m_ignoreList.push_back(e); SaveIgnore();
+            return;
+        }
+        auto sess = std::make_unique<DccSession>();
+        sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false; sess->state = DccSession::CONNECTING;
+        sess->sock = std::make_unique<CDccSock>();
+        sess->sock->Create();
+        CChatWnd* w = OpenDccChatWindow(nick);
+        w->m_dccSession = sess.get();
+        sess->win = w;
+        Show(w, L"Chat with " + nick, cJoin);
+        Show(w, L"Trying to connect...", cPart);
+        if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+        DccSession* raw = sess.get();
+        sess->sock->onConnect = [this, raw](int e) { DccChatConnectResult(raw, e); };
+        sess->sock->Connect(ip, port);
+        m_dcc.push_back(std::move(sess));
+    }
+    void DccChatPeerConnected(DccSession* sess) {   // listening side: a peer is ready to be accepted
+        auto newSock = std::make_unique<CDccSock>();
+        if (!sess->sock->Accept(*newSock)) { if (sess->win) Show(sess->win, L"* DCC Chat: accept failed.", cPart); sess->state = DccSession::FAILED; return; }
+        sess->live = std::move(newSock);
+        WireDccChatSocket(sess);
+        sess->state = DccSession::ACTIVE;
+        if (sess->win) { Show(sess->win, L"-", cText); Show(sess->win, L"DCC Chat connection established", cJoin); }
+    }
+    void DccChatConnectResult(DccSession* sess, int e) {   // connecting side
+        if (e != 0) { if (sess->win) Show(sess->win, L"* DCC Chat: connection failed.", cPart); sess->state = DccSession::FAILED; return; }
+        sess->live = std::move(sess->sock);   // the connecting socket itself becomes the live data socket (no separate accept step on this side)
+        WireDccChatSocket(sess);
+        sess->state = DccSession::ACTIVE;
+        if (sess->win) { Show(sess->win, L"-", cText); Show(sess->win, L"DCC Chat connection established", cJoin); }
+    }
+    void WireDccChatSocket(DccSession* sess) {
+        sess->live->onData = [this, sess](const char* data, int n) { DccChatOnData(sess, data, n); };
+        sess->live->onClose = [this, sess]() { DccChatOnClose(sess); };
+    }
+    void DccChatOnData(DccSession* sess, const char* data, int n) {
+        sess->inbuf.append(data, n);
+        size_t pos;
+        while ((pos = sess->inbuf.find('\n')) != std::string::npos) {
+            std::string lineA = sess->inbuf.substr(0, pos); sess->inbuf.erase(0, pos + 1);
+            if (!lineA.empty() && lineA.back() == '\r') lineA.pop_back();
+            CString line = CString(CA2W(lineA.c_str(), CP_UTF8));
+            if (sess->win) Show(sess->win, L"<" + sess->nick + L"> " + line, cText);
+        }
+    }
+    void DccChatOnClose(DccSession* sess) {
+        if (sess->win) Show(sess->win, L"* DCC Chat connection to " + sess->nick + L" closed.", cPart);
+        sess->state = DccSession::DONE;
     }
     void LoadIdentd() {
         CWinApp* a = AfxGetApp();
