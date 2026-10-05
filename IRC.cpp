@@ -2550,7 +2550,7 @@ typedef std::map<CString, VarEntry> VarMap;   // key: lowercase name including t
 struct VarScope { VarMap locals; std::vector<CString> unsetAtEnd; };   // one per script run
 
 // ---------------- Aliases and scripts: file format, block parsing, syntax tree ----------------
-struct AliasDef { CString name; std::vector<CString> lines; };   // one alias: its name and the lines of its body
+struct AliasDef { CString name; std::vector<CString> lines; CString groupName; };   // one alias: its name, body, and (remote-script-defined ones only) which #group it's in, if any -- empty for every aliases.ini-sourced alias, which have no group concept at all
 struct SNode { int kind = 0; CString text; std::vector<SNode> a, b; };   // 0 command, 1 if (text = condition, a = then, b = else), 2 while, 3 label
 
 static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> commands; a '|' inside parentheses is left alone
@@ -2574,21 +2574,54 @@ static bool IsKw(const CString& s, const wchar_t* kw) {   // s starts with the k
     if (s.GetLength() < n || s.Left(n).CompareNoCase(kw) != 0) return false;
     return s.GetLength() == n || s[n] == L' ' || s[n] == L'(' || s[n] == L'{';
 }
+// ---- Groups: "#groupname [on|off]" opens a group (on/off sets its DECLARED default state, used only the first
+// time this group is ever seen -- /enable and /disable are what actually change the live state after that); a
+// bare "#" or "#groupname end" closes whichever group is currently open. Every on/raw/ctcp/alias parsed while a
+// group is open belongs to it (empty groupName = not in any group, always active). Shared across every parser
+// below, since each independently walks the same script lines and needs to track this the same way. Defined here,
+// before ParseAliases, rather than down near the on/raw/ctcp parsers that also use it, since ParseAliases needs it
+// too and comes first in the file -- a free function has to be defined before its first use, unlike a class member. ----
+static bool IsGroupMarkerLine(const CString& trimmedLine, CString& curGroup) {
+    if (trimmedLine.IsEmpty() || trimmedLine[0] != L'#') return false;
+    if (trimmedLine.CompareNoCase(L"#") == 0) { curGroup.Empty(); return true; }
+    CString rest = trimmedLine.Mid(1); rest.Trim();
+    int sp = rest.Find(L' ');
+    CString word1 = sp >= 0 ? rest.Left(sp) : rest;
+    CString word2 = sp >= 0 ? rest.Mid(sp + 1) : CString(); word2.Trim(); word2.MakeLower();
+    if (word2 == L"end") curGroup.Empty(); else curGroup = word1;
+    return true;
+}
+struct GroupDecl { CString name; bool defaultOn; };
+static std::vector<GroupDecl> ParseGroupDeclarations(const std::vector<CString>& in) {   // every "#groupname [on|off]" opening marker found, in order (duplicates possible -- caller dedupes, first-seen wins)
+    std::vector<GroupDecl> out;
+    for (auto& raw : in) {
+        CString t = raw; t.Trim();
+        if (t.IsEmpty() || t[0] != L'#' || t.CompareNoCase(L"#") == 0) continue;
+        CString rest = t.Mid(1); rest.Trim();
+        int sp = rest.Find(L' ');
+        CString word1 = sp >= 0 ? rest.Left(sp) : rest;
+        CString word2 = sp >= 0 ? rest.Mid(sp + 1) : CString(); word2.Trim(); word2.MakeLower();
+        if (word2 == L"end" || word1.IsEmpty()) continue;   // a closing marker, not a declaration
+        GroupDecl g; g.name = word1; g.defaultOn = word2 != L"off"; out.push_back(g);
+    }
+    return out;
+}
 // The lines of aliases.ini (or the alias editor) -> aliases.   "/name body"   or   "/name {" ... "}"   ;comments and /* */ are skipped.
 static std::vector<AliasDef> ParseAliases(const std::vector<CString>& in) {
-    std::vector<AliasDef> out; bool comment = false;
+    std::vector<AliasDef> out; bool comment = false; CString curGroup;
     for (size_t i = 0; i < in.size(); i++) {
         CString t = in[i];
         if (comment) { if (t.Find(L"*/") >= 0) comment = false; continue; }
         t.Trim();
         if (t.IsEmpty() || t[0] == L';') continue;
         if (t.Left(2) == L"/*") { if (t.Find(L"*/", 2) < 0) comment = true; continue; }
+        if (IsGroupMarkerLine(t, curGroup)) continue;   // aliases.ini content never has these, so curGroup simply stays empty there throughout -- harmless for that source, essential for remote-script-defined aliases
         if (t.Left(6).CompareNoCase(L"alias ") == 0) { t = t.Mid(6); t.TrimLeft(); if (t.Left(3).CompareNoCase(L"-l ") == 0) { t = t.Mid(3); t.TrimLeft(); } }   // remote-script style
         if (t.Left(1) == L"/") t = t.Mid(1);
         int k = 0; while (k < t.GetLength() && t[k] != L' ' && t[k] != L'{') k++;
         CString name = t.Left(k), rest = t.Mid(k); rest.Trim();
         if (name.IsEmpty()) continue;
-        AliasDef ad; ad.name = name;
+        AliasDef ad; ad.name = name; ad.groupName = curGroup;
         int depth = BraceDelta(rest);
         if (depth <= 0) {
             if (rest.Left(1) == L"{" && rest.Right(1) == L"}") { rest = rest.Mid(1, rest.GetLength() - 2); rest.Trim(); }   // "{ cmd | cmd }" on one line
@@ -2739,8 +2772,8 @@ public:
 // round-trips cleanly as free-form text, and there's no unified numeric access-level system for them to assign. ----
 enum {   // this dialog's own control/menu ids -- kept separate from (and defined before) CAddressBookDlg's enum,
          // which lives much later in the file and isn't visible yet at this point
-    IDC_SE_TABALIASES = 3900, IDC_SE_TABPOPUPS, IDC_SE_TABVARS, IDC_SE_TABREMOTE,
-    IDC_SE_EDITALIASES, IDC_SE_EDITPOPUPS, IDC_SE_EDITVARS, IDC_SE_EDITREMOTE,
+    IDC_SE_TABALIASES = 3900, IDC_SE_TABPOPUPS, IDC_SE_TABVARS, IDC_SE_TABREMOTE, IDC_SE_TABUSERS,
+    IDC_SE_EDITALIASES, IDC_SE_EDITPOPUPS, IDC_SE_EDITVARS, IDC_SE_EDITREMOTE, IDC_SE_EDITUSERS,
     IDC_SE_STATUSFILE, IDC_SE_STATUSPOS, IDM_SE_SAVE, IDM_SE_UNDO, IDM_SE_CUT, IDM_SE_COPY, IDM_SE_PASTE, IDM_SE_SELALL, IDM_SE_ABOUT
 };
 class CScriptEditorDlg : public CDialog {
@@ -2756,17 +2789,18 @@ class CScriptEditorDlg : public CDialog {
         t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
     }
     int CurEditId() const {
-        switch (m_curTab) { case 0: return IDC_SE_EDITALIASES; case 1: return IDC_SE_EDITPOPUPS; case 2: return IDC_SE_EDITREMOTE; default: return IDC_SE_EDITVARS; }
+        switch (m_curTab) { case 0: return IDC_SE_EDITALIASES; case 1: return IDC_SE_EDITPOPUPS; case 2: return IDC_SE_EDITREMOTE; case 4: return IDC_SE_EDITUSERS; default: return IDC_SE_EDITVARS; }
     }
     void StashCurrentTabText() {   // so switching tabs doesn't lose whatever's been typed in the one being left
         if (m_curTab == 0) GetDlgItemText(IDC_SE_EDITALIASES, aliasText);
         else if (m_curTab == 1) GetDlgItemText(IDC_SE_EDITPOPUPS, popupText);
         else if (m_curTab == 2) GetDlgItemText(IDC_SE_EDITREMOTE, remoteText);
+        else if (m_curTab == 4) GetDlgItemText(IDC_SE_EDITUSERS, usersText);
         else GetDlgItemText(IDC_SE_EDITVARS, varText);
     }
 public:
-    CString aliasText, popupText, remoteText, varText;   // the caller fills these in before DoModal()
-    std::function<void(const CString&)> onSaveAliases, onSavePopups, onSaveRemote, onSaveVars;   // called (per-tab, via File > Save) or all four (on OK)
+    CString aliasText, popupText, remoteText, varText, usersText;   // the caller fills these in before DoModal()
+    std::function<void(const CString&)> onSaveAliases, onSavePopups, onSaveRemote, onSaveVars, onSaveUsers;   // called (per-tab, via File > Save) or all five (on OK)
 
     CScriptEditorDlg(CWnd* parent) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
@@ -2775,11 +2809,13 @@ public:
         Item(BS_PUSHBUTTON | WS_TABSTOP, 6, 6, 70, 14, IDC_SE_TABALIASES, 0x0080, L"Aliases");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 78, 6, 70, 14, IDC_SE_TABPOPUPS, 0x0080, L"Popups");
         Item(BS_PUSHBUTTON | WS_TABSTOP, 150, 6, 70, 14, IDC_SE_TABREMOTE, 0x0080, L"Remote");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 222, 6, 70, 14, IDC_SE_TABVARS, 0x0080, L"Variables");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 222, 6, 70, 14, IDC_SE_TABUSERS, 0x0080, L"Users");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 294, 6, 70, 14, IDC_SE_TABVARS, 0x0080, L"Variables");
         DWORD editStyle = WS_BORDER | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN | ES_NOHIDESEL;
         Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITALIASES, 0x0081, L"");
         Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITPOPUPS, 0x0081, L"");
         Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITREMOTE, 0x0081, L"");
+        Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITUSERS, 0x0081, L"");
         Item(editStyle, 6, 24, 428, 220, IDC_SE_EDITVARS, 0x0081, L"");
         Item(SS_LEFT | SS_NOPREFIX, 6, 248, 220, 10, IDC_SE_STATUSFILE, 0x0082, L"");
         Item(SS_RIGHT | SS_NOPREFIX, 234, 248, 200, 10, IDC_SE_STATUSPOS, 0x0082, L"");
@@ -2796,7 +2832,8 @@ public:
         GetDlgItem(IDC_SE_EDITPOPUPS)->ShowWindow(tab == 1 ? SW_SHOW : SW_HIDE);
         GetDlgItem(IDC_SE_EDITREMOTE)->ShowWindow(tab == 2 ? SW_SHOW : SW_HIDE);
         GetDlgItem(IDC_SE_EDITVARS)->ShowWindow(tab == 3 ? SW_SHOW : SW_HIDE);
-        static const wchar_t* const files[4] = { L"File: aliases.ini", L"File: popups.ini", L"File: remote.ini", L"File: vars.ini" };
+        GetDlgItem(IDC_SE_EDITUSERS)->ShowWindow(tab == 4 ? SW_SHOW : SW_HIDE);
+        static const wchar_t* const files[5] = { L"File: aliases.ini", L"File: popups.ini", L"File: remote.ini", L"File: vars.ini", L"File: users.ini" };
         SetDlgItemText(IDC_SE_STATUSFILE, files[tab]);
         UpdateStatus();
         GetDlgItem(CurEditId())->SetFocus();
@@ -2837,6 +2874,7 @@ public:
         SetDlgItemText(IDC_SE_EDITPOPUPS, popupText);
         SetDlgItemText(IDC_SE_EDITREMOTE, remoteText);
         SetDlgItemText(IDC_SE_EDITVARS, varText);
+        SetDlgItemText(IDC_SE_EDITUSERS, usersText);
         ShowTab(0);
         SetTimer(1, 300, nullptr);
         return TRUE;
@@ -2845,12 +2883,14 @@ public:
     afx_msg void OnTabPopups() { StashCurrentTabText(); ShowTab(1); }
     afx_msg void OnTabRemote() { StashCurrentTabText(); ShowTab(2); }
     afx_msg void OnTabVars() { StashCurrentTabText(); ShowTab(3); }
+    afx_msg void OnTabUsers() { StashCurrentTabText(); ShowTab(4); }
     afx_msg void OnMenuSave() {
         StashCurrentTabText();
         if (m_curTab == 0 && onSaveAliases) onSaveAliases(aliasText);
         else if (m_curTab == 1 && onSavePopups) onSavePopups(popupText);
         else if (m_curTab == 2 && onSaveRemote) onSaveRemote(remoteText);
         else if (m_curTab == 3 && onSaveVars) onSaveVars(varText);
+        else if (m_curTab == 4 && onSaveUsers) onSaveUsers(usersText);
     }
     afx_msg void OnMenuUndo() { GetDlgItem(CurEditId())->SendMessage(EM_UNDO, 0, 0); }
     afx_msg void OnMenuCut() { GetDlgItem(CurEditId())->SendMessage(WM_CUT, 0, 0); }
@@ -2867,12 +2907,13 @@ public:
         if (onSavePopups) onSavePopups(popupText);
         if (onSaveRemote) onSaveRemote(remoteText);
         if (onSaveVars) onSaveVars(varText);
+        if (onSaveUsers) onSaveUsers(usersText);
         CDialog::OnOK();
     }
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CScriptEditorDlg, CDialog)
-    ON_BN_CLICKED(IDC_SE_TABALIASES, OnTabAliases) ON_BN_CLICKED(IDC_SE_TABPOPUPS, OnTabPopups) ON_BN_CLICKED(IDC_SE_TABREMOTE, OnTabRemote) ON_BN_CLICKED(IDC_SE_TABVARS, OnTabVars)
+    ON_BN_CLICKED(IDC_SE_TABALIASES, OnTabAliases) ON_BN_CLICKED(IDC_SE_TABPOPUPS, OnTabPopups) ON_BN_CLICKED(IDC_SE_TABREMOTE, OnTabRemote) ON_BN_CLICKED(IDC_SE_TABVARS, OnTabVars) ON_BN_CLICKED(IDC_SE_TABUSERS, OnTabUsers)
     ON_COMMAND(IDM_SE_SAVE, OnMenuSave) ON_COMMAND(IDM_SE_UNDO, OnMenuUndo) ON_COMMAND(IDM_SE_CUT, OnMenuCut) ON_COMMAND(IDM_SE_COPY, OnMenuCopy)
     ON_COMMAND(IDM_SE_PASTE, OnMenuPaste) ON_COMMAND(IDM_SE_SELALL, OnMenuSelAll) ON_COMMAND(IDM_SE_ABOUT, OnMenuAbout) ON_WM_TIMER()
 END_MESSAGE_MAP()
@@ -2928,30 +2969,34 @@ static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
 // otherwise ignored: this client has no numeric access-level system (Auto-Op/Auto-Voice/Protect/Ignore are their own
 // separate lists, not a unified /level), so every event matches regardless of what level was written.
 struct RemoteEvent {
-    CString eventName;              // JOIN, PART, TEXT, ACTION, NOTICE, KICK, QUIT, NICK, TOPIC, CONNECT (always uppercase)
+    CString eventName;              // JOIN, PART, TEXT, ACTION, NOTICE, KICK, QUIT, NICK, TOPIC, CONNECT, WALLOPS (always uppercase)
     bool haltDefaultPrefix = false; // a ^ anywhere in the level field: on ^1:JOIN:... -- lets /halt in this event's
                                      // body suppress the built-in join/part/text/etc. line, same as real mIRC
-    CString matchText;              // TEXT/ACTION/NOTICE only
+    CString matchText;              // TEXT/ACTION/NOTICE/WALLOPS only
     CString whereSpec;              // JOIN/PART/KICK/TOPIC: channel list or bare # for "any channel"
                                      // TEXT/ACTION/NOTICE: #, ?, *, or a specific channel/wildcard
+                                     // WALLOPS: no where field at all -- it's a server-wide broadcast, no channel/target concept
     std::vector<CString> lines;
+    CString groupName;              // empty = not in any #group block, always active -- see IsGroupMarkerLine
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
-    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE" };
+    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS" };
     static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC" };
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
+    CString curGroup;
     for (size_t i = 0; i < in.size(); i++) {
         CString t = in[i]; t.Trim();
         if (t.IsEmpty() || t.Left(1) == L";") continue;
+        if (IsGroupMarkerLine(t, curGroup)) continue;
         if (t.Left(3).CompareNoCase(L"on ") != 0) continue;   // not an event line -- skip silently (comment/blank/stray text)
         CString rest = t.Mid(3); rest.TrimLeft();
         int c1 = rest.Find(L':'); if (c1 < 0) continue;
         CString level = rest.Left(c1); rest = rest.Mid(c1 + 1);
-        RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0;
+        RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0; ev.groupName = curGroup;
         int c2 = rest.Find(L':'); if (c2 < 0) continue;
         ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
-        if (inList(ev.eventName, kNeedsMatch, 3)) {
+        if (inList(ev.eventName, kNeedsMatch, 4)) {
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
@@ -2979,6 +3024,132 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             }
         }
         if (ev.eventName.IsEmpty()) continue;
+        out.push_back(ev);
+    }
+    return out;
+}
+// ---- raw events: "raw <numeric>:<matchtext>:<commands>" -- a different, simpler syntax from "on <level>:EVENT:..."
+// (no "on", no level field), living in the same remote script text. Fires for literally any incoming server line
+// -- any numeric (e.g. 322) or any non-numeric command mIRC itself doesn't otherwise recognize as a named event
+// (e.g. PROP) -- which is why mIRC's own docs specifically warn about keeping these scripts fast, and why
+// matching happens once per raw line at the very top of dispatch rather than being folded into each numeric's own
+// specific handler. ----
+struct RawEvent {
+    CString numericOrName;   // "322", "PROP", etc. -- always uppercase
+    CString matchText;       // wildcard, matched against the line's full parameter text ($1-)
+    std::vector<CString> lines;
+    CString groupName;       // empty = not in any #group block, always active
+};
+static std::vector<RawEvent> ParseRawEvents(const std::vector<CString>& in) {
+    std::vector<RawEvent> out;
+    CString curGroup;
+    for (size_t i = 0; i < in.size(); i++) {
+        CString t = in[i]; t.Trim();
+        if (t.IsEmpty() || t.Left(1) == L";") continue;
+        if (IsGroupMarkerLine(t, curGroup)) continue;
+        if (t.Left(4).CompareNoCase(L"raw ") != 0) continue;   // not a raw-event line -- skip silently
+        CString rest = t.Mid(4); rest.TrimLeft();
+        int c1 = rest.Find(L':'); if (c1 < 0) continue;
+        RawEvent ev; ev.numericOrName = rest.Left(c1); ev.numericOrName.MakeUpper(); ev.groupName = curGroup; rest = rest.Mid(c1 + 1);
+        int c2 = rest.Find(L':'); if (c2 < 0) continue;
+        ev.matchText = rest.Left(c2); rest = rest.Mid(c2 + 1);
+        CString cmdText = rest; cmdText.TrimLeft();
+        int db = BraceDelta(cmdText);
+        if (db <= 0) {
+            if (cmdText.Left(1) == L"{" && cmdText.Right(1) == L"}") { cmdText = cmdText.Mid(1, cmdText.GetLength() - 2); cmdText.Trim(); }
+            if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
+        } else {   // a { ... } body over several lines
+            bool outer = cmdText.Left(1) == L"{";
+            if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
+            if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
+            while (db > 0 && i + 1 < in.size()) {
+                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                if (db <= 0) {
+                    if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ev.lines.push_back(head); }
+                    else ev.lines.push_back(l);
+                    break;
+                }
+                ev.lines.push_back(l);
+            }
+        }
+        if (ev.numericOrName.IsEmpty()) continue;
+        out.push_back(ev);
+    }
+    return out;
+}
+// ---- ctcp events: "ctcp <level>:<matchtext>:<*|#|?>:<commands>", plus the access-level list that gives <level>
+// meaning ("N:mask" or "=N:mask" lines, also living in the same remote script text). matchtext is matched against
+// only the CTCP's first word -- the actual CTCP command per protocol convention (PING, VERSION, or a custom word
+// like "send") -- not the whole payload; this is confirmed by the documented "ctcp 100:send:?:/dcc send $nick
+// $1-" example, which only works correctly ($1- becoming the filename argument) if the matched command word is
+// stripped off first, not included in $1-. ----
+struct LevelEntry { int level = 0; bool exact = false; CString mask; };   // mask: nick!user@host wildcard; exact: true for "=N" (exactly N), false for plain "N" (N and anything below)
+struct CtcpEvent {
+    int level = 0;
+    CString matchText;   // matched against the CTCP's first word only; %variables are expanded fresh at match time
+    CString whereSpec;   // "*" any, "#" channel-targeted, "?" private-targeted
+    std::vector<CString> lines;
+    CString groupName;   // empty = not in any #group block, always active
+};
+// users.ini's real on-disk format, confirmed against an actual mIRC Users tab: one line per user, "mask:levels",
+// mask FIRST then a comma-separated level list, each level optionally "=" prefixed for exact (e.g.
+// "testtetrtreter:1" or "Nick:1,2,=5"). This is the reverse order from the inline "=5:*!user@mirc.com" notation
+// mIRC's own CTCP-events documentation uses to describe a grant in prose -- that's explanatory shorthand, not the
+// actual file syntax, which this now matches instead.
+static std::vector<LevelEntry> ParseLevelEntries(const std::vector<CString>& in) {
+    std::vector<LevelEntry> out;
+    for (auto& raw : in) {
+        CString t = raw; t.Trim();
+        if (t.IsEmpty() || t.Left(1) == L";") continue;
+        int c1 = t.Find(L':'); if (c1 <= 0) continue;
+        CString mask = t.Left(c1); mask.Trim();
+        CString levelsTok = t.Mid(c1 + 1);
+        int pos = 0;
+        while (pos != -1) {
+            CString tok = levelsTok.Tokenize(L",", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+            bool exact = tok.Left(1) == L"="; CString numTok = exact ? tok.Mid(1) : tok;
+            bool allDigits = !numTok.IsEmpty(); for (int di = 0; di < numTok.GetLength() && allDigits; di++) if (!iswdigit(numTok[di])) allDigits = false;
+            if (!allDigits) continue;
+            LevelEntry e; e.level = _wtoi(numTok); e.exact = exact; e.mask = mask;
+            out.push_back(e);
+        }
+    }
+    return out;
+}
+static std::vector<CtcpEvent> ParseCtcpEvents(const std::vector<CString>& in) {
+    std::vector<CtcpEvent> out;
+    CString curGroup;
+    for (size_t i = 0; i < in.size(); i++) {
+        CString t = in[i]; t.Trim();
+        if (t.IsEmpty() || t.Left(1) == L";") continue;
+        if (IsGroupMarkerLine(t, curGroup)) continue;
+        if (t.Left(5).CompareNoCase(L"ctcp ") != 0) continue;
+        CString rest = t.Mid(5); rest.TrimLeft();
+        int c1 = rest.Find(L':'); if (c1 < 0) continue;
+        CtcpEvent ev; ev.level = _wtoi(rest.Left(c1)); ev.groupName = curGroup; rest = rest.Mid(c1 + 1);
+        int c2 = rest.Find(L':'); if (c2 < 0) continue;
+        ev.matchText = rest.Left(c2); rest = rest.Mid(c2 + 1);
+        int c3 = rest.Find(L':'); if (c3 < 0) continue;
+        ev.whereSpec = rest.Left(c3); rest = rest.Mid(c3 + 1);
+        CString cmdText = rest; cmdText.TrimLeft();
+        int db = BraceDelta(cmdText);
+        if (db <= 0) {
+            if (cmdText.Left(1) == L"{" && cmdText.Right(1) == L"}") { cmdText = cmdText.Mid(1, cmdText.GetLength() - 2); cmdText.Trim(); }
+            if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
+        } else {   // a { ... } body over several lines
+            bool outer = cmdText.Left(1) == L"{";
+            if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
+            if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
+            while (db > 0 && i + 1 < in.size()) {
+                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                if (db <= 0) {
+                    if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ev.lines.push_back(head); }
+                    else ev.lines.push_back(l);
+                    break;
+                }
+                ev.lines.push_back(l);
+            }
+        }
         out.push_back(ev);
     }
     return out;
@@ -3792,7 +3963,8 @@ public:
     std::function<void()> onShowNotifyWindow;
     std::function<void(int, const CString&)> onControlCmd;   // listSel 0=aop 1=avoice 2=protect 3=ignore; feeds the text straight into the matching /command's own parser
     std::function<void(const CString&)> onCnickCmd;          // feeds the text straight into /cnick's own parser
-    std::function<void(const CString&)> onStartWhoisLookup;  // nick to look up; replies arrive asynchronously, polled via onGetWhoisCapture
+    std::function<void(const CString&, const CString&)> onStartWhoisLookup;  // nick [,nick2] to look up (nick2 empty = just one); replies arrive asynchronously, polled via onGetWhoisCapture
+    CString initialNick2;   // /uwho's optional second nick -- some servers only reveal idle time/away status on a second WHOIS for the same nick within a short window
     std::function<WhoisCapture()> onGetWhoisCapture;
     std::function<void(const WhoisCapture&)> onWhoisAdd;     // "Add": add/update this nick in the Address Book's Users tab from the whois data
     std::function<bool(const CString&)> onWhoisFind;         // "Find": true and switches to the Users tab if a matching entry exists
@@ -4052,6 +4224,10 @@ public:
         CheckDlgButton(IDC_AB_CT_RANDOMDELAY, randomDelay);
         RefreshControlList(); RefreshColorsList();
         SetTab(initialTab);
+        if (initialTab == IDC_AB_TABWHOIS && !initialNick.IsEmpty()) {   // /uwho: pre-fill the Whois tab's own nickname field (separate from the Users tab's) and start the lookup immediately, same as clicking the Whois button by hand
+            SetDlgItemText(IDC_AB_WH_NICK, initialNick);
+            if (onStartWhoisLookup) onStartWhoisLookup(initialNick, initialNick2);
+        }
         SetTimer(1, 500, nullptr);   // polls the Whois capture buffer -- replies arrive asynchronously while this modal dialog is open
         return TRUE;
     }
@@ -4142,7 +4318,7 @@ public:
         SetDlgItemText(IDC_AB_WH_NAME, L""); SetDlgItemText(IDC_AB_WH_ADDRESS, L""); SetDlgItemText(IDC_AB_WH_CHANNELS, L"");
         SetDlgItemText(IDC_AB_WH_IDLE, L""); SetDlgItemText(IDC_AB_WH_AWAY, L""); SetDlgItemText(IDC_AB_WH_SERVER, L"");
         SetDlgItemText(IDC_AB_WH_STATUS, L""); SetDlgItemText(IDC_AB_WH_CTCP, L"");
-        if (onStartWhoisLookup) onStartWhoisLookup(nick);
+        if (onStartWhoisLookup) onStartWhoisLookup(nick, CString());
     }
     afx_msg void OnWhoisAdd() {   // adds (or updates) this nick in the Users tab, pre-filled from the whois data
         CString nick = WhoisTabNick();
@@ -4608,9 +4784,25 @@ class CMainFrame : public CMDIFrameWnd {
         auto i = m_w.find(Key(net, n)); if (i == m_w.end()) return;
         CChatWnd* w = i->second; m_w.erase(i); w->DestroyWindow();
     }
+    // /debug sets net->debugTarget, but until now nothing ever actually wrote to it -- the window opened
+    // (Dispatch's "debug" command handles that) and then just sat empty forever, since the actual raw-line mirror
+    // was never wired up at the two places raw IRC lines actually flow: Send() below (outgoing) and OnLine()
+    // (incoming). dir is "->" or "<-", matching mIRC's own debug window convention.
+    void DebugLine(Net* net, const wchar_t* dir, const CString& raw) {
+        if (!net || net->debugTarget.IsEmpty()) return;
+        CString line = CString(dir) + L" " + raw;
+        if (net->debugTarget[0] == L'@') {
+            CChatWnd* w = Find(net, net->debugTarget);
+            if (!w) w = Open(net, net->debugTarget, false);   // the window could have been closed since /debug was set; reopen it rather than silently going dark
+            Show(w, line, cText);
+        } else {
+            CStdioFile f; if (f.Open(net->debugTarget, CFile::modeCreate | CFile::modeWrite | CFile::modeNoTruncate)) { f.SeekToEnd(); CStringA a8(line + L"\r\n"); f.Write(a8.GetString(), a8.GetLength()); }
+        }
+    }
     void Send(Net* net, CString l) {
         if (!net || !net->conn) { Note(net, L"Not connected. Use /server <host> [port]", cPart); return; }
         l.Remove(L'\r'); l.Remove(L'\n');
+        DebugLine(net, L"->", l);
         CW2A conv(l, CP_UTF8);
         CStringA u((LPCSTR)conv);
         u += "\r\n";
@@ -4735,6 +4927,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"newnick") { val = m_evNewnick; return true; }   // on NICK only: the nick they changed to ($nick is the old one)
         if (name == L"halted") { val = m_evHaltDef ? L"$true" : L"$false"; return true; }
         if (name == L"event") { val = m_evName; return true; }   // the name of the currently-running remote event: "JOIN", "TEXT", etc.
+        if (name == L"numeric") { val = m_evNumeric; return true; }   // the 3-digit numeric a running raw event matched against (e.g. "322"); empty for a non-numeric raw event or outside one entirely
         if (name == L"site") { int at = m_evAddress.Find(L'@'); val = at >= 0 ? m_evAddress.Mid(at + 1) : CString(); return true; }   // the host part of $address
         if (name == L"wildsite") { int at = m_evAddress.Find(L'@'); val = at >= 0 ? (CString(L"*!*@") + m_evAddress.Mid(at + 1)) : CString(); return true; }
         if (name == L"fulladdress") { val = (m_evNick.IsEmpty() || m_evAddress.IsEmpty()) ? CString() : (m_evNick + L"!" + m_evAddress); return true; }
@@ -5314,6 +5507,21 @@ class CMainFrame : public CMDIFrameWnd {
             else val = found->nick;
             return true;
         }
+        if (name == L"ulist") {   // $ulist(N).info: the Nth unique user mask across all level entries (1-indexed); .info for their /iuser text, otherwise the mask itself
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            double nD; int n = 1; if (ParseNum(a, nD)) n = (int)nD; else if (!a.IsEmpty()) n = 0;
+            std::vector<CString> uniqueMasks;
+            for (auto& e : m_levelEntries) {
+                CString key = e.mask; key.MakeLower();
+                bool dup = false; for (auto& um : uniqueMasks) { CString umKey = um; umKey.MakeLower(); if (umKey == key) { dup = true; break; } }
+                if (!dup) uniqueMasks.push_back(e.mask);
+            }
+            if (n < 1 || n > (int)uniqueMasks.size()) { val.Empty(); return true; }
+            CString mask = uniqueMasks[n - 1];
+            if (prop == L"info") { auto it = m_userInfo.find(VKey(mask)); val = it != m_userInfo.end() ? it->second : CString(); }
+            else val = mask;
+            return true;
+        }
         if (name == L"alias") {   // $alias(N/filename): this client has one flat alias list (aliases.ini), not multiple alias files, so this is necessarily simplified
             CString a = EvalIds(w, rawArgs, params); a.Trim();
             double nD;
@@ -5678,7 +5886,20 @@ class CMainFrame : public CMDIFrameWnd {
         return EvalIds(w, line, params);
     }
     // ---- aliases: aliases.ini  ([aliases]  n0=/name body ;  a multi-line alias is "/name {", its lines, "}") ----
-    AliasDef* FindAlias(const CString& name) { for (size_t i = 0; i < m_aliases.size(); i++) if (m_aliases[i].name.CompareNoCase(name) == 0) return &m_aliases[i]; return nullptr; }
+    // Real mIRC also recognizes "alias name { ... }" blocks written directly in the Remote script, not just the
+    // dedicated Aliases file -- ParseAliases already handled that syntax (see its own "remote-script style"
+    // comment), it just was never actually being run against m_remoteRaw anywhere. Kept as a separate list rather
+    // than merged into m_aliases, so saving edits to the Aliases tab can't accidentally duplicate a remote-defined
+    // alias into aliases.ini (or vice versa) -- each source's own save path only ever touches its own list.
+    std::vector<AliasDef> m_remoteAliases;
+    AliasDef* FindAlias(const CString& name) {
+        // The IsGroupEnabled() check is a no-op for every m_aliases entry (aliases.ini-sourced ones always have an
+        // empty groupName, and that's unconditionally treated as enabled) -- it only actually matters for
+        // m_remoteAliases, where a remote-script "alias" block can sit inside a #group someone has /disable'd.
+        for (size_t i = 0; i < m_aliases.size(); i++) if (m_aliases[i].name.CompareNoCase(name) == 0 && IsGroupEnabled(m_aliases[i].groupName)) return &m_aliases[i];
+        for (size_t i = 0; i < m_remoteAliases.size(); i++) if (m_remoteAliases[i].name.CompareNoCase(name) == 0 && IsGroupEnabled(m_remoteAliases[i].groupName)) return &m_remoteAliases[i];
+        return nullptr;
+    }
     bool OnRunStack(const CString& name) { for (size_t i = 0; i < m_runStack.size(); i++) if (m_runStack[i].CompareNoCase(name) == 0) return true; return false; }
     void SetAlias(const CString& name, const std::vector<CString>& lines) {
         if (AliasDef* a = FindAlias(name)) a->lines = lines;
@@ -5743,10 +5964,12 @@ class CMainFrame : public CMDIFrameWnd {
         dlg.popupText = BuildPopupsText();
         dlg.remoteText = BuildRemoteText();
         dlg.varText = BuildVarsText();
+        dlg.usersText = BuildUsersText();
         dlg.onSaveAliases = [this](const CString& text) { ApplyAliasesText(text); };
         dlg.onSavePopups = [this](const CString& text) { ApplyPopupsText(text); };
         dlg.onSaveRemote = [this](const CString& text) { ApplyRemoteText(text); };
         dlg.onSaveVars = [this](const CString& text) { ApplyVarsText(text); };
+        dlg.onSaveUsers = [this](const CString& text) { ApplyUsersText(text); };
         dlg.DoModal();
     }
     afx_msg void OnColorsDialog() {
@@ -5965,8 +6188,111 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- Remote events: on JOIN/PART/TEXT/ACTION/NOTICE/KICK/QUIT/NICK/TOPIC/CONNECT, remote.ini ----
     std::vector<CString> m_remoteRaw;   // the file / editor text, exactly as typed
     std::vector<RemoteEvent> m_events;  // parsed from m_remoteRaw whenever it changes
-    CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName;   // what $nick, $chan, $address, $knick,
-    bool m_evHaltDef = false;   // $newnick, $event resolve to while an event's commands are running
+    std::vector<RawEvent> m_rawEvents;  // "raw ..." lines, also parsed from m_remoteRaw -- the two syntaxes share the same script text
+    std::vector<CtcpEvent> m_ctcpEvents;    // "ctcp ..." lines, also parsed from m_remoteRaw
+    std::vector<LevelEntry> m_levelEntries; // "N:mask" / "=N:mask" lines, also parsed from m_remoteRaw -- gives ctcp events' <level> field meaning
+    // ---- Groups: live enabled/disabled state, overriding each group's declared "#name on|off" default once
+    // /enable or /disable has touched it. A vector (not a map) since wildcard matching and display both need the
+    // group's real, original-case name, which a lowercased map key would lose.
+    struct GroupState { CString name; bool enabled; };
+    std::vector<GroupState> m_groups;
+    bool IsGroupEnabled(const CString& groupName) {
+        if (groupName.IsEmpty()) return true;   // not in any group: always active
+        for (auto& g : m_groups) if (g.name.CompareNoCase(groupName) == 0) return g.enabled;
+        return true;   // a group referenced by an event but never actually declared (shouldn't normally happen): default enabled
+    }
+    void SyncGroupDeclarations() {   // registers any newly-seen "#name [on|off]" declarations, without clobbering a group /enable or /disable already touched this session
+        for (auto& g : ParseGroupDeclarations(m_remoteRaw)) {
+            bool found = false; for (auto& existing : m_groups) if (existing.name.CompareNoCase(g.name) == 0) { found = true; break; }
+            if (!found) m_groups.push_back({ g.name, g.defaultOn });
+        }
+    }
+    void LoadGroupState() {   // the persisted, previously-toggled state -- loaded once at startup, before SyncGroupDeclarations runs, so a saved /enable or /disable from a prior session is what wins over the script's own declared default
+        CString path = IniPath(L"remote.ini");
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(L"groupstate", buf.data(), (DWORD)buf.size(), path);
+        m_groups.clear();
+        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_groups.push_back({ line.Left(eq), _wtoi(line.Mid(eq + 1)) != 0 }); }
+    }
+    void SaveGroupState() {
+        CString path = IniPath(L"remote.ini");
+        WritePrivateProfileStringW(L"groupstate", nullptr, nullptr, path);
+        for (auto& g : m_groups) { CString v; v.Format(L"%d", g.enabled ? 1 : 0); WritePrivateProfileStringW(L"groupstate", g.name, v, path); }
+    }
+    // /guser: like /auser, but looks up the nick's address via USERHOST first and adds that instead of the bare
+    // nick -- so it's a delayed command, same reasoning mIRC's own docs give for /guser and /ruser's type form.
+    // Several can be outstanding at once (one per distinct nick); the 302 handler below consumes them by nick.
+    struct PendingGuser { bool add = false; CString levelsTok, nick, info; int type = 2; };
+    std::vector<PendingGuser> m_pendingGuser;
+    // ---- /ctcps /events /raw /remote /dlevel: master switches + the default level UserHasLevel falls back to ----
+    bool m_ctcpsOn = true, m_eventsOn = true, m_rawEventsOn = true, m_remoteOn = true;
+    int m_defaultLevel = 1;
+    // /iuser's per-user free-text info, shown via $ulist().info -- separate from m_levelEntries since one user mask
+    // can have several (mask,level) entries but only one info string, and info isn't part of the "N:mask" line
+    // format those entries are persisted as, so it needs its own small store.
+    std::map<CString, CString> m_userInfo;   // VKey(mask) -> info text
+    void LoadUserInfo() {
+        CString path = IniPath(L"remote.ini");
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(L"userinfo", buf.data(), (DWORD)buf.size(), path);
+        m_userInfo.clear();
+        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_userInfo[line.Left(eq)] = line.Mid(eq + 1); }
+    }
+    void SaveUserInfo() {
+        CString path = IniPath(L"remote.ini");
+        WritePrivateProfileStringW(L"userinfo", nullptr, nullptr, path);
+        for (auto& kv : m_userInfo) WritePrivateProfileStringW(L"userinfo", kv.first, kv.second, path);
+    }
+    // /auser /guser /ruser /rlevel all ultimately rewrite this one mask's single "mask:levels" line in m_usersRaw
+    // (adding/removing it as needed) from whatever m_levelEntries now holds for that mask, then call SaveUsers()
+    // to persist and re-parse -- real users.ini, one line per user, not one line per (mask,level) pair.
+    void RewriteUserLine(const CString& mask) {
+        std::vector<CString> levelToks;
+        for (auto& e : m_levelEntries) if (e.mask.CompareNoCase(mask) == 0) { CString t; t.Format(L"%s%d", e.exact ? L"=" : L"", e.level); levelToks.push_back(t); }
+        int idx = -1;
+        for (size_t i = 0; i < m_usersRaw.size(); i++) { CString t = m_usersRaw[i]; t.Trim(); int c1 = t.Find(L':'); if (c1 > 0 && t.Left(c1).CompareNoCase(mask) == 0) { idx = (int)i; break; } }
+        if (levelToks.empty()) { if (idx >= 0) m_usersRaw.erase(m_usersRaw.begin() + idx); }
+        else {
+            CString joined; for (size_t i = 0; i < levelToks.size(); i++) joined += (i ? L"," : L"") + levelToks[i];
+            CString line = mask + L":" + joined;
+            if (idx >= 0) m_usersRaw[idx] = line; else m_usersRaw.push_back(line);
+        }
+        SaveUsers();
+    }
+    void AddUserLevel(const CString& mask, int level, bool exact) {
+        for (auto& e : m_levelEntries) if (e.mask.CompareNoCase(mask) == 0 && e.level == level && e.exact == exact) return;   // no duplicate (mask,level,exactness) entries
+        LevelEntry e; e.mask = mask; e.level = level; e.exact = exact; m_levelEntries.push_back(e);
+        RewriteUserLine(mask);
+    }
+    void RemoveUserMask(const CString& mask, bool prefixMatch = false) {   // prefixMatch: /ruser Nick! removes every user whose mask starts with "Nick!"
+        if (prefixMatch) {
+            std::vector<CString> affected;
+            for (auto& e : m_levelEntries) if (e.mask.Left(mask.GetLength()).CompareNoCase(mask) == 0) { bool found = false; for (auto& a : affected) if (a.CompareNoCase(e.mask) == 0) { found = true; break; } if (!found) affected.push_back(e.mask); }
+            for (auto it = m_levelEntries.begin(); it != m_levelEntries.end(); ) { if (it->mask.Left(mask.GetLength()).CompareNoCase(mask) == 0) it = m_levelEntries.erase(it); else ++it; }
+            for (auto& a : affected) RewriteUserLine(a);   // each now has zero entries left, so RewriteUserLine removes its line
+        } else {
+            for (auto it = m_levelEntries.begin(); it != m_levelEntries.end(); ) { if (it->mask.CompareNoCase(mask) == 0) it = m_levelEntries.erase(it); else ++it; }
+            RewriteUserLine(mask);
+        }
+        m_userInfo.erase(VKey(mask)); SaveUserInfo();
+    }
+    void RemoveSpecificUserLevel(const CString& mask, int level, bool exact) {
+        for (auto it = m_levelEntries.begin(); it != m_levelEntries.end(); ) { if (it->mask.CompareNoCase(mask) == 0 && it->level == level && it->exact == exact) it = m_levelEntries.erase(it); else ++it; }
+        RewriteUserLine(mask);
+    }
+    void RemoveAllAtLevel(int level, bool exact) {   // /rlevel: removes every entry at this level (and exactness) regardless of mask
+        std::vector<CString> affected;
+        for (auto& e : m_levelEntries) if (e.level == level && e.exact == exact) { bool found = false; for (auto& a : affected) if (a.CompareNoCase(e.mask) == 0) { found = true; break; } if (!found) affected.push_back(e.mask); }
+        for (auto it = m_levelEntries.begin(); it != m_levelEntries.end(); ) { if (it->level == level && it->exact == exact) it = m_levelEntries.erase(it); else ++it; }
+        for (auto& a : affected) RewriteUserLine(a);
+    }
+    static bool LooksLikeLevelsList(const CString& s) {   // /ruser's first word is ambiguous (a levels list, or the mask itself) -- a real nick/hostmask is never made up purely of digits, commas and = signs, so that's the disambiguator
+        if (s.IsEmpty()) return false;
+        for (int i = 0; i < s.GetLength(); i++) { wchar_t c = s[i]; if (!iswdigit(c) && c != L',' && c != L'=') return false; }
+        return true;
+    }
+    CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName, m_evNumeric;   // what $nick, $chan, $address, $knick,
+    bool m_evHaltDef = false;   // $newnick, $event, $numeric resolve to while an event's commands are running
     // Internal Address List: nick (lowercase) -> user@host, learned passively from any prefixed line we see (JOIN,
     // PRIVMSG/NOTICE, PART, KICK, NICK, QUIT -- anywhere this file already has both a nick and a host on hand).
     // Backs $address(nick,type)/$wildsite(nick)-style lookups for nicks other than whoever triggered the current event.
@@ -5990,18 +6316,46 @@ class CMainFrame : public CMDIFrameWnd {
         DWORD n = GetPrivateProfileSectionW(L"remote", buf.data(), (DWORD)buf.size(), path);
         if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_remoteRaw.push_back(line.Mid(eq + 1)); }
         m_events = ParseRemoteEvents(m_remoteRaw);
+        m_rawEvents = ParseRawEvents(m_remoteRaw);
+        m_ctcpEvents = ParseCtcpEvents(m_remoteRaw);
+        m_remoteAliases = ParseAliases(m_remoteRaw);   // "alias name { ... }" blocks written directly in the Remote script
     }
     void SaveRemote() {
         CString path = IniPath(L"remote.ini");
         WritePrivateProfileStringW(L"remote", nullptr, nullptr, path);
         for (size_t i = 0; i < m_remoteRaw.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"remote", key, m_remoteRaw[i], path); }
         m_events = ParseRemoteEvents(m_remoteRaw);
+        m_rawEvents = ParseRawEvents(m_remoteRaw);
+        m_ctcpEvents = ParseCtcpEvents(m_remoteRaw);
+        m_remoteAliases = ParseAliases(m_remoteRaw);
+        SyncGroupDeclarations();   // picks up any group newly added via this edit, without resetting an existing /enable or /disable toggle
     }
+    // ---- Users: users.ini, separate from remote.ini -- matches mIRC's own dedicated Users tab/file, not mixed
+    // into the Remote script text the way an earlier pass of this feature did. ----
+    std::vector<CString> m_usersRaw;   // users.ini text, "mask:levels" per line, exactly as typed
+    void LoadUsers() {
+        CString path = IniPath(L"users.ini");
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { m_usersRaw.clear(); SaveUsers(); return; }
+        m_usersRaw.clear();
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(L"users", buf.data(), (DWORD)buf.size(), path);
+        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_usersRaw.push_back(line.Mid(eq + 1)); }
+        m_levelEntries = ParseLevelEntries(m_usersRaw);
+    }
+    void SaveUsers() {
+        CString path = IniPath(L"users.ini");
+        WritePrivateProfileStringW(L"users", nullptr, nullptr, path);
+        for (size_t i = 0; i < m_usersRaw.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"users", key, m_usersRaw[i], path); }
+        m_levelEntries = ParseLevelEntries(m_usersRaw);
+    }
+    CString BuildUsersText() { CString text; for (auto& l : m_usersRaw) text += l + L"\r\n"; return text; }
+    void ApplyUsersText(const CString& text) { m_usersRaw = SplitLinesRobust(text); SaveUsers(); }
     CString BuildRemoteText() { CString text; for (auto& l : m_remoteRaw) text += l + L"\r\n"; return text; }
     void ApplyRemoteText(const CString& text) { m_remoteRaw = SplitLinesRobust(text); SaveRemote(); }
     // Fires a JOIN/PART/KICK/TOPIC-shaped event (matched against a channel list). Returns true if a ^-prefixed match
     // halted (via /halt or /haltdef), meaning the caller's own built-in display line should be suppressed.
     bool FireChannelEvent(CChatWnd* w, const CString& eventName, const CString& chan, const CString& nick, const CString& address, const CString& params) {
+        if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
         CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
@@ -6009,6 +6363,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (int pass = 0; pass < 2; pass++) {   // pass 0: ^-prefixed (can suppress the default); pass 1: normal (independent)
             for (auto& ev : m_events) {
                 if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
                 m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evName = eventName;
                 RunScript(w, ev.lines, params);
@@ -6021,6 +6376,7 @@ class CMainFrame : public CMDIFrameWnd {
     // TEXT/ACTION/NOTICE: matched against both matchtext (wildcard, against the message) and where (#, ?, *, or a
     // specific channel). $1- is set to the message text itself.
     bool FireTextEvent(CChatWnd* w, const CString& eventName, bool isPriv, const CString& chanOrNick, const CString& nick, const CString& address, const CString& text) {
+        if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
         CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
@@ -6028,6 +6384,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (int pass = 0; pass < 2; pass++) {
             for (auto& ev : m_events) {
                 if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesTextWhere(ev.whereSpec, isPriv, chanOrNick)) continue;
                 if (!GlobMatch(ev.matchText, text)) continue;
                 m_evNick = nick; m_evChan = isPriv ? CString() : chanOrNick; m_evAddress = address; m_evName = eventName;
@@ -6038,8 +6395,107 @@ class CMainFrame : public CMDIFrameWnd {
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
         return suppress;
     }
+    // WALLOPS: matchtext against the message, same as TEXT/ACTION/NOTICE, but no "where" to check at all --
+    // WALLOPS is a server-wide operator broadcast with no channel or target concept.
+    bool FireWallopsEvent(CChatWnd* w, const CString& nick, const CString& address, const CString& text) {
+        if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
+        IalLearn(nick, address);
+        m_evHaltDef = false;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != L"WALLOPS" || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
+                if (!GlobMatch(ev.matchText, text)) continue;
+                m_evNick = nick; m_evChan = CString(); m_evAddress = address; m_evName = L"WALLOPS";
+                RunScript(w, ev.lines, text);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
+        return suppress;
+    }
+    // raw events: fires for literally any incoming line, checked once at the very top of dispatch before any
+    // numeric-specific handling. A /halt call within a matching script suppresses this client's own further
+    // processing of that line entirely -- its specific numeric handler, if it has one, never runs, matching
+    // mIRC's documented "prevent raw server messages from printing out their default text" behavior. There's no
+    // ^-prefix/level field here the way on events have one (raw's own syntax has no level position for it) --
+    // /halt is simply always available within a raw event's commands.
+    bool FireRawEvent(CChatWnd* w, const CString& cmd, const CString& paramsText) {
+        if (!m_remoteOn || !m_rawEventsOn) return false;   // /remote, /raw on|off
+        if (m_rawEvents.empty()) return false;   // the fast path mIRC's own docs ask scripts to keep in mind, applied here too: skip all matching work when there's nothing to match against
+        CString savedNumeric = m_evNumeric, savedName = m_evName;
+        bool suppress = false;
+        for (auto& ev : m_rawEvents) {
+            if (ev.numericOrName != cmd) continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            if (!GlobMatch(ev.matchText, paramsText)) continue;
+            bool isNumeric = !cmd.IsEmpty() && IsAllDigits(cmd);
+            m_evNumeric = isNumeric ? cmd : CString(); m_evName = cmd;
+            RunScript(w, ev.lines, paramsText);
+            if (m_halt) { suppress = true; break; }
+        }
+        m_evNumeric = savedNumeric; m_evName = savedName;
+        return suppress;
+    }
+    // %varname -> its current value, for matchtext fields that document %variable support (ctcp events). Only a
+    // plain literal substitution -- not a full expression evaluator -- which is all a matchtext field needs.
+    CString ExpandMatchVars(const CString& pattern) {
+        CString out; int i = 0, n = pattern.GetLength();
+        while (i < n) {
+            if (pattern[i] == L'%' && i + 1 < n && (iswalpha(pattern[i + 1]) || pattern[i + 1] == L'_')) {
+                int j = i + 1; while (j < n && (iswalnum(pattern[j]) || pattern[j] == L'_')) j++;
+                out += GetVar(pattern.Mid(i + 1, j - i - 1));
+                i = j;
+            } else { out += pattern[i]; i++; }
+        }
+        return out;
+    }
+    // Levels below 1 (and level 1 itself) are the implicit baseline every user has, matching mIRC's own documented
+    // "1 is the lowest access level, so any user can access it" -- no explicit grant needed. Anything higher
+    // requires an actual matching entry in m_levelEntries: a plain "N:mask" grants N and everything below it
+    // (cumulative), "=N:mask" grants exactly N and nothing else.
+    // A stored entry (/auser's own parameter name is literally "<nick|address>") can be either a bare nick
+    // ("mircmouse") or a full hostmask ("*!user@mirc.com") -- real users.ini supports both, so a bare nick is
+    // matched against just the nick, and anything containing '!' or '@' is matched against the full nick!user@host
+    // the way a hostmask-style entry needs to be. Matching a bare nick against the full address unconditionally
+    // (the original approach) meant a plain-nick entry could never actually match anyone, since GlobMatch requires
+    // an exact match or wildcards and "mircmouse" is neither equal to nor a wildcard pattern for
+    // "mircmouse!user@host".
+    bool UserHasLevel(const CString& nick, const CString& fulladdr, int requiredLevel) {
+        if (requiredLevel <= m_defaultLevel) return true;   // /dlevel changes this baseline from mIRC's own default of 1
+        for (auto& e : m_levelEntries) {
+            bool maskIsBareNick = e.mask.Find(L'!') < 0 && e.mask.Find(L'@') < 0;
+            if (!GlobMatch(e.mask, maskIsBareNick ? nick : fulladdr)) continue;
+            if (e.exact ? (e.level == requiredLevel) : (e.level >= requiredLevel)) return true;
+        }
+        return false;
+    }
+    // Returns true if a matching event's commands called /halt -- the caller's own default CTCP reply (PING, TIME,
+    // FINGER) should then be skipped, matching mIRC's documented behavior. VERSION is documented as never
+    // suppressible regardless, so the caller simply doesn't check this return value for VERSION at all.
+    bool FireCtcpEvent(CChatWnd* w, const CString& nick, const CString& host, bool isChanTarget, const CString& ctcpCmd, const CString& ctcpArgs) {
+        if (!m_remoteOn || !m_ctcpsOn) return false;   // /remote, /ctcps
+        if (m_ctcpEvents.empty()) return false;
+        CString fulladdr = nick + L"!" + host;
+        bool suppress = false;
+        for (auto& ev : m_ctcpEvents) {
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            bool whereOk = ev.whereSpec == L"*" || (ev.whereSpec == L"#" && isChanTarget) || (ev.whereSpec == L"?" && !isChanTarget);
+            if (!whereOk) continue;
+            if (!GlobMatch(ExpandMatchVars(ev.matchText), ctcpCmd)) continue;
+            if (!UserHasLevel(nick, fulladdr, ev.level)) continue;
+            IalLearn(nick, host);
+            m_evNick = nick; m_evAddress = host; m_evChan = CString(); m_evName = L"CTCP";
+            RunScript(w, ev.lines, ctcpArgs);
+            if (m_halt) suppress = true;
+        }
+        return suppress;
+    }
     // KICK: like FireChannelEvent, but also sets $knick (the nick who got kicked) alongside $nick (who did the kicking).
     bool FireKickEvent(CChatWnd* w, const CString& chan, const CString& nick, const CString& address, const CString& knick, const CString& reason) {
+        if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
         CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedKnick = m_evKnick, savedName = m_evName;
@@ -6047,6 +6503,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (int pass = 0; pass < 2; pass++) {
             for (auto& ev : m_events) {
                 if (ev.eventName != L"KICK" || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
                 m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evKnick = knick; m_evName = L"KICK";
                 RunScript(w, ev.lines, reason);
@@ -6058,11 +6515,13 @@ class CMainFrame : public CMDIFrameWnd {
     }
     // QUIT/NICK/CONNECT: no "where" to match against, so every matching event always runs.
     void FireSimpleEvent(CChatWnd* w, const CString& eventName, const CString& nick, const CString& address, const CString& params, const CString& newnick = CString()) {
+        if (!m_remoteOn || !m_eventsOn) return;   // /remote, /events
         IalLearn(nick, address);
         if (!newnick.IsEmpty()) IalRename(nick, newnick);
         CString savedNick = m_evNick, savedAddr = m_evAddress, savedNewnick = m_evNewnick, savedName = m_evName;
         for (auto& ev : m_events) {
             if (ev.eventName != eventName) continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
             m_evNick = nick; m_evAddress = address; m_evNewnick = newnick; m_evName = eventName;
             RunScript(w, ev.lines, params);
         }
@@ -6339,6 +6798,13 @@ class CMainFrame : public CMDIFrameWnd {
         if (cmd == L"tip") { CmdTip(w, arg); return; }
         if (cmd == L"titlebar") { CmdTitlebar(w, arg); return; }
         if (cmd == L"abook") { CmdAbook(w, arg); return; }
+        if (cmd == L"uwho") {   // /uwho <nick> [nick]: opens the Address Book's Whois tab and immediately performs a WHOIS, same as clicking its own Whois button by hand -- the optional second nick is the documented "WHOIS nick nick" trick some servers need before they'll reveal idle time/away status
+            CString a = arg; CString nick1 = Word(a); CString nick2 = a; nick2.Trim();
+            if (nick1.IsEmpty()) { Show(w, L"* Usage: /uwho <nick> [nick]", cPart); return; }
+            if (!net || !net->conn) { Show(w, L"* Not connected.", cPart); return; }
+            OpenAddressBook(nick1, IDC_AB_TABWHOIS, nick2);
+            return;
+        }
         if (cmd == L"notify") { CmdNotify(w, arg); return; }
         if (cmd == L"ignore") { CmdIgnore(w, arg); return; }
         if (cmd == L"aop") { CmdAop(w, arg); return; }
@@ -6562,7 +7028,12 @@ class CMainFrame : public CMDIFrameWnd {
             else Send(net, L"KICK " + chan + L" " + nick + (a.IsEmpty() ? CString() : L" :" + a));
         }
         else if (cmd == L"clipboard") { AddtoClipboard(arg); }
-        else if (cmd == L"raw" || cmd == L"quote") Send(net, arg);
+        else if (cmd == L"raw") {   // overloaded, matching real mIRC: /raw on|off toggles numeric-event processing; /raw <anything else> sends raw text to the server, same as /quote
+            CString a = arg; a.Trim(); CString aLower = a; aLower.MakeLower();
+            if (aLower == L"on" || aLower == L"off") { m_rawEventsOn = (aLower == L"on"); Show(w, CString(L"* Raw (numeric) event processing is now ") + (m_rawEventsOn ? L"on" : L"off") + L".", cInfo); }
+            else Send(net, arg);
+        }
+        else if (cmd == L"quote") Send(net, arg);
         // ---------------- mIRC command-reference pass: everything below was added to cover the standard mIRC
         // command list, skipping only what has no supporting feature in this client at all (see the chat reply
         // for the full list of what's skipped and why -- DCC, treebar, URL-list window, per-window transparency,
@@ -6896,12 +7367,157 @@ class CMainFrame : public CMDIFrameWnd {
             else if (sub == L"send") { CString nk = a; nk.Trim(); if (nk.IsEmpty()) Show(w, L"* Usage: /dcc send <nickname>  (a file picker opens next)", cPart); else DccSendInitiate(net, w, nk); }
             else Show(w, L"* Usage: /dcc chat <nickname> | /dcc send <nickname>", cPart);
         }
+        else if (cmd == L"ctcps") { CString a = arg; a.MakeLower(); a.Trim(); m_ctcpsOn = a.IsEmpty() ? !m_ctcpsOn : (a == L"on"); Show(w, CString(L"* CTCP event processing is now ") + (m_ctcpsOn ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"events") { CString a = arg; a.MakeLower(); a.Trim(); m_eventsOn = a.IsEmpty() ? !m_eventsOn : (a == L"on"); Show(w, CString(L"* Named event processing is now ") + (m_eventsOn ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"remote") { CString a = arg; a.MakeLower(); a.Trim(); m_remoteOn = a.IsEmpty() ? !m_remoteOn : (a == L"on"); Show(w, CString(L"* All remote script processing is now ") + (m_remoteOn ? L"on" : L"off") + L".", cInfo); }
+        else if (cmd == L"dlevel") { CString a = arg; a.Trim(); if (!IsAllDigits(a)) { Show(w, L"* Usage: /dlevel <level>", cPart); return; } m_defaultLevel = _wtoi(a); Show(w, L"* Default user level set to " + a, cInfo); }
+        else if (cmd == L"auser") {
+            CString a = arg; bool add = false;
+            if (a.Left(2).CompareNoCase(L"-a") == 0) { add = true; a = a.Mid(2); a.TrimLeft(); }
+            CString levelsTok = Word(a), mask = Word(a), info = a; info.Trim();
+            if (levelsTok.IsEmpty() || mask.IsEmpty()) { Show(w, L"* Usage: /auser [-a] <levels> <nick|address> [info]", cPart); return; }
+            if (!add) RemoveUserMask(mask);
+            int pos = 0;
+            while (pos != -1) {
+                CString tok = levelsTok.Tokenize(L",", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+                bool exact = tok.Left(1) == L"="; CString numTok = exact ? tok.Mid(1) : tok;
+                if (!IsAllDigits(numTok)) continue;
+                AddUserLevel(mask, _wtoi(numTok), exact);
+            }
+            if (!info.IsEmpty()) { m_userInfo[VKey(mask)] = info; SaveUserInfo(); }
+            Show(w, L"* User added: " + mask, cInfo);
+        }
+        else if (cmd == L"guser") {   // like /auser, but looks up <nick>'s address via USERHOST first and adds that instead of the bare nick -- delayed, same as /dns's nickname-lookup form
+            CString a = arg; bool add = false;
+            if (a.Left(2).CompareNoCase(L"-a") == 0) { add = true; a = a.Mid(2); a.TrimLeft(); }
+            CString levelsTok = Word(a), nick = Word(a), rest = a;
+            if (levelsTok.IsEmpty() || nick.IsEmpty()) { Show(w, L"* Usage: /guser [-a] <levels> <nick> [type] [info]", cPart); return; }
+            if (!net || !net->conn) { Show(w, L"* Not connected.", cPart); return; }
+            int type = 2; CString info = rest;   // type 2 (nick!*@host) is the same default /ban falls back to
+            CString maybeType = Word(rest); maybeType.Trim();
+            if (!maybeType.IsEmpty() && IsAllDigits(maybeType)) { type = _wtoi(maybeType); info = rest; }
+            info.Trim();
+            PendingGuser pg; pg.add = add; pg.levelsTok = levelsTok; pg.nick = nick; pg.type = type; pg.info = info;
+            m_pendingGuser.push_back(pg);
+            Send(net, L"USERHOST " + nick);
+        }
+        else if (cmd == L"iuser") {
+            CString a = arg; CString mask = Word(a); CString info = a; info.Trim();
+            if (mask.IsEmpty()) { Show(w, L"* Usage: /iuser <nick|address> [info]", cPart); return; }
+            if (info.IsEmpty()) m_userInfo.erase(VKey(mask)); else m_userInfo[VKey(mask)] = info;
+            SaveUserInfo();
+            Show(w, L"* Info " + (info.IsEmpty() ? CString(L"cleared for ") : CString(L"set for ")) + mask, cInfo);
+        }
+        else if (cmd == L"ruser") {   // the -nothing "/ruser Nick 1" three-arg form (remove levels AND filter by looked-up address type) isn't implemented -- that needs the same /userhost round-trip /guser does, deliberately deferred alongside it
+            CString a = arg; CString tok1 = Word(a);
+            CString levelsTok, mask;
+            if (LooksLikeLevelsList(tok1) && !a.IsEmpty()) { levelsTok = tok1; mask = Word(a); } else mask = tok1;
+            if (mask.IsEmpty()) { Show(w, L"* Usage: /ruser [levels] <nick|address>", cPart); return; }
+            if (mask.Right(1) == L"!") RemoveUserMask(mask, true);   // "/ruser Nick!" -- every entry whose mask starts with "Nick!"
+            else if (levelsTok.IsEmpty()) RemoveUserMask(mask);
+            else {
+                int pos = 0;
+                while (pos != -1) {
+                    CString tok = levelsTok.Tokenize(L",", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+                    bool exact = tok.Left(1) == L"="; CString numTok = exact ? tok.Mid(1) : tok;
+                    if (!IsAllDigits(numTok)) continue;
+                    RemoveSpecificUserLevel(mask, _wtoi(numTok), exact);
+                }
+            }
+            Show(w, L"* User updated: " + mask, cInfo);
+        }
+        else if (cmd == L"rlevel") {   // the distinction mIRC draws between a user's "general" (first-listed) level and any additional ones isn't tracked by this client's flat (mask,level) storage -- -r and its absence both remove every matching entry regardless of mask here, a deliberate simplification
+            CString a = arg; if (a.Left(2).CompareNoCase(L"-r") == 0) { a = a.Mid(2); a.TrimLeft(); }
+            if (a.IsEmpty()) { Show(w, L"* Usage: /rlevel [-r] <levels>", cPart); return; }
+            int pos = 0;
+            while (pos != -1) {
+                CString tok = a.Tokenize(L",", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+                bool exact = tok.Left(1) == L"="; CString numTok = exact ? tok.Mid(1) : tok;
+                if (!IsAllDigits(numTok)) continue;
+                RemoveAllAtLevel(_wtoi(numTok), exact);
+            }
+            Show(w, L"* Removed matching level entries.", cInfo);
+        }
+        else if (cmd == L"flush") {   // only ever acts on bare-nick entries, matching the doc's own "checks to see if that nick is on any channel" wording -- a wildcard hostmask entry has no single "nick" to check channel presence for
+            CString a = arg; bool levelsOnly = false;
+            if (a.Left(2).CompareNoCase(L"-l") == 0) { levelsOnly = true; a = a.Mid(2); a.TrimLeft(); }
+            bool hasLevels = !a.IsEmpty();
+            std::vector<int> filterLevels;
+            if (hasLevels) {
+                int pos = 0;
+                while (pos != -1) {
+                    CString tok = a.Tokenize(L",", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+                    CString numTok = tok.Left(1) == L"=" ? tok.Mid(1) : tok;
+                    if (!IsAllDigits(numTok)) continue;
+                    filterLevels.push_back(_wtoi(numTok));
+                }
+            }
+            std::vector<CString> removeMasks;
+            std::vector<std::pair<CString, std::pair<int, bool>>> removeLevels;   // (mask, (level, exact)) for -l mode
+            for (auto& e : m_levelEntries) {
+                bool bareNick = e.mask.Find(L'!') < 0 && e.mask.Find(L'@') < 0;
+                if (!bareNick) continue;
+                if (hasLevels) { bool match = false; for (int fl : filterLevels) if (e.level == fl) { match = true; break; } if (!match) continue; }
+                bool onAChannel = false;
+                for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && cw->m_chan && cw->FindNick(e.mask) >= 0) { onAChannel = true; break; } }
+                if (onAChannel) continue;
+                if (levelsOnly) removeLevels.push_back({ e.mask, { e.level, e.exact } });
+                else { bool dup = false; for (auto& s : removeMasks) if (s.CompareNoCase(e.mask) == 0) { dup = true; break; } if (!dup) removeMasks.push_back(e.mask); }
+            }
+            for (auto& m : removeMasks) RemoveUserMask(m);
+            for (auto& pr : removeLevels) RemoveSpecificUserLevel(pr.first, pr.second.first, pr.second.second);
+            CString countStr; countStr.Format(L"%d", (int)(removeMasks.size() + removeLevels.size()));
+            Show(w, L"* Flushed " + countStr + L" stale user entries.", cInfo);
+        }
+        else if (cmd == L"enable" || cmd == L"disable") {
+            CString a = arg; a.Trim(); bool enable = cmd == L"enable";
+            if (a.IsEmpty()) { Show(w, L"* Usage: /" + cmd + L" <group1> [group2] ...  (wildcards OK, e.g. #help*)", cPart); return; }
+            int pos = 0, count = 0;
+            while (pos != -1) {
+                CString tok = a.Tokenize(L" ", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+                CString pat = tok.Left(1) == L"#" ? tok.Mid(1) : tok;   // accepted with or without the leading # for convenience
+                for (auto& g : m_groups) if (GlobMatch(pat, g.name)) { g.enabled = enable; count++; }
+            }
+            SaveGroupState();
+            CString countStr; countStr.Format(L"%d", count);
+            Show(w, L"* " + countStr + L" group(s) " + (enable ? CString(L"enabled") : CString(L"disabled")) + L".", cInfo);
+        }
+        else if (cmd == L"groups") {
+            CString a = arg; a.MakeLower(); a.Trim();
+            bool onlyEnabled = a == L"-e", onlyDisabled = a == L"-d";
+            int shown = 0;
+            for (auto& g : m_groups) {
+                if (onlyEnabled && !g.enabled) continue;
+                if (onlyDisabled && g.enabled) continue;
+                Show(w, L"* #" + g.name + L" (" + (g.enabled ? CString(L"enabled") : CString(L"disabled")) + L")", cInfo);
+                shown++;
+            }
+            if (shown == 0) Show(w, L"* No groups.", cInfo);
+        }
+        else if (cmd == L"ulist") {
+            CString a = arg; a.Trim();
+            wchar_t op = 0; if (a.Left(1) == L"<" || a.Left(1) == L">") { op = a[0]; a = a.Mid(1); a.TrimLeft(); }
+            if (!IsAllDigits(a)) { Show(w, L"* Usage: /ulist [<|>] <level>", cPart); return; }
+            int lvl = _wtoi(a);
+            std::vector<CString> shown;
+            for (auto& e : m_levelEntries) {
+                bool match = op == L'<' ? e.level <= lvl : op == L'>' ? e.level >= lvl : e.level == lvl;
+                if (!match) continue;
+                CString key = e.mask; key.MakeLower();
+                bool dup = false; for (auto& s : shown) if (s == key) { dup = true; break; } if (dup) continue;
+                shown.push_back(key);
+                CString line; line.Format(L"* %s (level %d)", (LPCWSTR)e.mask, e.level);
+                Show(w, line, cInfo);
+            }
+            if (shown.empty()) Show(w, L"* No matching users.", cInfo);
+        }
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
     }
 
     // ---- server input ----
     void OnLine(Net* net, const CString& raw) {
+        DebugLine(net, L"<-", raw);
         CString l = raw, prefix, trail; bool hasT = false;
         if (l.Left(1) == L":") { int sp = l.Find(L' '); if (sp < 0) return; prefix = l.Mid(1, sp - 1); l = l.Mid(sp + 1); }
         int t = l.Find(L" :"); if (t >= 0) { trail = l.Mid(t + 2); l = l.Left(t); hasT = true; }
@@ -6914,6 +7530,11 @@ class CMainFrame : public CMDIFrameWnd {
         CString nick = prefix, host; int b = nick.Find(L'!');
         if (b >= 0) { host = nick.Mid(b + 1); nick = nick.Left(b); }
         bool me = nick.CompareNoCase(net->nick) == 0;
+
+        if (!m_rawEvents.empty()) {   // raw events: checked once, here, before any numeric-specific handling -- see FireRawEvent
+            CString paramsText; for (size_t i = 0; i < p.size(); i++) paramsText += (i ? L" " : L"") + p[i];
+            if (FireRawEvent(Status(net), cmd, paramsText)) return;   // /halt within a matching raw event suppresses this client's own further handling of the line entirely
+        }
 
         if (cmd == L"005") {   // RPL_ISUPPORT: pick out NETWORK=<name> for $network (the line itself still prints below, as before)
             size_t last = hasT ? p.size() - 1 : p.size();   // the trailing "are supported by this server" isn't a token
@@ -6944,10 +7565,22 @@ class CMainFrame : public CMDIFrameWnd {
                     return;
                 }
                 if (!notice) {
-                    if (txt == L"VERSION") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
-                    else if (txt.Left(4) == L"PING") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + txt + CString(wchar_t(1)));   // echo the payload back, standard CTCP PING reply
-                    else if (txt == L"TIME") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"TIME " + CTime::GetCurrentTime().Format(L"%a %b %d %H:%M:%S %Y") + CString(wchar_t(1)));
-                    else if (txt == L"FINGER") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"FINGER " + CString(VERSION) + CString(wchar_t(1)));
+                    // ctcp events: matchtext matches only the CTCP's first word (the command itself -- VERSION,
+                    // PING, or a custom word), with everything after it as $1-/params. Checked before the built-in
+                    // replies so a matching event's /halt can suppress them -- except VERSION, which mIRC's own
+                    // docs say can never be suppressed, so it's sent unconditionally regardless of suppress here
+                    // (the matching event's own commands still ran, same as mIRC: the halt just has no effect on
+                    // this one specific reply).
+                    CString ctcpCmd = txt, ctcpArgs; int sp = txt.Find(L' ');
+                    if (sp >= 0) { ctcpCmd = txt.Left(sp); ctcpArgs = txt.Mid(sp + 1); ctcpArgs.TrimLeft(); }
+                    bool suppressed = FireCtcpEvent(Status(net), nick, host, IsChan(tgt), ctcpCmd, ctcpArgs);
+                    CString cmdUpper = ctcpCmd; cmdUpper.MakeUpper();
+                    if (cmdUpper == L"VERSION") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"VERSION " + CString(VERSION) + CString(wchar_t(1)));
+                    else if (!suppressed) {
+                        if (cmdUpper == L"PING") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + txt + CString(wchar_t(1)));   // echo the whole original payload back (including its timestamp argument), standard CTCP PING reply
+                        else if (cmdUpper == L"TIME") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"TIME " + CTime::GetCurrentTime().Format(L"%a %b %d %H:%M:%S %Y") + CString(wchar_t(1)));
+                        else if (cmdUpper == L"FINGER") Send(net, L"NOTICE " + nick + L" :" + CString(wchar_t(1)) + L"FINGER " + CString(VERSION) + CString(wchar_t(1)));
+                    }
                 }
                 //this is to let you know that someone CTCPed you.    
                 //might we should reply to unknown CTCPs
@@ -6997,7 +7630,11 @@ class CMainFrame : public CMDIFrameWnd {
                 else if (!priv && IsChan(tgt) && m_tipsChannel) QueueEventTip(tgt, tipText, w);
             }
         }
-        //* Someone (user@hostname) invites you to join #chan
+        else if (cmd == L"WALLOPS") {
+            CString msg = P(0);
+            bool suppress = FireWallopsEvent(Status(net), nick, host, msg);
+            if (!suppress) Show(Status(net), L"!" + nick + L"! " + msg, cWallops);   // matches real mIRC's own "!nick! message" WALLOPS display convention
+        }
         else if (cmd == L"INVITE") {
             if (!IsIgnored(net, nick, prefix, L'i')) {
                 Note(net, nick + L" invites you to join " + P(1), cInvite);
@@ -7166,7 +7803,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString j; for (size_t i = 1; i < p.size(); i++) j += p[i] + L" ";
             Note(net, j.IsEmpty() ? raw : j, cWhois);
         }
-        else if (cmd == L"302" && (!m_pendingUserhost.empty() || !m_localLookupPendingNick.IsEmpty())) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated -- relevant to a pending /dns nickname lookup and/or Local Settings' "Server" lookup method
+        else if (cmd == L"302" && (!m_pendingUserhost.empty() || !m_localLookupPendingNick.IsEmpty() || !m_pendingGuser.empty())) {   // RPL_USERHOST: nick[*]=+ident@host, space-separated -- relevant to a pending /dns nickname lookup, Local Settings' "Server" lookup method, and/or a pending /guser
             CString trailing = P(1); int tp = 0;
             for (CString entry = trailing.Tokenize(L" ", tp); !entry.IsEmpty(); entry = trailing.Tokenize(L" ", tp)) {
                 int eq = entry.Find(L'='); if (eq < 0) continue;
@@ -7182,6 +7819,25 @@ class CMainFrame : public CMDIFrameWnd {
                 if (!m_localLookupPendingNick.IsEmpty() && key == m_localLookupPendingNick) {
                     m_localLookupPendingNick.Empty();
                     if (!m_localCapturedThisConnect) LocalApplyServerReportedHost(net, host);   // only acts as a fallback: if this server already sent a pre-registration hostname/mask notice this connection, that's the authoritative source and USERHOST isn't consulted at all
+                }
+                for (auto git = m_pendingGuser.begin(); git != m_pendingGuser.end(); ) {
+                    if (git->nick.CompareNoCase(nk) != 0) { ++git; continue; }
+                    CChatWnd* guw = Status(net);   // "w" isn't a shared variable across OnLine's dispatch chain -- each branch defines its own locally, and the 302 handler never had one
+                    CString fulladdr = nk + L"!" + host;
+                    CString typeStr; typeStr.Format(L"%d", git->type);
+                    CString formattedAddr; FuncValue(guw, L"mask", fulladdr + L"," + typeStr, CString(), CString(), formattedAddr);   // same $mask-style address formatting /ban already uses
+                    if (formattedAddr.IsEmpty()) formattedAddr = fulladdr;
+                    if (!git->add) RemoveUserMask(formattedAddr);
+                    int pos = 0;
+                    while (pos != -1) {
+                        CString tok = git->levelsTok.Tokenize(L",", pos); tok.Trim(); if (tok.IsEmpty()) continue;
+                        bool exact = tok.Left(1) == L"="; CString numTok = exact ? tok.Mid(1) : tok;
+                        if (!IsAllDigits(numTok)) continue;
+                        AddUserLevel(formattedAddr, _wtoi(numTok), exact);
+                    }
+                    if (!git->info.IsEmpty()) { m_userInfo[VKey(formattedAddr)] = git->info; SaveUserInfo(); }
+                    Show(guw, L"* User added: " + formattedAddr, cInfo);
+                    git = m_pendingGuser.erase(git);
                 }
             }
             StartNextDnsIfIdle();
@@ -7777,9 +8433,10 @@ class CMainFrame : public CMDIFrameWnd {
         return true;
     }
     void OnAbookMenu() { OpenAddressBook(); }
-    void OpenAddressBook(const CString& startNick = CString(), int tab = IDC_AB_TABUSERS) {
+    void OpenAddressBook(const CString& startNick = CString(), int tab = IDC_AB_TABUSERS, const CString& startNick2 = CString()) {
         CAddressBookDlg dlg(&m_abook, &m_notify, &m_highlightList, &m_aopList, &m_avoiceList, &m_protectList, &m_ignoreList, &m_cnickList, startNick, this);
         dlg.initialTab = tab;
+        dlg.initialNick2 = startNick2;
         dlg.popupOnConnect = m_notifyPopupOnConnect; dlg.onlyInWindow = m_notifyOnlyInWindow;
         dlg.inActiveWindow = m_notifyInActiveWindow; dlg.showAddrTime = m_notifyShowAddrTime;
         dlg.highlightOn = m_highlightOn;
@@ -7794,10 +8451,11 @@ class CMainFrame : public CMDIFrameWnd {
             if (sel == 0) CmdAop(nullptr, text); else if (sel == 1) CmdAvoice(nullptr, text); else if (sel == 2) CmdProtect(nullptr, text); else CmdIgnore(nullptr, text);
         };
         dlg.onCnickCmd = [this](const CString& text) { CmdCnick(nullptr, text); };
-        dlg.onStartWhoisLookup = [this](const CString& nick) {
+        dlg.onStartWhoisLookup = [this](const CString& nick, const CString& nick2) {
             m_uwhoCapturingNick = nick; m_uwhoCapture = WhoisCapture();
             Net* net = nullptr; for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
-            if (net) Send(net, L"WHOIS " + nick); else AfxMessageBox(L"Not connected to a server.", MB_ICONINFORMATION);
+            if (net) Send(net, L"WHOIS " + nick + (nick2.IsEmpty() ? CString() : L" " + nick2));   // the real protocol form of the "ask twice" trick: WHOIS <nick> <nick> routes to that user's own server, which some IRCds only reveal idle/away info to
+            else AfxMessageBox(L"Not connected to a server.", MB_ICONINFORMATION);
         };
         dlg.onGetWhoisCapture = [this] { return m_uwhoCapture; };
         dlg.onWhoisAdd = [this](const WhoisCapture& c) {
@@ -10193,6 +10851,10 @@ public:
 		LoadVars();
 		LoadPopups();
 		LoadRemote();
+		LoadGroupState();
+		SyncGroupDeclarations();
+		LoadUsers();
+		LoadUserInfo();
 		LoadDccSettings();
 		LoadLocalSettings();
 		LoadColors(); PushSchemeColors(CurScheme());
