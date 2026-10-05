@@ -20,6 +20,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <afxsock.h>
 #include <afxext.h>
 #include <afxdlgs.h>
+#include <afxdisp.h>   // the full COleDateTime class definition -- afxwin.h etc. only forward-declare it, which isn't enough to actually construct/use one ($ctime(text)'s date parsing)
 #include <map>
 #include <memory>
 #include <vector>
@@ -52,6 +53,7 @@ along with this program.  If not, see <https://gnu.org>.
 #pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -
 #include <wininet.h>
 #pragma comment(lib, "wininet.lib")   // About dialog's "Check for Update" button -- a single blocking HTTPS GET to the GitHub API, nothing more
+#pragma comment(lib, "oleaut32.lib")  // $ctime(text): COleDateTime::ParseDateTime()'s flexible date-text parsing (January 1 1970, 3rd August 1987 3:46pm, 21/4/72, etc.)
 // $zip: zlib + minizip-ng (store/deflate + WinZip AES), vendored as plain C source files compiled alongside this
 // .cpp -- see the build notes near CmdZip/FuncValue's "zip" handler for the exact file list and compiler flags.
 // mz_crypt_winvista.c's AES/hash primitives are implemented via Windows' own CNG (BCrypt), hence this lib.
@@ -158,6 +160,61 @@ static CString OsName() {
         return CString(bld >= 26100 ? L"2025" : bld >= 20348 ? L"2022" : bld >= 17763 ? L"2019" : L"2016");
     }
     return CString();
+}
+// ---- Shared mIRC-style date/time formatter, used by $asctime/$time/$date/$gmt's optional format parameter. t is
+// treated as local time throughout (CTime::GetCurrentTime() already is); z/zz/zzz reflect the real current UTC
+// offset (via GetTimeZoneInformation), not a hardcoded +0000, since this client has no separate, user-configurable
+// timezone setting distinct from the system's own. ----
+static CString FormatMircDate(const CTime& t, CString fmt) {
+    if (fmt.IsEmpty()) fmt = L"ddd mmm dd hh:nn:ss yyyy";
+    static const wchar_t* const monthsShort[] = { L"Jan",L"Feb",L"Mar",L"Apr",L"May",L"Jun",L"Jul",L"Aug",L"Sep",L"Oct",L"Nov",L"Dec" };
+    static const wchar_t* const monthsLong[] = { L"January",L"February",L"March",L"April",L"May",L"June",L"July",L"August",L"September",L"October",L"November",L"December" };
+    static const wchar_t* const daysShort[] = { L"Sun",L"Mon",L"Tue",L"Wed",L"Thu",L"Fri",L"Sat" };
+    static const wchar_t* const daysLong[] = { L"Sunday",L"Monday",L"Tuesday",L"Wednesday",L"Thursday",L"Friday",L"Saturday" };
+    int yr = t.GetYear(), mo = t.GetMonth(), dy = t.GetDay(), hr = t.GetHour(), mi = t.GetMinute(), se = t.GetSecond();
+    int dow = t.GetDayOfWeek() - 1;   // CTime::GetDayOfWeek(): 1=Sunday..7=Saturday
+    int hr12 = hr % 12; if (hr12 == 0) hr12 = 12;
+    TIME_ZONE_INFORMATION tzi = {}; DWORD tzid = GetTimeZoneInformation(&tzi);
+    LONG biasMin = tzi.Bias + (tzid == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightBias : tzid == TIME_ZONE_ID_STANDARD ? tzi.StandardBias : 0);
+    int offMin = -(int)biasMin; wchar_t offSign = offMin >= 0 ? L'+' : L'-'; int offAbs = offMin < 0 ? -offMin : offMin;
+    int offH = offAbs / 60, offM = offAbs % 60;
+    CString out; int i = 0, n = fmt.GetLength();
+    auto starts = [&](const wchar_t* tok) { int L = (int)wcslen(tok); return i + L <= n && fmt.Mid(i, L).CompareNoCase(tok) == 0; };
+    while (i < n) {
+        CString s;
+        if (starts(L"yyyy")) { s.Format(L"%04d", yr); out += s; i += 4; }
+        else if (starts(L"yy")) { s.Format(L"%02d", yr % 100); out += s; i += 2; }
+        else if (starts(L"mmmm")) { out += monthsLong[mo - 1]; i += 4; }
+        else if (starts(L"mmm")) { out += monthsShort[mo - 1]; i += 3; }
+        else if (starts(L"mm")) { s.Format(L"%02d", mo); out += s; i += 2; }
+        else if (starts(L"m")) { s.Format(L"%d", mo); out += s; i += 1; }
+        else if (starts(L"dddd")) { out += daysLong[dow]; i += 4; }
+        else if (starts(L"ddd")) { out += daysShort[dow]; i += 3; }
+        else if (starts(L"dd")) { s.Format(L"%02d", dy); out += s; i += 2; }
+        else if (starts(L"d")) { s.Format(L"%d", dy); out += s; i += 1; }
+        else if (starts(L"HH")) { s.Format(L"%02d", hr); out += s; i += 2; }
+        else if (starts(L"H")) { s.Format(L"%d", hr); out += s; i += 1; }
+        else if (starts(L"hh")) { s.Format(L"%02d", hr12); out += s; i += 2; }
+        else if (starts(L"h")) { s.Format(L"%d", hr12); out += s; i += 1; }
+        else if (starts(L"nn")) { s.Format(L"%02d", mi); out += s; i += 2; }
+        else if (starts(L"n")) { s.Format(L"%d", mi); out += s; i += 1; }
+        else if (starts(L"ss")) { s.Format(L"%02d", se); out += s; i += 2; }
+        else if (starts(L"s")) { s.Format(L"%d", se); out += s; i += 1; }
+        else if (starts(L"TT")) { out += (hr < 12 ? L"AM" : L"PM"); i += 2; }
+        else if (starts(L"T")) { out += (hr < 12 ? L"A" : L"P"); i += 1; }
+        else if (starts(L"tt")) { out += (hr < 12 ? L"am" : L"pm"); i += 2; }
+        else if (starts(L"t")) { out += (hr < 12 ? L"a" : L"p"); i += 1; }
+        else if (starts(L"oo")) {
+            int d10 = dy % 100;
+            out += (d10 >= 11 && d10 <= 13) ? L"th" : (dy % 10 == 1 ? L"st" : dy % 10 == 2 ? L"nd" : dy % 10 == 3 ? L"rd" : L"th");
+            i += 2;
+        }
+        else if (starts(L"zzz")) { s.Format(L"%c%02d%02d GMT", offSign, offH, offM); out += s; i += 3; }
+        else if (starts(L"zz")) { s.Format(L"%c%02d%02d", offSign, offH, offM); out += s; i += 2; }
+        else if (starts(L"z")) { s.Format(L"%c%d", offSign, offH); out += s; i += 1; }
+        else { out += fmt[i]; i++; }
+    }
+    return out;
 }
 // mIRC's full 99-colour palette: 0-15 are the classic set (same values used elsewhere in this file for ^C rendering);
 // 16-98 are the fixed extended colours, standardized across clients (values per the modern IRC formatting spec).
@@ -2152,6 +2209,7 @@ struct Net {
     CString network;               // from the server's 005 ISUPPORT "NETWORK=" token, for $network (empty if the server doesn't say)
     std::vector<CString> notifyPending;   // the nicks most recently ISON-queried on this network, so the 303 reply can be matched back up -- see NotifyTick / the "303" handler
     CString debugTarget;   // /debug: a @window name (or empty) that this connection's state is noted in -- see Dispatch's "debug" command
+    ULONGLONG connectTick = 0;   // GetTickCount64() at 001 (registration complete) -- $uptime(server)
 };
 
 // ---------------- One DCC Chat (or, in a later pass, Send/Get) session. The CTCP negotiation happens over the
@@ -4556,6 +4614,8 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<DnsRequest> m_dnsQueue; std::map<CString, int> m_pendingUserhost; int m_dnsSeq = 0;
     std::vector<std::pair<CString, CString>> m_lastDnsRecords;   // the most recently completed -m request's records, for $dns(T,N)
     std::vector<TimerInfo> m_timers; CString m_ltimer; UINT_PTR m_timerTickId = 0;   // see /timer, /timers, TimerTick
+    CString m_ctimer;         // the name of the /timer whose command is currently running, if any -- $ctimer
+    ULONGLONG m_appStartTick = 0;   // GetTickCount64() at app startup -- $uptime(mirc)
     // ---- Identd server ----
     bool m_identdEnabled = false, m_identdShowReq = true, m_identdOnlyConnecting = false, m_identdUseEmail = false;
     CString m_identdUserId = L"user", m_identdSystem = L"UNIX"; int m_identdPort = 113;
@@ -4945,6 +5005,29 @@ class CMainFrame : public CMDIFrameWnd {
             val.Format(L"%ld", id == TIME_ZONE_ID_DAYLIGHT ? -tz.DaylightBias * 60 : 0L);   // seconds of DST offset, 0 when not in effect
             return true;
         }
+        if (name == L"ctime") { val.Format(L"%I64d", (__int64)time(nullptr)); return true; }   // $ctime(text) -- the parenthesized form -- is in FuncValue
+        if (name == L"ctimer") { val = m_ctimer; return true; }   // the name of the /timer currently running, outside one too (empty)
+        if (name == L"idle") {   // seconds since the last keyboard/mouse input anywhere on the system -- Windows tracks this natively (GetLastInputInfo), no input hook of this client's own needed
+            LASTINPUTINFO lii = { sizeof lii }; if (GetLastInputInfo(&lii)) val.Format(L"%I64d", (ULONGLONG)((GetTickCount64() - lii.dwTime) / 1000)); else val = L"0";
+            return true;
+        }
+        if (name == L"logstamp") { val = FormatMircDate(CTime::GetCurrentTime(), m_tsLogFmt); return true; }
+        if (name == L"logstampfmt") { val = m_tsLogFmt; return true; }
+        if (name == L"timestamp") { val = FormatMircDate(CTime::GetCurrentTime(), m_tsEventFmt); return true; }
+        if (name == L"timestampfmt") { val = m_tsEventFmt; return true; }
+        if (name == L"timezone") {   // current UTC offset in seconds (not m_appStartTick -- GetTimeZoneInformation, same source FormatMircDate's z/zz/zzz use)
+            TIME_ZONE_INFORMATION tz = {}; DWORD id = GetTimeZoneInformation(&tz);
+            LONG biasMin = tz.Bias + (id == TIME_ZONE_ID_DAYLIGHT ? tz.DaylightBias : id == TIME_ZONE_ID_STANDARD ? tz.StandardBias : 0);
+            val.Format(L"%ld", -biasMin * 60); return true;
+        }
+        if (name == L"ticksqpc") {   // same units as $ticks (milliseconds), but from the high-resolution performance counter rather than GetTickCount64
+            LARGE_INTEGER freq, cnt;
+            if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&cnt) && freq.QuadPart) val.Format(L"%I64d", (__int64)(cnt.QuadPart * 1000 / freq.QuadPart));
+            else val = L"0";
+            return true;
+        }
+        if (name == L"online" || name == L"onlineserver") { val.Format(L"%ld", (long)OtCurrentSeconds()); return true; }   // the Online Timer dialog's current-session seconds
+        if (name == L"onlinetotal") { val.Format(L"%ld", (long)OtTotalSeconds()); return true; }
         return false;
     }
     // ---- variables ----
@@ -5505,6 +5588,113 @@ class CMainFrame : public CMDIFrameWnd {
             if (prop == L"nick") val = found->nick; else if (prop == L"email") val = found->email; else if (prop == L"website") val = found->website;
             else if (prop == L"picture") val = found->picture; else if (prop == L"info" || prop.Left(4) == L"note") val = found->notes;
             else val = found->nick;
+            return true;
+        }
+        if (name == L"asctime") {   // $asctime(format) | $asctime(N) | $asctime(N,format) -- a bare numeric single argument is a $ctime value (default format); a bare non-numeric single argument is a format applied to the CURRENT time; two arguments are always (N, format)
+            CString a = EvalIds(w, rawArgs, params);
+            int comma = a.Find(L',');
+            CString p1 = comma >= 0 ? a.Left(comma) : a; p1.Trim();
+            CString p2 = comma >= 0 ? a.Mid(comma + 1) : CString(); p2.Trim();
+            double nD; bool haveTime = false; __int64 tval = 0; CString fmt;
+            if (comma >= 0) { haveTime = ParseNum(p1, nD); tval = (__int64)nD; fmt = p2; }
+            else if (ParseNum(p1, nD)) { haveTime = true; tval = (__int64)nD; }
+            else fmt = p1;
+            CTime t = haveTime ? CTime((time_t)tval) : CTime::GetCurrentTime();
+            val = FormatMircDate(t, fmt);
+            return true;
+        }
+        if (name == L"ctime") {   // $ctime (no parens, see IdentValue) is "now"; $ctime(text) parses arbitrary date text via COleDateTime's flexible parser
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            if (a.IsEmpty()) { val.Format(L"%I64d", (__int64)time(nullptr)); return true; }
+            COleDateTime dt;
+            if (dt.ParseDateTime(a) && dt.GetStatus() == COleDateTime::valid) {
+                CTime ct(dt.GetYear(), dt.GetMonth(), dt.GetDay(), dt.GetHour(), dt.GetMinute(), dt.GetSecond());
+                val.Format(L"%I64d", (__int64)ct.GetTime());
+            } else val = L"0";   // unparseable text: 0 as a clear, safe sentinel rather than guessing
+            return true;
+        }
+        if (name == L"duration") {   // $duration(seconds,N) -- or, per mIRC's own docs, its own output fed back in to reverse the conversion: "1w 2d 3h 4m 5s" or "hh:nn:ss" text is parsed back into a plain seconds count
+            CString a = EvalIds(w, rawArgs, params);
+            int comma = a.Find(L',');
+            CString p1 = comma >= 0 ? a.Left(comma) : a; p1.Trim();
+            CString p2 = comma >= 0 ? a.Mid(comma + 1) : CString(); p2.Trim();
+            double secD; long totalSec;
+            if (ParseNum(p1, secD)) totalSec = (long)secD;
+            else if (p1.Find(L':') >= 0) { int hh = 0, mm = 0, ss = 0; swscanf_s(p1, L"%d:%d:%d", &hh, &mm, &ss); totalSec = hh * 3600 + mm * 60 + ss; }
+            else {
+                totalSec = 0; int i = 0, n = p1.GetLength();
+                while (i < n) {
+                    while (i < n && p1[i] == L' ') i++;
+                    int start = i; while (i < n && iswdigit(p1[i])) i++;
+                    if (i == start) { i++; continue; }
+                    long num = _wtol(p1.Mid(start, i - start));
+                    if (i < n) { wchar_t unit = towlower(p1[i]); i++;
+                        if (unit == L'w') totalSec += num * 604800; else if (unit == L'd') totalSec += num * 86400;
+                        else if (unit == L'h') totalSec += num * 3600; else if (unit == L'm') totalSec += num * 60;
+                        else if (unit == L's') totalSec += num;
+                    }
+                }
+            }
+            int N = 0; if (!p2.IsEmpty()) { double nD; if (ParseNum(p2, nD)) N = (int)nD; }
+            if (N == 3) { long h = totalSec / 3600, m = (totalSec % 3600) / 60, s = totalSec % 60; val.Format(L"%02ld:%02ld:%02ld", h, m, s); return true; }
+            long wk = totalSec / 604800, d = (totalSec % 604800) / 86400, h = (totalSec % 86400) / 3600, m = (totalSec % 3600) / 60, s = totalSec % 60;
+            CString parts, t;
+            if (wk) { t.Format(L"%ldw ", wk); parts += t; }
+            if (d || wk) { t.Format(L"%ldd ", d); parts += t; }
+            if (h || d || wk) { t.Format(L"%ldh ", h); parts += t; }
+            t.Format(L"%ldm ", m); parts += t;
+            if (N != 2) { t.Format(L"%lds", s); parts += t; }
+            parts.TrimRight(); val = parts;
+            return true;
+        }
+        if (name == L"uptime") {   // $uptime(mirc|server|system, N) -- N is $duration()'s own N (1=default text, 2=without seconds, 3=seconds instead of ms)
+            CString a = EvalIds(w, rawArgs, params);
+            int comma = a.Find(L',');
+            CString which = comma >= 0 ? a.Left(comma) : a; which.Trim(); which.MakeLower();
+            CString nTok = comma >= 0 ? a.Mid(comma + 1) : CString(); nTok.Trim();
+            int N = 0; if (!nTok.IsEmpty()) { double nD; if (ParseNum(nTok, nD)) N = (int)nD; }
+            ULONGLONG ms = 0;
+            if (which == L"mirc") ms = ::GetTickCount64() - m_appStartTick;
+            else if (which == L"system") ms = ::GetTickCount64();
+            else if (which == L"server") {
+                Net* net = (w && w->net) ? w->net : nullptr;
+                if (!net) for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
+                ms = (net && net->connectTick) ? ::GetTickCount64() - net->connectTick : 0;
+            }
+            if (N == 3) { val.Format(L"%I64d", ms / 1000); return true; }
+            CString secStr; secStr.Format(L"%I64d", ms / 1000);
+            return FuncValue(w, L"duration", secStr + (N == 2 ? L",2" : CString()), CString(), params, val);
+        }
+        if (name == L"timer") {   // $timer(0) = count; $timer(N) or $timer(name) = that timer's own id/name; $timer(N/name).prop for its properties
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            if (prop == L"name") {   // "treats the specified parameter as a timer name ... and returns the timer N position"
+                int pos = 0; for (size_t i = 0; i < m_timers.size(); i++) if (m_timers[i].name.CompareNoCase(a) == 0) { pos = (int)i + 1; break; }
+                val.Format(L"%d", pos); return true;
+            }
+            double nD; bool isNum = ParseNum(a, nD); int idx = isNum ? (int)nD : 0;
+            if (isNum && idx == 0) { val.Format(L"%d", (int)m_timers.size()); return true; }
+            TimerInfo* t = nullptr;
+            if (isNum) { if (idx >= 1 && idx <= (int)m_timers.size()) t = &m_timers[idx - 1]; }
+            else { for (auto& ti : m_timers) if (ti.name.CompareNoCase(a) == 0) { t = &ti; break; } }
+            if (!t) { val.Empty(); return true; }
+            if (prop.IsEmpty()) { val = t->name; return true; }
+            if (prop == L"com") val = t->command;
+            else if (prop == L"time" || prop == L"delay") val.Format(L"%g", t->intervalSec);   // "time" has no documented distinction from "delay" mIRC gives elsewhere -- both map to the same interval here
+            else if (prop == L"reps") val.Format(L"%d", t->repsLeft);
+            else if (prop == L"type") val = t->offline ? L"offline" : L"online";
+            else if (prop == L"secs") { ULONGLONG now = ::GetTickCount64(); val.Format(L"%I64d", t->nextFire > now ? (ULONGLONG)((t->nextFire - now) / 1000) : 0); }
+            else if (prop == L"mmt") val = L"$false";   // this client doesn't track true multimedia (-h) timers separately from plain millisecond (-m) ones
+            else if (prop == L"anysc") val = t->dynAssoc ? L"$true" : L"$false";
+            else if (prop == L"pause") val = (t->paused || t->haltCountdown) ? L"$true" : L"$false";
+            else val.Empty();   // wid/cid/hwnd: not tracked -- this client has no equivalent window-id system for these
+            return true;
+        }
+        if ((name == L"time" || name == L"date" || name == L"gmt") && !rawArgs.IsEmpty()) {   // the format-parameter overload -- plain $time/$date/$gmt (no parens) are unaffected, handled separately in IdentValue
+            CString fmt = EvalIds(w, rawArgs, params); fmt.Trim();
+            CTime t;
+            if (name == L"gmt") { time_t now = time(nullptr); struct tm gmtm; gmtime_s(&gmtm, &now); t = CTime(gmtm.tm_year + 1900, gmtm.tm_mon + 1, gmtm.tm_mday, gmtm.tm_hour, gmtm.tm_min, gmtm.tm_sec); }
+            else t = CTime::GetCurrentTime();
+            val = FormatMircDate(t, fmt);
             return true;
         }
         if (name == L"ulist") {   // $ulist(N).info: the Nth unique user mask across all level entries (1-indexed); .info for their /iuser text, otherwise the mask itself
@@ -7720,6 +7910,7 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
+            net->connectTick = ::GetTickCount64();   // $uptime(server)
             m_autojoinSkip = false; m_autojoinDelayS = 0; m_autojoinDelayNet = nullptr;   // reset before on CONNECT runs, so /autojoin inside it starts from a clean slate every time
             LocalLookupNow(net);   // File > Local Settings' "On Connect" checkboxes -- refreshes host/IP for this connection before DCC might need them
             FireSimpleEvent(Status(net), L"CONNECT", net->nick, CString(), CString());   // real mIRC fires this at end-of-MOTD; 001 (just-registered) is close enough here and much simpler to hook
@@ -10089,7 +10280,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (!t.offline && t.net && !t.net->conn) { m_timers.erase(m_timers.begin() + i); continue; }   // online timer: its network disconnected
             if (t.paused || t.haltCountdown || now < t.nextFire) { i++; continue; }
             CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : (m_w.empty() ? nullptr : m_w.begin()->second);
-            if (fw) RunScript(fw, std::vector<CString>{ t.command }, CString());
+            if (fw) { m_ctimer = t.name; RunScript(fw, std::vector<CString>{ t.command }, CString()); m_ctimer.Empty(); }
             if (t.totalReps > 0 && --t.repsLeft <= 0) { m_timers.erase(m_timers.begin() + i); continue; }
             t.nextFire = t.catchUp ? t.nextFire + (ULONGLONG)(t.intervalSec * 1000) : now + (ULONGLONG)(t.intervalSec * 1000);
             i++;
@@ -10850,6 +11041,7 @@ public:
 		LoadAliases();
 		LoadVars();
 		LoadPopups();
+		m_appStartTick = ::GetTickCount64();   // $uptime(mirc)
 		LoadRemote();
 		LoadGroupState();
 		SyncGroupDeclarations();
