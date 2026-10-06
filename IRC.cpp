@@ -366,6 +366,30 @@ static std::vector<CString> ReadAllLinesOf(const CString& path) {
     if (f.Open(path, CFile::modeRead | CFile::typeText)) { CString ln; while (f.ReadString(ln)) lines.push_back(ln); }
     return lines;
 }
+// ---- Multi-file script/alias/vars/users loading (File > Load... / Unload, /load, /unload; IRC.ini's own
+// [afiles]/[rfiles]/[pfiles] sections list which files are currently loaded, exactly matching real mIRC's own
+// format). A file in the [rfiles] list can be a script (.mrc or an INI with a [remote] section), a variables file
+// (has a [variables] section), or a users file (has a [users] section) -- real mIRC doesn't store which explicitly
+// in the file list itself, so this sniffs it from the file's own content the same way, each time it's loaded. ----
+static bool HasIniSection(const CString& path, const wchar_t* section) {
+    wchar_t buf[4] = {};
+    return GetPrivateProfileSectionW(section, buf, 4, path) > 0;
+}
+// Reads one script file's lines: this client's own remote.ini-style files keep their content in a "[remote]"
+// section (n0=, n1=, ... keys), same as every other *.ini this app writes; a plain .mrc file (or any file with no
+// such section) is read as plain text instead, one physical line per entry -- which is how real mIRC's own loose
+// script files work, and also covers a file saved by this app in that older, single-section-per-category style.
+static std::vector<CString> ReadIniSectionLines(const CString& path, const wchar_t* section) {
+    std::vector<wchar_t> buf(262144, 0);
+    DWORD n = GetPrivateProfileSectionW(section, buf.data(), (DWORD)buf.size(), path);
+    std::vector<CString> lines;
+    if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) lines.push_back(line.Mid(eq + 1)); }
+    return lines;
+}
+static std::vector<CString> ReadScriptFileLines(const CString& path) {
+    if (HasIniSection(path, L"remote")) return ReadIniSectionLines(path, L"remote");
+    return ReadAllLinesOf(path);
+}
 // A basic recursive directory/file search for $finddir/$findfile -- supports the dir+wildcard+N+depth lookup form
 // only; the @window-fill and per-match-command forms described for these identifiers aren't implemented.
 static bool FindInDirRecursive(const CString& dir, const CString& wildcardCsv, bool wantDirs, int& counter, int targetN, int depth, int maxDepth, CString& result) {
@@ -2612,16 +2636,66 @@ struct AliasDef { CString name; std::vector<CString> lines; CString groupName; }
 struct SNode { int kind = 0; CString text; std::vector<SNode> a, b; };   // 0 command, 1 if (text = condition, a = then, b = else), 2 while, 3 label
 
 static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> commands; a '|' inside parentheses is left alone
+    // A '|' only counts as a command separator when it has whitespace on both sides (or sits right at the start/
+    // end of the string, treated as an implicit boundary) -- matching how every real multi-command script line
+    // actually looks ("cmd1 | cmd2", always spaced, for readability). Without this, a literal '|' embedded tight
+    // in ordinary text -- most commonly ASCII art, e.g. "\|/(_)_(_)\|/" -- gets misread as splitting that single
+    // /say (or similar) line into several bogus fragments, sending garbage raw commands to the server instead of
+    // the intended text.
     std::vector<CString> out; CString cur; int depth = 0;
-    for (int i = 0; i < s.GetLength(); i++) {
+    int n = s.GetLength();
+    for (int i = 0; i < n; i++) {
         wchar_t c = s[i];
         if (c == L'(') depth++; else if (c == L')' && depth > 0) depth--;
-        if (c == L'|' && depth == 0) { out.push_back(cur); cur.Empty(); } else cur += c;
+        bool spacedBefore = i == 0 || s[i - 1] == L' ' || s[i - 1] == L'\t';
+        bool spacedAfter = i + 1 >= n || s[i + 1] == L' ' || s[i + 1] == L'\t';
+        if (c == L'|' && depth == 0 && spacedBefore && spacedAfter) { out.push_back(cur); cur.Empty(); } else cur += c;
     }
     out.push_back(cur);
     return out;
 }
 static int BraceDelta(const CString& s) { int d = 0; for (int i = 0; i < s.GetLength(); i++) { if (s[i] == L'{') d++; else if (s[i] == L'}') d--; } return d; }
+// A line-level (not character-count) brace delta, used only by StripForeignBlocks below: a line is a structural
+// closer ONLY if its trimmed content is exactly "}", and a structural opener ONLY if it ENDS with "{". Everything
+// else is 0, even if "{" or "}" characters appear elsewhere in it. This matters because BraceDelta's plain
+// character count breaks inside a menu block full of ASCII-art say lines -- real mIRC scripts like this routinely
+// contain a lone "}" as part of the drawing itself (e.g. a bear's paw), which, counted naively, closes one brace
+// level too many and makes the skip below end partway through the block instead of at its real closing brace.
+static int LineStructuralBraceDelta(const CString& trimmed) {
+    if (trimmed == L"}") return -1;
+    if (!trimmed.IsEmpty() && trimmed.Right(1) == L"{") return 1;
+    return 0;
+}
+// Strips out whole "menu { ... }" / "dialog { ... }" / "xdialog { ... }" block bodies before the real on/raw/
+// ctcp/alias line scanners ever see them. Without this, a popup item inside a menu block like
+// "/say some colour-coded text" gets misread by the alias scanner as top-level "/name body" syntax (valid for
+// aliases.ini), silently redefining "say" with garbage every time such a line appears -- a script with several
+// popup items that each start with "/say ..." ends up clobbering the real say command/alias entirely, with the
+// LAST such line in the file winning. Brace-depth tracked (not a simple "skip one line") so a nested { } inside
+// the foreign block, or a submenu, doesn't end the skip early; also handles the block's "{" sitting on its own
+// line rather than the header line. This client doesn't implement menu/dialog blocks itself, so there is nothing
+// lost by skipping them here -- they simply aren't runnable script content in the first place.
+static std::vector<CString> StripForeignBlocks(const std::vector<CString>& in) {
+    std::vector<CString> out;
+    int skipDepth = 0; bool awaitingOpenBrace = false;
+    static const wchar_t* const kForeignKw[] = { L"menu ", L"menu\t", L"dialog ", L"dialog\t", L"xdialog ", L"xdialog\t" };
+    for (auto& raw : in) {
+        CString t = raw; t.Trim();
+        if (awaitingOpenBrace) {
+            if (t.Right(1) == L"{") { awaitingOpenBrace = false; skipDepth = 1; }
+            continue;
+        }
+        if (skipDepth > 0) { skipDepth += LineStructuralBraceDelta(t); if (skipDepth < 0) skipDepth = 0; continue; }
+        bool isForeignOpener = false;
+        for (auto kw : kForeignKw) { int kwLen = (int)wcslen(kw); if (t.GetLength() >= kwLen && t.Left(kwLen).CompareNoCase(kw) == 0) { isForeignOpener = true; break; } }
+        if (isForeignOpener) {
+            if (t.Right(1) == L"{") skipDepth = 1; else awaitingOpenBrace = true;
+            continue;
+        }
+        out.push_back(raw);
+    }
+    return out;
+}
 static int MatchParen(const CString& s, int open) {   // index of the ')' matching the '(' at s[open], or -1
     int d = 0;
     for (int i = open; i < s.GetLength(); i++) { if (s[i] == L'(') d++; else if (s[i] == L')' && --d == 0) return i; }
@@ -2832,7 +2906,8 @@ enum {   // this dialog's own control/menu ids -- kept separate from (and define
          // which lives much later in the file and isn't visible yet at this point
     IDC_SE_TABALIASES = 3900, IDC_SE_TABPOPUPS, IDC_SE_TABVARS, IDC_SE_TABREMOTE, IDC_SE_TABUSERS,
     IDC_SE_EDITALIASES, IDC_SE_EDITPOPUPS, IDC_SE_EDITVARS, IDC_SE_EDITREMOTE, IDC_SE_EDITUSERS,
-    IDC_SE_STATUSFILE, IDC_SE_STATUSPOS, IDM_SE_SAVE, IDM_SE_UNDO, IDM_SE_CUT, IDM_SE_COPY, IDM_SE_PASTE, IDM_SE_SELALL, IDM_SE_ABOUT
+    IDC_SE_STATUSFILE, IDC_SE_STATUSPOS, IDM_SE_SAVE, IDM_SE_UNDO, IDM_SE_CUT, IDM_SE_COPY, IDM_SE_PASTE, IDM_SE_SELALL, IDM_SE_ABOUT,
+    IDM_SE_VIEWFILE0 = 3950   // ..+49: one id per file in the current tab's "View" menu (switching which loaded file it's showing) -- up to 50 files per category, comfortably more than anyone will ever load
 };
 class CScriptEditorDlg : public CDialog {
     std::vector<WORD> t; int cnt = 0;
@@ -2856,9 +2931,45 @@ class CScriptEditorDlg : public CDialog {
         else if (m_curTab == 4) GetDlgItemText(IDC_SE_EDITUSERS, usersText);
         else GetDlgItemText(IDC_SE_EDITVARS, varText);
     }
+    CMenu* m_viewMenu = nullptr;   // rebuilt every time the active tab or its file list changes; lives inside m_menu, so not separately destroyed
+    // Which file in the current tab's list is being shown. Aliases/Remote/Users/Variables each have their own
+    // index, since switching tabs doesn't lose your place in any of the others.
+    int m_activeAliasIdx = 0, m_activeRemoteIdx = 0, m_activeUsersIdx = 0, m_activeVarsIdx = 0;
+    std::vector<CString>* FilesForTab(int tab) {   // nullptr for Popups (tab 1) -- that category's multi-file model is per-section, not a switchable list within one tab
+        switch (tab) { case 0: return &aliasFiles; case 2: return &remoteFiles; case 3: return &varsFiles; case 4: return &usersFiles; default: return nullptr; }
+    }
+    int* ActiveIdxForTab(int tab) {
+        switch (tab) { case 0: return &m_activeAliasIdx; case 2: return &m_activeRemoteIdx; case 3: return &m_activeVarsIdx; case 4: return &m_activeUsersIdx; default: return nullptr; }
+    }
+    static CString KindForTab(int tab) {
+        switch (tab) { case 0: return L"aliases"; case 3: return L"variables"; case 4: return L"users"; default: return L"remote"; }
+    }
+    CString ActivePathForTab(int tab) {   // empty if that tab has no switchable file list, or the list is empty
+        auto* files = FilesForTab(tab); auto* idx = ActiveIdxForTab(tab);
+        if (!files || !idx || files->empty()) return CString();
+        int i = *idx; if (i < 0 || i >= (int)files->size()) i = 0;
+        return (*files)[i];
+    }
+    void RebuildViewMenu() {   // called on tab switch and whenever a tab's file list could have changed
+        if (!m_menu) return;
+        if (m_viewMenu) { m_menu->RemoveMenu(1, MF_BYPOSITION); delete m_viewMenu; m_viewMenu = nullptr; }   // "View" always sits at position 1, right after "File"
+        m_viewMenu = new CMenu(); m_viewMenu->CreatePopupMenu();
+        auto* files = FilesForTab(m_curTab); auto* idx = ActiveIdxForTab(m_curTab);
+        if (files && idx && !files->empty()) {
+            for (int i = 0; i < (int)files->size() && i < 50; i++) {
+                CString label; label.Format(L"%d %s", i + 1, (LPCWSTR)NoPathPart((*files)[i]));
+                m_viewMenu->AppendMenu(MF_STRING | (i == *idx ? MF_CHECKED : 0), IDM_SE_VIEWFILE0 + i, label);
+            }
+        } else m_viewMenu->AppendMenu(MF_STRING | MF_GRAYED, IDM_SE_VIEWFILE0 + 49, L"(nothing else loaded)");
+        m_menu->InsertMenu(1, MF_BYPOSITION | MF_POPUP, (UINT_PTR)m_viewMenu->GetSafeHmenu(), L"&View");
+        DrawMenuBar();
+    }
 public:
-    CString aliasText, popupText, remoteText, varText, usersText;   // the caller fills these in before DoModal()
-    std::function<void(const CString&)> onSaveAliases, onSavePopups, onSaveRemote, onSaveVars, onSaveUsers;   // called (per-tab, via File > Save) or all five (on OK)
+    CString aliasText, popupText, remoteText, varText, usersText;   // the caller fills these in before DoModal() -- always the CURRENTLY ACTIVE file's text for that tab, not necessarily the first file's
+    std::vector<CString> aliasFiles, remoteFiles, usersFiles, varsFiles;   // every loaded file for each category, for the "View" menu -- index 0 is what aliasText/remoteText/etc. above are expected to hold initially
+    std::function<void(const CString&)> onSavePopups;   // popups keep their own single-call save -- that category's multi-file model (one file per section) isn't part of this switchable-list mechanism
+    std::function<CString(const CString& path, const CString& kind)> onReadFile;          // kind: "aliases"/"remote"/"users"/"variables"
+    std::function<void(const CString& path, const CString& text, const CString& kind)> onWriteFile;
 
     CScriptEditorDlg(CWnd* parent) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
@@ -2883,7 +2994,10 @@ public:
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
-    ~CScriptEditorDlg() { delete m_menu; }
+    ~CScriptEditorDlg() {
+        if (m_viewMenu) { if (m_menu) m_menu->RemoveMenu(1, MF_BYPOSITION); delete m_viewMenu; }   // detach before destroying m_menu, same as RebuildViewMenu does, so m_menu's own destructor doesn't also try to tear down this already-deleted submenu
+        delete m_menu;
+    }
     void ShowTab(int tab) {
         m_curTab = tab;
         GetDlgItem(IDC_SE_EDITALIASES)->ShowWindow(tab == 0 ? SW_SHOW : SW_HIDE);
@@ -2891,8 +3005,9 @@ public:
         GetDlgItem(IDC_SE_EDITREMOTE)->ShowWindow(tab == 2 ? SW_SHOW : SW_HIDE);
         GetDlgItem(IDC_SE_EDITVARS)->ShowWindow(tab == 3 ? SW_SHOW : SW_HIDE);
         GetDlgItem(IDC_SE_EDITUSERS)->ShowWindow(tab == 4 ? SW_SHOW : SW_HIDE);
-        static const wchar_t* const files[5] = { L"File: aliases.ini", L"File: popups.ini", L"File: remote.ini", L"File: vars.ini", L"File: users.ini" };
-        SetDlgItemText(IDC_SE_STATUSFILE, files[tab]);
+        CString activePath = ActivePathForTab(tab);
+        SetDlgItemText(IDC_SE_STATUSFILE, activePath.IsEmpty() ? L"File: popups.ini" : (L"File: " + activePath));
+        RebuildViewMenu();
         UpdateStatus();
         GetDlgItem(CurEditId())->SetFocus();
     }
@@ -2944,11 +3059,32 @@ public:
     afx_msg void OnTabUsers() { StashCurrentTabText(); ShowTab(4); }
     afx_msg void OnMenuSave() {
         StashCurrentTabText();
-        if (m_curTab == 0 && onSaveAliases) onSaveAliases(aliasText);
-        else if (m_curTab == 1 && onSavePopups) onSavePopups(popupText);
-        else if (m_curTab == 2 && onSaveRemote) onSaveRemote(remoteText);
-        else if (m_curTab == 3 && onSaveVars) onSaveVars(varText);
-        else if (m_curTab == 4 && onSaveUsers) onSaveUsers(usersText);
+        if (m_curTab == 1) { if (onSavePopups) onSavePopups(popupText); return; }
+        SaveActiveFileOfTab(m_curTab);
+    }
+    CString* TextMemberForTab(int tab) {
+        switch (tab) { case 0: return &aliasText; case 2: return &remoteText; case 3: return &varText; case 4: return &usersText; default: return nullptr; }
+    }
+    void SaveActiveFileOfTab(int tab) {   // writes that tab's stashed text back to whichever file it's CURRENTLY showing -- not necessarily index 0 anymore
+        CString path = ActivePathForTab(tab); CString* text = TextMemberForTab(tab);
+        if (path.IsEmpty() || !text || !onWriteFile) return;
+        onWriteFile(path, *text, KindForTab(tab));
+    }
+    afx_msg void OnViewFile(UINT id) {
+        int idx = (int)id - IDM_SE_VIEWFILE0;
+        auto* files = FilesForTab(m_curTab); auto* activeIdx = ActiveIdxForTab(m_curTab);
+        if (!files || !activeIdx || idx < 0 || idx >= (int)files->size() || idx == *activeIdx) return;
+        StashCurrentTabText();
+        SaveActiveFileOfTab(m_curTab);   // whatever was just typed into the file being left isn't lost
+        *activeIdx = idx;
+        CString newPath = (*files)[idx];
+        CString text = onReadFile ? onReadFile(newPath, KindForTab(m_curTab)) : CString();
+        CString* member = TextMemberForTab(m_curTab);
+        if (member) *member = text;
+        SetDlgItemText(CurEditId(), text);
+        SetDlgItemText(IDC_SE_STATUSFILE, L"File: " + newPath);
+        RebuildViewMenu();
+        UpdateStatus();
     }
     afx_msg void OnMenuUndo() { GetDlgItem(CurEditId())->SendMessage(EM_UNDO, 0, 0); }
     afx_msg void OnMenuCut() { GetDlgItem(CurEditId())->SendMessage(WM_CUT, 0, 0); }
@@ -2961,11 +3097,8 @@ public:
     afx_msg void OnTimer(UINT_PTR) { UpdateStatus(); }
     void OnOK() override {
         StashCurrentTabText();
-        if (onSaveAliases) onSaveAliases(aliasText);
         if (onSavePopups) onSavePopups(popupText);
-        if (onSaveRemote) onSaveRemote(remoteText);
-        if (onSaveVars) onSaveVars(varText);
-        if (onSaveUsers) onSaveUsers(usersText);
+        for (int tab : { 0, 2, 3, 4 }) SaveActiveFileOfTab(tab);   // each tab's own currently-active file, not always index 0
         CDialog::OnOK();
     }
     DECLARE_MESSAGE_MAP()
@@ -2974,6 +3107,7 @@ BEGIN_MESSAGE_MAP(CScriptEditorDlg, CDialog)
     ON_BN_CLICKED(IDC_SE_TABALIASES, OnTabAliases) ON_BN_CLICKED(IDC_SE_TABPOPUPS, OnTabPopups) ON_BN_CLICKED(IDC_SE_TABREMOTE, OnTabRemote) ON_BN_CLICKED(IDC_SE_TABVARS, OnTabVars) ON_BN_CLICKED(IDC_SE_TABUSERS, OnTabUsers)
     ON_COMMAND(IDM_SE_SAVE, OnMenuSave) ON_COMMAND(IDM_SE_UNDO, OnMenuUndo) ON_COMMAND(IDM_SE_CUT, OnMenuCut) ON_COMMAND(IDM_SE_COPY, OnMenuCopy)
     ON_COMMAND(IDM_SE_PASTE, OnMenuPaste) ON_COMMAND(IDM_SE_SELALL, OnMenuSelAll) ON_COMMAND(IDM_SE_ABOUT, OnMenuAbout) ON_WM_TIMER()
+    ON_COMMAND_RANGE(IDM_SE_VIEWFILE0, IDM_SE_VIEWFILE0 + 49, OnViewFile)
 END_MESSAGE_MAP()
 
 // ---------------- Popup menus: file format ----------------
@@ -2982,21 +3116,35 @@ enum { IDP_BAR = 20000, IDP_CTX = 21000, IDP_COPY = 29999 };   // menu ids: menu
 static const wchar_t* const kPopSec[5] = { L"mpopup", L"cpopup", L"qpopup", L"lpopup", L"bpopup" };        // status, channel, query, nick list, menu bar
 static const wchar_t* const kPopType[5] = { L"status", L"channel", L"query", L"nicklist", L"menubar" };   // what $menu returns
 // "Title:/commands" one per line; leading dots make sub menus (".Sub", "..Sub sub"); "-" is a separator; "Title {" ... "}" is a multi-line item.
+// Like LineStructuralBraceDelta, but for ParsePopupItems' multi-line item bodies specifically: a line closes
+// ONLY if it ENDS with "}" (trailing content before it, e.g. "lastcmd }", is still accepted as a close -- this
+// function already supported that) and opens ONLY if it ENDS with "{". A "{" or "}" appearing anywhere else in
+// the line -- ASCII-art text, a say command's own content, etc. -- is never treated as structural. Plain
+// character counting (the old behaviour) breaks on real scripts like Clocks.mrc, where a popup item's command is
+// ASCII art that happens to contain a lone "}" mid-line (part of a drawing) with no matching "{" -- counted
+// naively, that single stray character closes the whole multi-line body one line early, leaking every remaining
+// line of that submenu out as its own separate top-level popup item instead.
+static int PopupBodyBraceDelta(const CString& trimmed) {
+    int d = 0;
+    if (!trimmed.IsEmpty() && trimmed.Right(1) == L"}") d--;
+    if (!trimmed.IsEmpty() && trimmed.Right(1) == L"{") d++;
+    return d;
+}
 static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
     std::vector<PopupItem> out;
     for (size_t i = 0; i < in.size(); i++) {
         CString t = in[i]; t.TrimLeft();
         if (t.IsEmpty() || t[0] == L';') continue;
         PopupItem it; int dots = 0; while (dots < t.GetLength() && t[dots] == L'.') dots++;
-        it.depth = dots; t = t.Mid(dots); t.TrimLeft();
+        it.depth = dots; t = t.Mid(dots); t.Trim();   // full trim, not just TrimLeft -- the "ends with {" check just below needs t's true trailing edge, not whatever trailing whitespace or stray byte the line happened to carry
         int c = -1, d = 0;   // the title ends at the first ':' outside parentheses (so $iif(a:b,c) is safe)
         for (int k = 0; k < t.GetLength(); k++) { if (t[k] == L'(') d++; else if (t[k] == L')' && d > 0) d--; else if (t[k] == L':' && d == 0) { c = k; break; } }
         CString cmd;
         if (c >= 0) { it.title = t.Left(c); cmd = t.Mid(c + 1); }
-        else { it.title = t; if (t.Right(1) == L"{" && BraceDelta(t) > 0) { it.title = t.Left(t.GetLength() - 1); cmd = L"{"; } }
+        else { it.title = t; if (t.Right(1) == L"{" && PopupBodyBraceDelta(t) > 0) { it.title = t.Left(t.GetLength() - 1); cmd = L"{"; } }
         it.title.Trim(); cmd.Trim();
         if (!cmd.IsEmpty()) {
-            int db = BraceDelta(cmd);
+            int db = PopupBodyBraceDelta(cmd);
             if (db <= 0) {
                 if (cmd.Left(1) == L"{" && cmd.Right(1) == L"}") { cmd = cmd.Mid(1, cmd.GetLength() - 2); cmd.Trim(); }
                 it.cmd.push_back(cmd);
@@ -3005,7 +3153,7 @@ static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
                 if (outer) { cmd = cmd.Mid(1); cmd.TrimLeft(); }
                 if (!cmd.IsEmpty()) it.cmd.push_back(cmd);
                 while (db > 0 && i + 1 < in.size()) {
-                    CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                    CString l = in[++i]; l.Trim(); db += PopupBodyBraceDelta(l);
                     if (db <= 0) {
                         if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) it.cmd.push_back(head); }
                         else it.cmd.push_back(l);
@@ -3017,6 +3165,51 @@ static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
         }
         if (it.title.IsEmpty() && it.cmd.empty()) continue;
         out.push_back(it);
+    }
+    return out;
+}
+struct MenuBlockDef { std::vector<CString> targets; std::vector<PopupItem> items; };   // one "menu <name1>[,<name2>...] { ... }" block from a remote script
+// Scans raw (unstripped) script lines for "menu <names> { ... }" blocks -- real mIRC's own remote-script popup
+// syntax -- and parses each one's body with the same ParsePopupItems used for popups.ini, so these items render
+// and run identically to ones defined through the Popups tab. Uses the same conservative line-level brace
+// matching as StripForeignBlocks and for the same reason: a popup item's command can be ASCII art containing a
+// lone "{" or "}" that a naive character count would misread as a structural brace. This must run on the
+// UNSTRIPPED lines (before StripForeignBlocks removes menu bodies), since that function discards exactly the
+// content this one needs to read.
+static std::vector<MenuBlockDef> ParseMenuBlocks(const std::vector<CString>& in) {
+    std::vector<MenuBlockDef> out;
+    int n = (int)in.size();
+    for (int i = 0; i < n; i++) {
+        CString t = in[i]; t.Trim();
+        if (t.GetLength() < 5 || t.Left(5).CompareNoCase(L"menu ") != 0) continue;
+        CString header = t.Mid(5); header.TrimLeft();
+        CString namesPart; int bodyStart;
+        if (header.Right(1) == L"{") { namesPart = header.Left(header.GetLength() - 1); bodyStart = i + 1; }
+        else {
+            namesPart = header;
+            int j = i + 1; bool found = false;
+            while (j < n) { CString tj = in[j]; tj.Trim(); if (tj.Right(1) == L"{") { found = true; break; } j++; }
+            if (!found) continue;   // malformed: no opener found anywhere after this header -- skip it, keep scanning
+            bodyStart = j + 1;
+        }
+        namesPart.Trim();
+        std::vector<CString> body; int depth = 1; int k = bodyStart;
+        while (k < n) {
+            CString tk = in[k]; CString ttk = tk; ttk.Trim();
+            depth += LineStructuralBraceDelta(ttk);
+            if (depth <= 0) { k++; break; }
+            body.push_back(tk); k++;
+        }
+        MenuBlockDef mb;
+        { int start = 0; while (start <= namesPart.GetLength()) {
+            int comma = namesPart.Find(L',', start);
+            CString piece = comma < 0 ? namesPart.Mid(start) : namesPart.Mid(start, comma - start);
+            piece.Trim(); if (!piece.IsEmpty()) mb.targets.push_back(piece);
+            if (comma < 0) break; start = comma + 1;
+        } }
+        mb.items = ParsePopupItems(body);
+        if (!mb.targets.empty()) out.push_back(mb);
+        i = k - 1;   // the for-loop's own i++ then resumes right after this block's closing brace
     }
     return out;
 }
@@ -5044,23 +5237,12 @@ class CMainFrame : public CMDIFrameWnd {
         FlushVars();
     }
     void FlushVars() { if (m_varsDirty) { m_varsDirty = false; SaveVars(); } }
-    void LoadVars() {   // vars.ini:  [variables]  n0=%name value
-        m_vars.clear();
-        CString path = IniPath(L"vars.ini");
-        std::vector<wchar_t> buf(65536, 0);
-        DWORD n = GetPrivateProfileSectionW(L"variables", buf.data(), (DWORD)buf.size(), path);
-        if (!n) return;
-        for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
-            CString line = p; int eq = line.Find(L'=');
-            if (eq <= 0) continue;
-            CString v = line.Mid(eq + 1); int sp = v.Find(L' ');
-            CString name = sp < 0 ? v : v.Left(sp), val = sp < 0 ? CString() : v.Mid(sp + 1);
-            if (name.Left(1) != L"%") continue;
-            VarEntry e; e.name = name; e.value = val; m_vars[VKey(name)] = e;
-        }
+    CString PrimaryVarsFilePath() { return m_cachedVarsPath.IsEmpty() ? IniPath(L"vars.ini") : m_cachedVarsPath; }   // set by RebuildFromRFiles' own scan; falls back to the conventional default name if no vars file is registered yet
+    void LoadVars() {   // m_vars is populated by RebuildFromRFiles (called from LoadRemote, which always runs first at startup) -- this just guards LoadVars() being called on its own, with m_rfiles not loaded yet
+        if (m_rfiles.empty()) LoadRemote(); else RebuildFromRFiles();
     }
     void SaveVars() {
-        CString path = IniPath(L"vars.ini");
+        CString path = PrimaryVarsFilePath();
         WritePrivateProfileStringW(L"variables", nullptr, nullptr, path);   // drop the section, then rewrite it in order
         int i = 0;
         for (auto& kv : m_vars) {
@@ -5068,6 +5250,8 @@ class CMainFrame : public CMDIFrameWnd {
             CString key; key.Format(L"n%d", i++);
             WritePrivateProfileStringW(L"variables", key, kv.second.name + L" " + kv.second.value, path);
         }
+        bool found = false; for (auto& p : m_rfiles) if (p.CompareNoCase(path) == 0) { found = true; break; }
+        if (!found) { m_rfiles.push_back(path); SaveFileList(L"rfiles", m_rfiles); }   // a brand-new vars.ini (first-ever /set) -- register it in the list so it's reloaded next startup too
     }
     // ---- Scripts Editor: the Variables tab, as "%name value" lines matching vars.ini's own convention ----
     CString BuildVarsText() {
@@ -6082,12 +6266,18 @@ class CMainFrame : public CMDIFrameWnd {
     // than merged into m_aliases, so saving edits to the Aliases tab can't accidentally duplicate a remote-defined
     // alias into aliases.ini (or vice versa) -- each source's own save path only ever touches its own list.
     std::vector<AliasDef> m_remoteAliases;
+    // Every alias file in m_afiles AFTER the first -- m_afiles[0] is what m_aliases itself represents (the
+    // editable, saveable primary file, same as before multi-file support existed); any additional alias files
+    // loaded via /load -a or already listed in IRC.ini's [afiles] are merged in here, read-only, same spirit as
+    // m_remoteAliases for remote-script-defined ones.
+    std::vector<AliasDef> m_extraAliases;
     AliasDef* FindAlias(const CString& name) {
-        // The IsGroupEnabled() check is a no-op for every m_aliases entry (aliases.ini-sourced ones always have an
-        // empty groupName, and that's unconditionally treated as enabled) -- it only actually matters for
+        // The IsGroupEnabled() check is a no-op for every m_aliases/m_extraAliases entry (aliases.ini-sourced ones
+        // always have an empty groupName, unconditionally treated as enabled) -- it only actually matters for
         // m_remoteAliases, where a remote-script "alias" block can sit inside a #group someone has /disable'd.
         for (size_t i = 0; i < m_aliases.size(); i++) if (m_aliases[i].name.CompareNoCase(name) == 0 && IsGroupEnabled(m_aliases[i].groupName)) return &m_aliases[i];
         for (size_t i = 0; i < m_remoteAliases.size(); i++) if (m_remoteAliases[i].name.CompareNoCase(name) == 0 && IsGroupEnabled(m_remoteAliases[i].groupName)) return &m_remoteAliases[i];
+        for (size_t i = 0; i < m_extraAliases.size(); i++) if (m_extraAliases[i].name.CompareNoCase(name) == 0) return &m_extraAliases[i];
         return nullptr;
     }
     bool OnRunStack(const CString& name) { for (size_t i = 0; i < m_runStack.size(); i++) if (m_runStack[i].CompareNoCase(name) == 0) return true; return false; }
@@ -6104,14 +6294,25 @@ class CMainFrame : public CMDIFrameWnd {
         }
         return out;
     }
+    void RebuildExtraAliasFiles() {   // every m_afiles entry after the first, merged read-only into m_extraAliases
+        m_extraAliases.clear();
+        for (size_t i = 1; i < m_afiles.size(); i++) {
+            auto lines = ReadIniSectionLines(m_afiles[i], L"aliases");
+            auto parsed = ParseAliases(lines);
+            m_extraAliases.insert(m_extraAliases.end(), parsed.begin(), parsed.end());
+        }
+    }
     void SaveAliases() {
-        CString path = IniPath(L"aliases.ini");
+        if (m_afiles.empty()) { m_afiles.push_back(IniPath(L"aliases.ini")); SaveFileList(L"afiles", m_afiles); }
+        CString path = m_afiles[0];
         WritePrivateProfileStringW(L"aliases", nullptr, nullptr, path);   // drop the section, then rewrite it in order
         std::vector<CString> lines = AliasLines();
         for (size_t i = 0; i < lines.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"aliases", key, lines[i], path); }
     }
     void LoadAliases() {
-        CString path = IniPath(L"aliases.ini");
+        m_afiles = LoadFileList(L"afiles");
+        if (m_afiles.empty()) { m_afiles.push_back(IniPath(L"aliases.ini")); SaveFileList(L"afiles", m_afiles); }
+        CString path = m_afiles[0];
         m_aliases.clear();
         if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
             std::vector<wchar_t> buf(262144, 0);
@@ -6119,25 +6320,26 @@ class CMainFrame : public CMDIFrameWnd {
             std::vector<CString> lines;
             if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) lines.push_back(line.Mid(eq + 1)); }
             m_aliases = ParseAliases(lines);
-            return;
-        }
-        // first run with aliases.ini: carry over aliases from the old [aliases] section of the main ini, or start with a small default set
-        std::vector<wchar_t> buf(65536, 0);
-        DWORD n = GetPrivateProfileSectionW(L"aliases", buf.data(), (DWORD)buf.size(), AfxGetApp()->m_pszProfileName);
-        if (n) {
-            for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
-                CString line = p; int eq = line.Find(L'='); if (eq <= 0) continue;
-                std::vector<CString> body; body.push_back(line.Mid(eq + 1)); SetAlias(line.Left(eq), body);
-            }
-            WritePrivateProfileStringW(L"aliases", nullptr, nullptr, AfxGetApp()->m_pszProfileName);   // moved: drop the old section
         } else {
-            static const wchar_t* defs[] = { L"/op /mode # +ooo $$1 $2 $3", L"/dop /mode # -ooo $$1 $2 $3", L"/j /join #$$1 $2-", L"/p /part #",
-                L"/n /names #$$1", L"/w /whois $$1", L"/k /kick # $$1 $2-", L"/q /query $$1", L"/send /dcc send $1 $2", L"/chat /dcc chat $1",
-                L"/ping /ctcp $$1 ping", L"/s /server $$1-" };
-            std::vector<CString> lines; for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) lines.push_back(defs[i]);
-            m_aliases = ParseAliases(lines);
+            // first run with this aliases file: carry over aliases from the old [aliases] section of the main ini, or start with a small default set
+            std::vector<wchar_t> buf(65536, 0);
+            DWORD n = GetPrivateProfileSectionW(L"aliases", buf.data(), (DWORD)buf.size(), AfxGetApp()->m_pszProfileName);
+            if (n) {
+                for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+                    CString line = p; int eq = line.Find(L'='); if (eq <= 0) continue;
+                    std::vector<CString> body; body.push_back(line.Mid(eq + 1)); SetAlias(line.Left(eq), body);
+                }
+                WritePrivateProfileStringW(L"aliases", nullptr, nullptr, AfxGetApp()->m_pszProfileName);   // moved: drop the old section
+            } else {
+                static const wchar_t* defs[] = { L"/op /mode # +ooo $$1 $2 $3", L"/dop /mode # -ooo $$1 $2 $3", L"/j /join #$$1 $2-", L"/p /part #",
+                    L"/n /names #$$1", L"/w /whois $$1", L"/k /kick # $$1 $2-", L"/q /query $$1", L"/send /dcc send $1 $2", L"/chat /dcc chat $1",
+                    L"/ping /ctcp $$1 ping", L"/s /server $$1-" };
+                std::vector<CString> lines; for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) lines.push_back(defs[i]);
+                m_aliases = ParseAliases(lines);
+            }
+            SaveAliases();
         }
-        SaveAliases();
+        RebuildExtraAliasFiles();
     }
     afx_msg void OnAliasEditor() {
         CString text; std::vector<CString> cur = AliasLines();
@@ -6148,18 +6350,51 @@ class CMainFrame : public CMDIFrameWnd {
         for (CString piece = text.Tokenize(L"\n", pos); !piece.IsEmpty(); piece = text.Tokenize(L"\n", pos)) { piece.TrimRight(L'\r'); lines.push_back(piece); }
         m_aliases = ParseAliases(lines); SaveAliases();
     }
-    afx_msg void OnScriptEditor() {   // the unified, tabbed Aliases/Popups/Variables editor -- see CScriptEditorDlg
+    // Generic, path-+-kind-aware read/write used by the Script Editor's "View" menu (switching which loaded file a
+    // tab is showing) and by its Save/OK paths once a tab is no longer necessarily showing its category's first
+    // file. kind is "remote"/"aliases"/"users"/"variables" -- the dialog always knows which tab (and so which
+    // category) a path came from, so this sidesteps sniffing a brand-new, not-yet-written file's content (which
+    // has nothing to sniff yet).
+    CString ReadFileTextForKind(const CString& path, const CString& kind) {
+        std::vector<CString> lines;
+        if (kind == L"variables") lines = ReadIniSectionLines(path, L"variables");
+        else if (kind == L"users") lines = ReadIniSectionLines(path, L"users");
+        else if (kind == L"aliases") lines = ReadIniSectionLines(path, L"aliases");
+        else lines = ReadScriptFileLines(path);   // "remote": this app's own "[remote]" INI section, or plain text if the file has no such section (a loose .mrc)
+        CString text; for (auto& l : lines) text += l + L"\r\n"; return text;
+    }
+    void WriteFileTextForKind(const CString& path, const CString& text, const CString& kind) {
+        std::vector<CString> lines = SplitLinesRobust(text);
+        if (kind == L"remote" && !HasIniSection(path, L"remote") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            CStdioFile f; if (f.Open(path, CFile::modeCreate | CFile::modeWrite | CFile::typeText)) for (auto& l : lines) f.WriteString(l + L"\r\n");   // an existing plain .mrc with no "[remote]" section -- keep it plain text rather than converting it to this app's own INI format
+        } else {
+            const wchar_t* section = kind == L"variables" ? L"variables" : kind == L"users" ? L"users" : kind == L"aliases" ? L"aliases" : L"remote";
+            WritePrivateProfileStringW(section, nullptr, nullptr, path);
+            for (size_t i = 0; i < lines.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(section, key, lines[i], path); }
+        }
+        if (kind == L"aliases") {
+            if (!m_afiles.empty() && path.CompareNoCase(m_afiles[0]) == 0) LoadAliases(); else RebuildExtraAliasFiles();
+        } else RebuildFromRFiles();   // covers remote/variables/users -- also refreshes m_remoteRaw (the primary file's own view) when path happens to be m_rfiles[0]
+    }
+    afx_msg void OnScriptEditor() {   // the unified, tabbed Aliases/Popups/Remote/Users/Variables editor -- see CScriptEditorDlg
         CScriptEditorDlg dlg(this);
         CString at; for (auto& l : AliasLines()) at += l + L"\r\n"; dlg.aliasText = at;
+        dlg.aliasFiles = m_afiles;
         dlg.popupText = BuildPopupsText();
-        dlg.remoteText = BuildRemoteText();
-        dlg.varText = BuildVarsText();
-        dlg.usersText = BuildUsersText();
-        dlg.onSaveAliases = [this](const CString& text) { ApplyAliasesText(text); };
+        for (auto& p : m_rfiles) {   // m_rfiles mixes script/vars/users files together (same as real mIRC's own [rfiles]) -- split them out here so each tab's "View" menu only lists files of its own kind
+            if (HasIniSection(p, L"variables")) dlg.varsFiles.push_back(p);
+            else if (HasIniSection(p, L"users")) dlg.usersFiles.push_back(p);
+            else dlg.remoteFiles.push_back(p);
+        }
+        // Each tab's text is its OWN kind's first file, not necessarily m_rfiles[0] (which could be any kind,
+        // depending on load order) -- BuildRemoteText()/BuildUsersText()/BuildVarsText() all assume m_rfiles[0] is
+        // their own kind, so reading explicitly by kind here is what actually handles that correctly.
+        dlg.remoteText = dlg.remoteFiles.empty() ? CString() : ReadFileTextForKind(dlg.remoteFiles[0], L"remote");
+        dlg.varText = dlg.varsFiles.empty() ? CString() : ReadFileTextForKind(dlg.varsFiles[0], L"variables");
+        dlg.usersText = dlg.usersFiles.empty() ? CString() : ReadFileTextForKind(dlg.usersFiles[0], L"users");
         dlg.onSavePopups = [this](const CString& text) { ApplyPopupsText(text); };
-        dlg.onSaveRemote = [this](const CString& text) { ApplyRemoteText(text); };
-        dlg.onSaveVars = [this](const CString& text) { ApplyVarsText(text); };
-        dlg.onSaveUsers = [this](const CString& text) { ApplyUsersText(text); };
+        dlg.onReadFile = [this](const CString& path, const CString& kind) { return ReadFileTextForKind(path, kind); };
+        dlg.onWriteFile = [this](const CString& path, const CString& text, const CString& kind) { WriteFileTextForKind(path, text, kind); };
         dlg.DoModal();
     }
     afx_msg void OnColorsDialog() {
@@ -6324,6 +6559,7 @@ class CMainFrame : public CMDIFrameWnd {
 
     // ---- popup menus: popups.ini  ([mpopup] status  [cpopup] channel  [qpopup] query  [lpopup] nick list  [bpopup] menu bar) ----
     std::vector<CString> m_popRaw[5];                          // each section's lines, exactly as in the file / editor
+    CString m_popPath[5];                                      // which file each section (status/channel/query/nick/menu) currently loads from -- IRC.ini's [pfiles] n0..n4, matching real mIRC's own per-section file tracking (all five commonly point at the same popups.ini, but /load -ps etc. can point any one of them elsewhere)
     std::vector<std::vector<CString>> m_bpActs, m_ctxActs;     // what each menu-bar item / each item of the popup being shown runs
     int m_bpCount = 0; CString m_menuType;                     // how many menu-bar menus were inserted; the value of $menu
 
@@ -6358,29 +6594,59 @@ class CMainFrame : public CMDIFrameWnd {
         fill(3, lp, sizeof lp / sizeof lp[0]); fill(4, bp, sizeof bp / sizeof bp[0]);
     }
     void SavePopups() {
-        CString path = IniPath(L"popups.ini");
         for (int s = 0; s < 5; s++) {
-            WritePrivateProfileStringW(kPopSec[s], nullptr, nullptr, path);   // drop the section, then rewrite it in order
-            for (size_t i = 0; i < m_popRaw[s].size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(kPopSec[s], key, m_popRaw[s][i], path); }
+            if (m_popPath[s].IsEmpty()) m_popPath[s] = IniPath(L"popups.ini");
+            WritePrivateProfileStringW(kPopSec[s], nullptr, nullptr, m_popPath[s]);   // drop the section, then rewrite it in order
+            for (size_t i = 0; i < m_popRaw[s].size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(kPopSec[s], key, m_popRaw[s][i], m_popPath[s]); }
         }
+        SaveFileList(L"pfiles", std::vector<CString>(m_popPath, m_popPath + 5));
     }
     void LoadPopups() {
-        CString path = IniPath(L"popups.ini");
+        auto list = LoadFileList(L"pfiles");
+        for (int s = 0; s < 5; s++) m_popPath[s] = (s < (int)list.size() && !list[s].IsEmpty()) ? list[s] : IniPath(L"popups.ini");
         for (int s = 0; s < 5; s++) m_popRaw[s].clear();
-        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { SeedPopups(); SavePopups(); return; }
-        std::vector<wchar_t> buf(262144, 0);
-        for (int s = 0; s < 5; s++) {
-            DWORD n = GetPrivateProfileSectionW(kPopSec[s], buf.data(), (DWORD)buf.size(), path);
-            if (!n) continue;
-            for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_popRaw[s].push_back(line.Mid(eq + 1)); }
-        }
+        bool anyExists = false; for (int s = 0; s < 5; s++) if (GetFileAttributesW(m_popPath[s]) != INVALID_FILE_ATTRIBUTES) anyExists = true;
+        if (!anyExists) { SeedPopups(); SavePopups(); return; }
+        for (int s = 0; s < 5; s++) m_popRaw[s] = ReadIniSectionLines(m_popPath[s], kPopSec[s]);
+        SaveFileList(L"pfiles", std::vector<CString>(m_popPath, m_popPath + 5));   // first run with no [pfiles] yet: persist the now-defaulted list
     }
     // ---- Remote events: on JOIN/PART/TEXT/ACTION/NOTICE/KICK/QUIT/NICK/TOPIC/CONNECT, remote.ini ----
     std::vector<CString> m_remoteRaw;   // the file / editor text, exactly as typed
-    std::vector<RemoteEvent> m_events;  // parsed from m_remoteRaw whenever it changes
-    std::vector<RawEvent> m_rawEvents;  // "raw ..." lines, also parsed from m_remoteRaw -- the two syntaxes share the same script text
-    std::vector<CtcpEvent> m_ctcpEvents;    // "ctcp ..." lines, also parsed from m_remoteRaw
-    std::vector<LevelEntry> m_levelEntries; // "N:mask" / "=N:mask" lines, also parsed from m_remoteRaw -- gives ctcp events' <level> field meaning
+    // ---- [afiles] / [rfiles]: the lists of currently-loaded alias and remote/vars/users files, in IRC.ini, in
+    // mIRC's own n0=/n1=/... format. m_remoteRaw above stays the MERGED text of every script-kind file in
+    // m_rfiles (and m_aliases/m_vars/m_levelEntries similarly merge every alias/vars/users-kind file) -- so all the
+    // existing parsing/execution code keeps working unchanged; only how these get POPULATED changes. The Script
+    // Editor's Remote/Aliases tabs still only read and write the FIRST file in each list (m_rfiles[0] /
+    // m_afiles[0]) until that editor gets its own multi-file UI (a separate, later piece of work) -- additional
+    // files loaded via /load or already listed in IRC.ini are fully active regardless, just not directly editable
+    // there yet.
+    std::vector<CString> m_afiles, m_rfiles;
+    // Inserts path into list at 1-based position posN (0/unspecified = append). If path is already listed, its
+    // position is left alone and nothing is inserted -- matching "if you try to load a file that's already
+    // loaded, its contents are updated and its position... is maintained" from mIRC's own /load docs; the actual
+    // content refresh happens via whichever Load*() the caller runs afterward, not here.
+    static void InsertIntoFileList(std::vector<CString>& list, const CString& path, int posN) {
+        for (auto& p : list) if (p.CompareNoCase(path) == 0) return;
+        if (posN >= 1 && posN <= (int)list.size() + 1) list.insert(list.begin() + (posN - 1), path);
+        else list.push_back(path);
+    }
+    std::vector<CString> LoadFileList(const wchar_t* section) {
+        CString path = IniPath(L"IRC.ini");
+        std::vector<wchar_t> buf(65536, 0);
+        DWORD n = GetPrivateProfileSectionW(section, buf.data(), (DWORD)buf.size(), path);
+        std::vector<CString> out;
+        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) out.push_back(line.Mid(eq + 1)); }
+        return out;
+    }
+    void SaveFileList(const wchar_t* section, const std::vector<CString>& list) {
+        CString path = IniPath(L"IRC.ini");
+        WritePrivateProfileStringW(section, nullptr, nullptr, path);
+        for (size_t i = 0; i < list.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(section, key, list[i], path); }
+    }
+    std::vector<RemoteEvent> m_events;  // parsed from m_remoteMerged (every script-kind file in m_rfiles, combined) whenever it changes
+    std::vector<RawEvent> m_rawEvents;  // "raw ..." lines, also parsed from m_remoteMerged -- the two syntaxes share the same script text
+    std::vector<CtcpEvent> m_ctcpEvents;    // "ctcp ..." lines, also parsed from m_remoteMerged
+    std::vector<LevelEntry> m_levelEntries; // "N:mask" / "=N:mask" lines, parsed from m_usersRaw (every users-kind file in m_rfiles, combined) -- gives ctcp events' <level> field meaning
     // ---- Groups: live enabled/disabled state, overriding each group's declared "#name on|off" default once
     // /enable or /disable has touched it. A vector (not a map) since wildcard matching and display both need the
     // group's real, original-case name, which a lowercased map key would lose.
@@ -6391,8 +6657,8 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& g : m_groups) if (g.name.CompareNoCase(groupName) == 0) return g.enabled;
         return true;   // a group referenced by an event but never actually declared (shouldn't normally happen): default enabled
     }
-    void SyncGroupDeclarations() {   // registers any newly-seen "#name [on|off]" declarations, without clobbering a group /enable or /disable already touched this session
-        for (auto& g : ParseGroupDeclarations(m_remoteRaw)) {
+    void SyncGroupDeclarationsFrom(const std::vector<CString>& lines) {   // registers any newly-seen "#name [on|off]" declarations, without clobbering a group /enable or /disable already touched this session
+        for (auto& g : ParseGroupDeclarations(lines)) {
             bool found = false; for (auto& existing : m_groups) if (existing.name.CompareNoCase(g.name) == 0) { found = true; break; }
             if (!found) m_groups.push_back({ g.name, g.defaultOn });
         }
@@ -6492,50 +6758,81 @@ class CMainFrame : public CMDIFrameWnd {
         auto it = m_ial.find(VKey(oldNick));
         if (it != m_ial.end()) { m_ial[VKey(newNick)] = it->second; m_ial.erase(it); }
     }
-    void LoadRemote() {
-        CString path = IniPath(L"remote.ini");
-        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-            m_remoteRaw = {
-                L"###on *:JOIN:#:/echo $chan $nick ($address) has joined $chan",
-                L"on *:TEXT:hellotest!!!*:#:/notice $nick Hi there!",
-            };
-            SaveRemote(); return;
+    std::vector<CString> m_remoteMerged;   // the concatenated lines of every script-kind file in m_rfiles -- what m_events/m_rawEvents/m_ctcpEvents/m_remoteAliases/group declarations actually parse from, as opposed to m_remoteRaw, which stays just m_rfiles[0]'s own lines for the editor
+    CString m_cachedVarsPath, m_cachedUsersPath;   // set by RebuildFromRFiles' own scan, so SaveVars()/SaveUsers() -- which can run very often (every /set, every /auser) -- don't re-sniff every m_rfiles entry's content with fresh file I/O on every single call
+    std::vector<MenuBlockDef> m_remoteMenus;   // every "menu <names> { ... }" block found across every script-kind file in m_rfiles -- merged into the matching popup(s) in ShowContextPopup/RebuildMenuBarPopups, alongside whatever's defined in popups.ini
+    // Re-scans every file in m_rfiles, sniffing each one's kind by content (HasIniSection) and routing it to the
+    // right place: a "[variables]" file merges into m_vars, a "[users]" file merges into m_usersRaw, anything else
+    // is treated as a script and appended to m_remoteMerged. Called by all of LoadRemote/LoadVars/LoadUsers, since
+    // whichever one is asked for, the whole list has to be re-read anyway -- they all draw from the same files.
+    void RebuildFromRFiles() {
+        m_remoteRaw = m_rfiles.empty() ? std::vector<CString>() : ReadScriptFileLines(m_rfiles[0]);   // the editor's own view: just the primary file
+        m_remoteMerged.clear(); m_usersRaw.clear(); m_vars.clear(); m_cachedVarsPath.Empty(); m_cachedUsersPath.Empty(); m_remoteMenus.clear();
+        for (auto& path : m_rfiles) {
+            if (HasIniSection(path, L"variables")) {
+                if (m_cachedVarsPath.IsEmpty()) m_cachedVarsPath = path;   // first one found wins, matching PrimaryVarsFilePath's old scan order
+                for (auto& line : ReadIniSectionLines(path, L"variables")) {
+                    int sp = line.Find(L' '); CString vname = sp < 0 ? line : line.Left(sp), vval = sp < 0 ? CString() : line.Mid(sp + 1);
+                    if (vname.Left(1) != L"%") continue;
+                    VarEntry e; e.name = vname; e.value = vval; m_vars[VKey(vname)] = e;
+                }
+            } else if (HasIniSection(path, L"users")) {
+                if (m_cachedUsersPath.IsEmpty()) m_cachedUsersPath = path;
+                auto lines = ReadIniSectionLines(path, L"users");
+                m_usersRaw.insert(m_usersRaw.end(), lines.begin(), lines.end());
+            } else {
+                auto rawLines = ReadScriptFileLines(path);
+                auto fileMenus = ParseMenuBlocks(rawLines);   // must run on the UNSTRIPPED lines -- StripForeignBlocks below discards exactly what this needs to read
+                m_remoteMenus.insert(m_remoteMenus.end(), fileMenus.begin(), fileMenus.end());
+                auto lines = StripForeignBlocks(rawLines);   // drop menu/dialog block bodies before anything else can misread a line inside one as top-level script content
+                m_remoteMerged.insert(m_remoteMerged.end(), lines.begin(), lines.end());
+            }
         }
-        m_remoteRaw.clear();
-        std::vector<wchar_t> buf(262144, 0);
-        DWORD n = GetPrivateProfileSectionW(L"remote", buf.data(), (DWORD)buf.size(), path);
-        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_remoteRaw.push_back(line.Mid(eq + 1)); }
-        m_events = ParseRemoteEvents(m_remoteRaw);
-        m_rawEvents = ParseRawEvents(m_remoteRaw);
-        m_ctcpEvents = ParseCtcpEvents(m_remoteRaw);
-        m_remoteAliases = ParseAliases(m_remoteRaw);   // "alias name { ... }" blocks written directly in the Remote script
+        m_events = ParseRemoteEvents(m_remoteMerged);
+        m_rawEvents = ParseRawEvents(m_remoteMerged);
+        m_ctcpEvents = ParseCtcpEvents(m_remoteMerged);
+        m_remoteAliases = ParseAliases(m_remoteMerged);   // "alias name { ... }" blocks written directly in a Remote script
+        m_levelEntries = ParseLevelEntries(m_usersRaw);
+        SyncGroupDeclarationsFrom(m_remoteMerged);
+        RebuildMenuBarPopups();   // picks up any "menu menubar {...}" change from a (re)load -- safe to call even before the menu bar exists yet (it checks m_menu.GetSafeHmenu() itself)
     }
-    void SaveRemote() {
-        CString path = IniPath(L"remote.ini");
+    void LoadRemote() {
+        m_rfiles = LoadFileList(L"rfiles");
+        if (m_rfiles.empty()) {   // first run, or upgrading from before multi-file support existed: seed the list from the single files this client always used
+            CString remotePath = IniPath(L"remote.ini");
+            if (GetFileAttributesW(remotePath) == INVALID_FILE_ATTRIBUTES) {
+                std::vector<CString> seed = {
+                    L"###on *:JOIN:#:/echo $chan $nick ($address) has joined $chan",
+                    L"on *:TEXT:hellotest!!!*:#:/notice $nick Hi there!",
+                };
+                WritePrivateProfileStringW(L"remote", nullptr, nullptr, remotePath);
+                for (size_t i = 0; i < seed.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"remote", key, seed[i], remotePath); }
+            }
+            m_rfiles = { remotePath, IniPath(L"users.ini"), IniPath(L"vars.ini") };
+            SaveFileList(L"rfiles", m_rfiles);
+        }
+        RebuildFromRFiles();
+    }
+    void SaveRemote() {   // writes the Script Editor's own edits back to m_rfiles[0] only -- see the m_remoteMerged comment above for why
+        if (m_rfiles.empty()) m_rfiles.push_back(IniPath(L"remote.ini"));
+        CString path = m_rfiles[0];
         WritePrivateProfileStringW(L"remote", nullptr, nullptr, path);
         for (size_t i = 0; i < m_remoteRaw.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"remote", key, m_remoteRaw[i], path); }
-        m_events = ParseRemoteEvents(m_remoteRaw);
-        m_rawEvents = ParseRawEvents(m_remoteRaw);
-        m_ctcpEvents = ParseCtcpEvents(m_remoteRaw);
-        m_remoteAliases = ParseAliases(m_remoteRaw);
-        SyncGroupDeclarations();   // picks up any group newly added via this edit, without resetting an existing /enable or /disable toggle
+        RebuildFromRFiles();
     }
     // ---- Users: users.ini, separate from remote.ini -- matches mIRC's own dedicated Users tab/file, not mixed
     // into the Remote script text the way an earlier pass of this feature did. ----
     std::vector<CString> m_usersRaw;   // users.ini text, "mask:levels" per line, exactly as typed
-    void LoadUsers() {
-        CString path = IniPath(L"users.ini");
-        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { m_usersRaw.clear(); SaveUsers(); return; }
-        m_usersRaw.clear();
-        std::vector<wchar_t> buf(65536, 0);
-        DWORD n = GetPrivateProfileSectionW(L"users", buf.data(), (DWORD)buf.size(), path);
-        if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) { CString line = p; int eq = line.Find(L'='); if (eq > 0) m_usersRaw.push_back(line.Mid(eq + 1)); }
-        m_levelEntries = ParseLevelEntries(m_usersRaw);
+    CString PrimaryUsersFilePath() { return m_cachedUsersPath.IsEmpty() ? IniPath(L"users.ini") : m_cachedUsersPath; }   // set by RebuildFromRFiles' own scan; falls back to the conventional default name if no users file is registered yet
+    void LoadUsers() {   // m_usersRaw/m_levelEntries are populated by RebuildFromRFiles (called from LoadRemote, which always runs first at startup) -- this just guards the case of LoadUsers() being called on its own, with m_rfiles not loaded yet
+        if (m_rfiles.empty()) LoadRemote(); else RebuildFromRFiles();
     }
     void SaveUsers() {
-        CString path = IniPath(L"users.ini");
+        CString path = PrimaryUsersFilePath();
         WritePrivateProfileStringW(L"users", nullptr, nullptr, path);
         for (size_t i = 0; i < m_usersRaw.size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(L"users", key, m_usersRaw[i], path); }
+        bool found = false; for (auto& p : m_rfiles) if (p.CompareNoCase(path) == 0) { found = true; break; }
+        if (!found) { m_rfiles.push_back(path); SaveFileList(L"rfiles", m_rfiles); }   // a brand-new users.ini (first-ever /auser) -- register it in the list so it's reloaded next startup too
         m_levelEntries = ParseLevelEntries(m_usersRaw);
     }
     CString BuildUsersText() { CString text; for (auto& l : m_usersRaw) text += l + L"\r\n"; return text; }
@@ -6824,15 +7121,28 @@ class CMainFrame : public CMDIFrameWnd {
         int n = m.GetMenuItemCount();
         if (lastSep && n > 0) m.DeleteMenu(n - 1, MF_BYPOSITION);
     }
+    // Every item from every remote-script "menu <names> { ... }" block whose target list includes the given
+    // name (case-insensitive) -- status/channel/query/nicklist/menubar, matching kPopType.
+    std::vector<PopupItem> RemoteMenuItemsFor(const CString& target) {
+        std::vector<PopupItem> out;
+        for (auto& mb : m_remoteMenus) {
+            bool matches = false;
+            for (auto& tgt : mb.targets) if (tgt.CompareNoCase(target) == 0) { matches = true; break; }
+            if (matches) out.insert(out.end(), mb.items.begin(), mb.items.end());
+        }
+        return out;
+    }
     // Shows popup section 'sec' for window w at pt; params are $1 $2 ... (the selected nicks, or the query's nick). Returns false if that
     // popup has nothing to show, so the caller can fall back to the default menu.
     bool ShowContextPopup(CChatWnd* w, int sec, const CString& params, CPoint pt, bool canCopy) {
         if (!w) return false;
-        if (m_popRaw[sec].empty() && !canCopy) return false;
+        std::vector<PopupItem> remoteItems = RemoteMenuItemsFor(kPopType[sec]);   // remote-script "menu" items add to popups.ini's own, same as real mIRC -- checked here too, so a section with ONLY remote-script items doesn't wrongly report "nothing to show"
+        if (m_popRaw[sec].empty() && remoteItems.empty() && !canCopy) return false;
         if (m_depth == 0) { m_halt = false; m_steps = 0; }
         m_depth++;
         m_menuType = kPopType[sec];
         std::vector<PopupItem> items = m_popRaw[sec].empty() ? std::vector<PopupItem>() : ExpandSubmenus(ParsePopupItems(m_popRaw[sec]), w, params);
+        if (!remoteItems.empty()) { auto expanded = ExpandSubmenus(remoteItems, w, params); items.insert(items.end(), expanded.begin(), expanded.end()); }
         CMenu m; m.CreatePopupMenu(); m_ctxActs.clear();
         if (canCopy) { m.AppendMenu(MF_STRING, IDP_COPY, L"Copy"); m.AppendMenu(MF_SEPARATOR); }
         size_t i = 0;
@@ -6882,6 +7192,8 @@ class CMainFrame : public CMDIFrameWnd {
         m_bpCount = 0; m_bpActs.clear();
         win = FindMenuBarIndex(L"Window"); if (win < 0) return;
         std::vector<PopupItem> items = ParsePopupItems(m_popRaw[4]);
+        auto remoteMenubarItems = RemoteMenuItemsFor(L"menubar");   // remote-script "menu menubar {...}" items add alongside popups.ini's own
+        if (!remoteMenubarItems.empty()) items.insert(items.end(), remoteMenubarItems.begin(), remoteMenubarItems.end());
         struct Grp { CString title; std::vector<PopupItem> items; };
         std::vector<Grp> groups; int cur = -1;
         for (size_t i = 0; i < items.size();) {
@@ -7700,6 +8012,57 @@ class CMainFrame : public CMDIFrameWnd {
                 Show(w, line, cInfo);
             }
             if (shown.empty()) Show(w, L"* No matching users.", cInfo);
+        }
+        else if (cmd == L"load" || cmd == L"reload") {   // /reload is documented to skip on start/load triggers -- this client has no such events to skip, so both behave identically here
+            CString a = arg; a.TrimLeft();
+            if (a.Left(1) != L"-") { Show(w, L"* Usage: /" + cmd + L" <-aN|-pscqnm|-ruvsN> <filename>", cPart); return; }
+            CString sw = Word(a); sw.MakeLower();
+            CString fname = a; fname.Trim();
+            if (fname.IsEmpty()) { Show(w, L"* Usage: /" + cmd + L" <-aN|-pscqnm|-ruvsN> <filename>", cPart); return; }
+            CString path = IniPath(fname);
+            if (sw.Left(2) == L"-a") {
+                int posN = 0; CString numPart = sw.Mid(2); if (!numPart.IsEmpty() && IsAllDigits(numPart)) posN = _wtoi(numPart);
+                InsertIntoFileList(m_afiles, path, posN); SaveFileList(L"afiles", m_afiles); LoadAliases();
+                Show(w, L"* Loaded alias file: " + path, cInfo);
+            } else if (sw.Left(2) == L"-p" && sw.GetLength() >= 3) {
+                wchar_t sec = sw[2];
+                int secIdx = sec == L's' ? 0 : sec == L'c' ? 1 : sec == L'q' ? 2 : sec == L'n' ? 3 : sec == L'm' ? 4 : -1;
+                if (secIdx < 0) { Show(w, L"* Usage: /" + cmd + L" -ps|-pc|-pq|-pn|-pm <filename>", cPart); return; }
+                m_popPath[secIdx] = path; m_popRaw[secIdx] = ReadIniSectionLines(path, kPopSec[secIdx]);
+                SaveFileList(L"pfiles", std::vector<CString>(m_popPath, m_popPath + 5));
+                RebuildMenuBarPopups();
+                Show(w, L"* Loaded popup file: " + path, cInfo);
+            } else if (sw == L"-ru") {
+                InsertIntoFileList(m_rfiles, path, 0); SaveFileList(L"rfiles", m_rfiles); LoadRemote();
+                Show(w, L"* Loaded users file: " + path, cInfo);
+            } else if (sw == L"-rv") {
+                InsertIntoFileList(m_rfiles, path, 0); SaveFileList(L"rfiles", m_rfiles); LoadRemote();
+                Show(w, L"* Loaded variables file: " + path, cInfo);
+            } else if (sw.Left(3) == L"-rs") {
+                int posN = 0; CString numPart = sw.Mid(3); if (!numPart.IsEmpty() && IsAllDigits(numPart)) posN = _wtoi(numPart);
+                InsertIntoFileList(m_rfiles, path, posN); SaveFileList(L"rfiles", m_rfiles); LoadRemote();
+                Show(w, L"* Loaded script file: " + path, cInfo);
+            } else Show(w, L"* Usage: /" + cmd + L" <-aN|-pscqnm|-ruvsN> <filename>", cPart);
+        }
+        else if (cmd == L"unload") {   // the -n switch (skip on unload trigger) is accepted but has nothing to actually skip -- this client has no on UNLOAD event
+            CString a = arg; a.TrimLeft();
+            if (a.Left(2).CompareNoCase(L"-n") == 0) { a = a.Mid(2); a.TrimLeft(); }
+            if (a.Left(1) != L"-") { Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart); return; }
+            CString sw = Word(a); sw.MakeLower();
+            CString fname = a; fname.Trim();
+            if (fname.IsEmpty()) { Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart); return; }
+            CString path = IniPath(fname);
+            if (sw == L"-a") {
+                bool removed = false;
+                for (auto it = m_afiles.begin(); it != m_afiles.end(); ++it) if (it->CompareNoCase(path) == 0) { m_afiles.erase(it); removed = true; break; }
+                if (removed) { SaveFileList(L"afiles", m_afiles); if (m_afiles.empty()) m_afiles.push_back(IniPath(L"aliases.ini")); LoadAliases(); Show(w, L"* Unloaded alias file: " + path, cInfo); }
+                else Show(w, L"* Not currently loaded: " + path, cPart);
+            } else if (sw == L"-rs") {
+                bool removed = false;
+                for (auto it = m_rfiles.begin(); it != m_rfiles.end(); ++it) if (it->CompareNoCase(path) == 0) { m_rfiles.erase(it); removed = true; break; }
+                if (removed) { SaveFileList(L"rfiles", m_rfiles); LoadRemote(); Show(w, L"* Unloaded: " + path, cInfo); }
+                else Show(w, L"* Not currently loaded: " + path, cPart);
+            } else Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart);
         }
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
@@ -11039,12 +11402,11 @@ public:
         LoadBookmarks(); 
         LoadFavs();
 		LoadAliases();
-		LoadVars();
 		LoadPopups();
 		m_appStartTick = ::GetTickCount64();   // $uptime(mirc)
-		LoadRemote();
-		LoadGroupState();
-		SyncGroupDeclarations();
+		LoadGroupState();   // must run before LoadRemote(), which now syncs group declarations internally (via RebuildFromRFiles) -- loading the persisted toggle state first is what lets it win over a script's own declared default, same as before multi-file support existed
+		LoadRemote();        // populates m_rfiles -- LoadVars/LoadUsers both now read from it, so both have to come after this, not before as they used to
+		LoadVars();
 		LoadUsers();
 		LoadUserInfo();
 		LoadDccSettings();

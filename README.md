@@ -25,15 +25,19 @@ you may get random bugs, glitches, or crashes.
 ~~aliases system~~  
 ~~popup system~~  
 ~~variables system~~  
-~~Re-do favorites and add history~~    
+~~load / unload scripts~~  
+support editing multi scripts in the script editor   
 identifiers  
-~~script editor to let you to edit aliases/vars/scripts~~  
+scripting support for menu popups  
 scripting  
+~~script editor to let you to edit aliases/vars/scripts~~  
 ~~online timer~~  
 ~~timer~~  
 ~~tray icon~~ 
 ~~identd server~~     
-DCC chat/file send/server      
+~~DCC chat/file send~~  
+DCC server
+FServe      
 ~~address book~~      
 ~~notify~~  
 ~~play sounds via /splay~~  
