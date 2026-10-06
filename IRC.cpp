@@ -14,6 +14,7 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://gnu.org>.
 */
+#include <regex>
 #include <afxinet.h>
 #include <afxwin.h>
 #include <afxcmn.h>
@@ -22,6 +23,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <afxdlgs.h>
 #include <afxdisp.h>   // the full COleDateTime class definition -- afxwin.h etc. only forward-declare it, which isn't enough to actually construct/use one ($ctime(text)'s date parsing)
 #include <wincrypt.h>  // CryptStringToBinaryA -- base64-decoding the embedded Fixedsys Excelsior font
+#include <bcrypt.h>    // BCryptHash etc -- $md5 and friends; bcrypt.lib is already linked (see the build command notes) but its header was never actually included
 #include <map>
 #include <set>
 #include <memory>
@@ -39,6 +41,8 @@ along with this program.  If not, see <https://gnu.org>.
 #include <shellapi.h>
 #include <shlobj.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
 #include <windns.h>
 #include <process.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -163,6 +167,18 @@ static CString OsName() {
         return CString(bld >= 26100 ? L"2025" : bld >= 20348 ? L"2022" : bld >= 17763 ? L"2019" : L"2016");
     }
     return CString();
+}
+// Raw major/minor/build numbers behind OsName()'s own friendly-name mapping, exposed separately for
+// $osmajor/$osminor/$osbuild/$osversion -- duplicates OsName()'s own RtlGetVersion call rather than refactoring
+// it to share one, to keep this a small, standalone addition.
+static bool OsVersionRaw(DWORD& major, DWORD& minor, DWORD& build) {
+    typedef LONG(WINAPI* RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+    OSVERSIONINFOEXW vi = {}; vi.dwOSVersionInfoSize = sizeof vi;
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn fn = nt ? (RtlGetVersionFn)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+    if (!fn || fn((PRTL_OSVERSIONINFOW)&vi) != 0) return false;
+    major = vi.dwMajorVersion; minor = vi.dwMinorVersion; build = vi.dwBuildNumber;
+    return true;
 }
 // ---- Shared mIRC-style date/time formatter, used by $asctime/$time/$date/$gmt's optional format parameter. t is
 // treated as local time throughout (CTime::GetCurrentTime() already is); z/zz/zzz reflect the real current UTC
@@ -2598,6 +2614,72 @@ static CString FmtNum(double v) {   // whole numbers plain, otherwise up to 5 de
     if (v == floor(v) && fabs(v) < 1e15) s.Format(L"%.0f", v == 0 ? 0.0 : v);
     else { s.Format(L"%.5f", v); s.TrimRight(L'0'); s.TrimRight(L'.'); }
     return s;
+}
+// Splits a list into tokens by a single delimiter character, matching real mIRC behaviour for the whole $xxxtok
+// family: leading, trailing, and consecutive delimiters all collapse away rather than producing empty tokens in
+// between (confirmed directly against mIRC's own $puttok documentation and examples -- this isn't a guess).
+static std::vector<CString> SplitTok(const CString& s, wchar_t delim) {
+    std::vector<CString> out;
+    int start = 0, n = s.GetLength();
+    while (start < n) {
+        int c = s.Find(delim, start);
+        CString piece = c < 0 ? s.Mid(start) : s.Mid(start, c - start);
+        if (!piece.IsEmpty()) out.push_back(piece);
+        if (c < 0) break;
+        start = c + 1;
+    }
+    return out;
+}
+static CString JoinTok(const std::vector<CString>& v, wchar_t delim) {
+    CString out; for (size_t i = 0; i < v.size(); ++i) { if (i) out += delim; out += v[i]; } return out;
+}
+// Resolves mIRC's "N" token-index convention: 1-based from the start, or negative for 1-based from the end
+// (-1 is the last token). Returns a 0-based C++ index, or -1 if out of range.
+static int TokIndex(int N, size_t count) {
+    if (N == 0 || count == 0) return -1;
+    int idx = N > 0 ? N - 1 : (int)count + N;
+    if (idx < 0 || idx >= (int)count) return -1;
+    return idx;
+}
+// Standard RFC 4648 Base32 decode -- used by $totp/$hotp for a key given in the Google-Authenticator-style Base32
+// form (the overwhelmingly common real-world case for a TOTP secret). Invalid characters and padding ('=') are
+// simply skipped rather than rejected outright, which is permissive but matches how most real callers expect it
+// to behave with a pasted secret that might have odd spacing.
+static std::vector<BYTE> Base32Decode(const CString& s) {
+    static const wchar_t* alphabet = L"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    std::vector<BYTE> out;
+    int buffer = 0, bitsLeft = 0;
+    for (int i = 0; i < s.GetLength(); ++i) {
+        wchar_t c = towupper(s[i]);
+        if (c == L'=' || c == L' ') continue;
+        const wchar_t* p = wcschr(alphabet, c);
+        if (!p) continue;
+        int val = (int)(p - alphabet);
+        buffer = (buffer << 5) | val; bitsLeft += 5;
+        if (bitsLeft >= 8) { bitsLeft -= 8; out.push_back((BYTE)((buffer >> bitsLeft) & 0xFF)); }
+    }
+    return out;
+}
+// HMAC via BCrypt, for $totp/$hotp (RFC 4226/6238) -- the same BCrypt plumbing $md5/$sha1 etc already use, just
+// opened in HMAC mode (BCRYPT_ALG_HANDLE_HMAC_FLAG) and given a key.
+static bool HmacCompute(LPCWSTR algId, const std::vector<BYTE>& key, const BYTE* data, int dataLen, std::vector<BYTE>& outHash) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (::BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0 || !hAlg) return false;
+    bool ok = false;
+    ULONG objLen = 0, cb = 0, hashLen = 0;
+    ::BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0);
+    ::BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cb, 0);
+    if (objLen > 0 && hashLen > 0) {
+        std::vector<BYTE> obj(objLen);
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        if (::BCryptCreateHash(hAlg, &hHash, obj.data(), objLen, (PUCHAR)key.data(), (ULONG)key.size(), 0) == 0 && hHash) {
+            outHash.resize(hashLen);
+            if (::BCryptHashData(hHash, (PUCHAR)data, dataLen, 0) == 0 && ::BCryptFinishHash(hHash, outHash.data(), hashLen, 0) == 0) ok = true;
+            ::BCryptDestroyHash(hHash);
+        }
+    }
+    ::BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
 }
 // Exactly "number op number" with op one of + - * / % ^  ->  1 and the result in out; 0 = not such an expression;
 // -1 = division by zero.
@@ -5371,6 +5453,7 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<AddressEntry> m_abook;
     // ---- File and directory identifiers: small bits of state a few of them need ----
     int m_readn = 0;                      // $readn: the line number matched by the last $read()
+    int m_flinen = 0;                     // $flinen: the line number matched by the last $fline(), same spirit as $readn above
     CString m_dccGetDir;                  // $getdir: stored for compatibility, since this client has no DCC to actually save anything there
     CString m_sfstate;                    // $sfstate: "cancel" after the last $sfile/$sdir/$msfile was dismissed without a selection
     std::vector<CString> m_msfileResults; // $msfile(N): the file list from the most recent $msfile(dir,title,oktext) call
@@ -5404,6 +5487,44 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_bt[4]; int m_seqn = 0; std::vector<CMDIChildWnd*> m_tabWnds;   // CChatWnd and CListWnd both live here now
     std::map<CString, CChatWnd*> m_w;
     std::map<CString, CCustomDialogWnd*> m_dialogs;   // open modeless /dialog -m windows, keyed by lowercase dialog name -- raw pointers, since each one deletes itself (PostNcDestroy) once its HWND is gone; this map's own entry for it is cleared first, in CloseCustomDialog, so nothing double-deletes it
+    // $regex()'s captured backreferences, keyed by lowercase match name ("default" when none was given), so a
+    // later $regml(name,N) can retrieve them. For a /g (global) match, every match's capture groups are appended
+    // in sequence into the same flat list (matching mIRC's own documented behaviour: two backreferences across
+    // three /g matches means $regml(name,0) reports 6, not 2) -- group 0 (the whole match) is never stored here,
+    // only capture groups 1 and up, since that's what mIRC's $regml calls a "backreference". An insertion-order
+    // list, capped at 50 entries (oldest dropped first), mirrors mIRC's own documented "remembers the 50 most
+    // recent named searches" limit; $regex, $regsub and $regsubex all share this same storage.
+    std::map<CString, std::vector<CString>> m_regexResults;
+    std::vector<CString> m_regexResultOrder;
+    void StoreRegexResult(const CString& name, std::vector<CString>&& groups) {
+        CString key = name; key.MakeLower(); if (key.IsEmpty()) key = L"default";
+        if (!m_regexResults.count(key)) {
+            m_regexResultOrder.push_back(key);
+            if (m_regexResultOrder.size() > 50) { m_regexResults.erase(m_regexResultOrder.front()); m_regexResultOrder.erase(m_regexResultOrder.begin()); }
+        }
+        m_regexResults[key] = std::move(groups);
+    }
+    // Hash tables (/hmake, /hadd, /hdel, /hfree, $hget, $hfind). Items are a plain vector of key/data pairs, kept
+    // in insertion order -- this matters because $hget(table,N).item iterates items by that order, and because
+    // mIRC's own hash tables are documented as using chaining to resolve collisions (which is itself effectively
+    // a linked list per bucket), a plain ordered list with linear lookup is a faithful-enough match in behavior
+    // for realistic table sizes, without needing to actually implement bucket hashing. "size" (bucket count) is
+    // accepted and reported back via $hget(table).size for script compatibility, but doesn't affect anything --
+    // there's no real bucket array underneath it to size.
+    struct HashTableEntry { CString name; int size = 100; std::vector<std::pair<CString, CString>> items; };
+    std::vector<HashTableEntry> m_hashTables;
+    HashTableEntry* FindHashTable(const CString& tname) { for (auto& t : m_hashTables) if (t.name.CompareNoCase(tname) == 0) return &t; return nullptr; }
+    // File handles (/fopen, /fclose, /fwrite, $fopen, $fread, $fgetc, $feof, $ferr). Each handle keeps its own
+    // real, open CStdioFile so position tracking, writes, and reads all behave like a genuine file handle rather
+    // than a snapshot read into memory once -- a script that /fwrite's then $fread's the same handle sees its
+    // own just-written data, matching real mIRC. $feof/$ferr are deliberately GLOBAL, not per-handle state (this
+    // matches mIRC's own documented behaviour: "Return the results of the last file access attempt in any
+    // script" -- not "in this handle"), updated by whichever file command or identifier ran most recently.
+    struct FileHandleEntry { CString name, filename; CStdioFile* file = nullptr; };
+    std::vector<FileHandleEntry> m_fileHandles;
+    bool m_lastFileEof = false, m_lastFileErr = false;
+    FileHandleEntry* FindFileHandle(const CString& hname) { for (auto& h : m_fileHandles) if (h.name.CompareNoCase(hname) == 0) return &h; return nullptr; }
+    void CloseFileHandle(FileHandleEntry& h) { if (h.file) { h.file->Close(); delete h.file; h.file = nullptr; } }
     std::vector<DialogTableDef> m_dialogTables;       // every "dialog name { ... }" block found across every script-kind file in m_rfiles, same spirit as m_remoteMenus
     std::vector<AliasDef> m_aliases; std::vector<CString> m_runStack;   // aliases (aliases.ini) and the alias names currently running
     int m_depth = 0, m_steps = 0; bool m_halt = false; CString m_result, m_prop, m_lastPrompt;   // state of the running script: $result, $prop, $!
@@ -5680,6 +5801,95 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"ircdir") { val = ExeDir(); return true; }
         if (name == L"ircexe") { val = ExePath(); return true; }
         if (name == L"ircini") { val = L"IRC.ini"; return true; }
+        if (name == L"halted") { val = m_halt ? L"$true" : L"$false"; return true; }
+        if (name == L"feof") { val = m_lastFileEof ? L"1" : L"0"; return true; }   // the result of the LAST file-handling command/identifier anywhere, not per-handle state -- matches mIRC's own documented behaviour
+        if (name == L"ferr") { val = m_lastFileErr ? L"1" : L"0"; return true; }
+        if (name == L"isadmin") { val = IsUserAnAdmin() ? L"$true" : L"$false"; return true; }
+        if (name == L"locked") { val = L"$false"; return true; }   // this client has no Options > Lock dialog equivalent, so there's nothing to ever be locked
+        if (name == L"active" || name == L"activecid" || name == L"activewid") {
+            CChatWnd* aw = dynamic_cast<CChatWnd*>(MDIGetActive());
+            if (!aw) { val.Empty(); return true; }
+            if (name == L"active") val = aw->m_name;
+            else if (name == L"activewid") val.Format(L"%d", aw->m_cwId);
+            else if (aw->net) val.Format(L"%d", aw->net->id);
+            else val.Empty();
+            return true;
+        }
+        if (name == L"cmdline") { val = ::GetCommandLineW(); return true; }
+        if (name == L"flinen") { val.Format(L"%d", m_flinen); return true; }
+        if (name == L"notify") { val = m_notifyOn ? L"$true" : L"$false"; return true; }
+        if (name == L"fullname") { val = net ? net->o.real : m_defOpts.real; return true; }   // the real name from the Connect options; falls back to the default (not-yet-connected) options when there's no active connection
+        if (name == L"myident") { val = net ? net->o.user : CString(); return true; }   // the ident/username sent for the current connection
+        if (name == L"myhost") {   // this machine's own hostname (not its IP -- see $ip for that)
+            char hostname[256];
+            val = (::gethostname(hostname, sizeof(hostname)) == 0) ? CString(hostname) : CString();
+            return true;
+        }
+        if (name == L"serverip") {   // the resolved IP of the server this connection is actually talking to
+            val.Empty();
+            if (net && net->conn) {
+                CString addr; UINT port = 0;
+                if (net->sock.GetPeerName(addr, port)) val = addr;
+            }
+            return true;
+        }
+        if (name == L"ip") {   // the local machine's own IP address. Earlier attempts each failed differently on
+            // real machines with virtual network adapters present (WSL2, Hyper-V, Docker, VPNs all create one):
+            // resolving through the local hostname can land on whichever adapter the hostname happens to map to;
+            // asking the OS routing table via a UDP "connect" to a public address came back with a WSL virtual
+            // adapter's address instead of the real one; and requiring a configured default gateway, while a good
+            // signal in principle, turned out too strict and matched nothing at all on another real machine. This
+            // combines the lessons from all three: enumerate adapters directly, exclude ones whose description
+            // names them as a known kind of virtual adapter, and among what's left prefer one with a default
+            // gateway configured but don't require it -- so a real adapter that doesn't happen to report a
+            // gateway correctly is still found, while WSL/Hyper-V/VPN adapters are excluded by name regardless of
+            // what the routing table or gateway fields say about them.
+            val.Empty();
+            ULONG bufLen = 15000;
+            std::vector<BYTE> buf(bufLen);
+            PIP_ADAPTER_ADDRESSES addrs = (PIP_ADAPTER_ADDRESSES)buf.data();
+            ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+            DWORD ret = ::GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &bufLen);
+            if (ret == ERROR_BUFFER_OVERFLOW) { buf.resize(bufLen); addrs = (PIP_ADAPTER_ADDRESSES)buf.data(); ret = ::GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &bufLen); }
+            if (ret == NO_ERROR) {
+                static const wchar_t* virtualMarkers[] = { L"wsl", L"hyper-v", L"virtualbox", L"vmware", L"virtual", L"docker", L"teredo", L"tap-", L"tunnel", L"loopback", L"npcap" };
+                CString bestNoGateway;   // a fallback candidate, kept in case nothing with a gateway survives the filter
+                for (PIP_ADAPTER_ADDRESSES a = addrs; a; a = a->Next) {
+                    if (a->OperStatus != IfOperStatusUp) continue;
+                    if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                    if (!a->FirstUnicastAddress) continue;
+                    CString desc = a->Description; desc.MakeLower();
+                    bool isVirtual = false; for (auto m : virtualMarkers) if (desc.Find(m) >= 0) { isVirtual = true; break; }
+                    if (isVirtual) continue;
+                    sockaddr_in* sa = (sockaddr_in*)a->FirstUnicastAddress->Address.lpSockaddr;
+                    char ipStr[64] = {};
+                    if (!::inet_ntop(AF_INET, &sa->sin_addr, ipStr, sizeof(ipStr))) continue;
+                    if (a->FirstGatewayAddress) { val = CString(ipStr); break; }   // has a real default gateway -- the strongest candidate, take it immediately
+                    if (bestNoGateway.IsEmpty()) bestNoGateway = ipStr;   // remember the first non-virtual adapter even without a gateway, in case nothing better turns up
+                }
+                if (val.IsEmpty()) val = bestNoGateway;
+            }
+            return true;
+        }
+        if (name == L"diskfree" || name == L"disktotal") {   // the drive this app is installed/running on -- real mIRC's own versions report free/total space summed across ALL drives, which this simplifies to just the one drive, since summing every drive on the system is of dubious use and AdiIRC's own issue tracker notes real users finding that combined-total behavior confusing anyway
+            CString drive = ExeDir().Left(3);   // "C:\" from "C:\path\to\"
+            ULARGE_INTEGER avail, total, freeb;
+            if (::GetDiskFreeSpaceExW(drive, &avail, &total, &freeb)) val.Format(L"%llu", (name == L"diskfree" ? avail : total).QuadPart);
+            else val = L"0";
+            return true;
+        }
+        if (name == L"cpucount") { SYSTEM_INFO si; ::GetSystemInfo(&si); val.Format(L"%d", (int)si.dwNumberOfProcessors); return true; }
+        if (name == L"memfree" || name == L"memtotal") {
+            MEMORYSTATUSEX ms = {}; ms.dwLength = sizeof(ms);
+            if (::GlobalMemoryStatusEx(&ms)) val.Format(L"%llu", (name == L"memfree" ? ms.ullAvailPhys : ms.ullTotalPhys) / (1024 * 1024));   // megabytes, matching mIRC's own documented units for these
+            else val = L"0";
+            return true;
+        }
+        if (name == L"mircdir") { val = ExeDir(); return true; }   // the real mIRC identifier names, as bare (no-parens) identifiers -- same as $ircdir/$ircexe/$ircini above, just under their standard mIRC names too, for scripts written against real mIRC rather than this app specifically
+        if (name == L"mircexe") { val = ExePath(); return true; }
+        if (name == L"mircini") { val = ExeDir() + L"IRC.ini"; return true; }
+        if (name == L"script") { val = m_rfiles.empty() ? CString() : m_rfiles[0]; return true; }   // this client has no per-line "which loaded file is this command actually running from" tracking, so this reports the primary script file as a reasonable approximation, not necessarily the exact file a specific alias/event came from when multiple script files are loaded
+        if (name == L"scriptdir") { CString path = m_rfiles.empty() ? CString() : m_rfiles[0]; int s = path.ReverseFind(L'\\'); val = s >= 0 ? path.Left(s + 1) : path; return true; }
         if (name == L"filtered") { val = L"0"; return true; }   // /filter isn't implemented in this client
         if (name == L"readn") { val.Format(L"%d", m_readn); return true; }
         if (name == L"getdir") { val = m_dccGetDir; return true; }   // stored for compatibility; nothing actually saves here, since there's no DCC in this client
@@ -5714,6 +5924,14 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"chan") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
+        if (name == L"target") { val = !m_evChan.IsEmpty() ? m_evChan : m_evNick; return true; }   // "where the event took place" -- a channel or query's nick, for the common events (text/join/part/etc) that already track $chan/$nick; events this client doesn't give a distinct target for (like on CLOSE's own window name) aren't specifically covered
+
+        if (name == L"wildsite") {   // the host portion of $address, wildcarded to *!*@host form -- empty outside an event, same as $address itself
+            if (m_evAddress.IsEmpty()) { val.Empty(); return true; }
+            int at = m_evAddress.Find(L'@');
+            val = (at >= 0) ? (L"*!*@" + m_evAddress.Mid(at + 1)) : CString();
+            return true;
+        }
         if (name == L"knick") { val = m_evKnick; return true; }   // on KICK only: the nick who got kicked ($nick is the kicker)
         if (name == L"newnick") { val = m_evNewnick; return true; }   // on NICK only: the nick they changed to ($nick is the old one)
         if (name == L"halted") { val = m_evHaltDef ? L"$true" : L"$false"; return true; }
@@ -5724,6 +5942,15 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"fulladdress") { val = (m_evNick.IsEmpty() || m_evAddress.IsEmpty()) ? CString() : (m_evNick + L"!" + m_evAddress); return true; }
         if (name == L"network") { val = net ? net->network : CString(); return true; }
         if (name == L"os") { val = OsName(); return true; }
+        if (name == L"osmajor" || name == L"osminor" || name == L"osbuild" || name == L"osversion") {
+            DWORD maj, mnr, bld;
+            if (!OsVersionRaw(maj, mnr, bld)) { val.Empty(); return true; }
+            if (name == L"osmajor") val.Format(L"%lu", maj);
+            else if (name == L"osminor") val.Format(L"%lu", mnr);
+            else if (name == L"osbuild") val.Format(L"%lu", bld);
+            else val.Format(L"%lu.%lu.%lu", maj, mnr, bld);
+            return true;
+        }
         if (name == L"date") { val = now.Format(L"%d/%m/%Y"); return true; }
         if (name == L"adate") { val = now.Format(L"%m/%d/%Y"); return true; }
         if (name == L"day") { val = now.Format(L"%A"); return true; }
@@ -5970,6 +6197,908 @@ class CMainFrame : public CMDIFrameWnd {
             val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
         }
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
+        if (name == L"abs" || name == L"sqrt" || name == L"ceil" || name == L"log" || name == L"log10" || name == L"sin" || name == L"cos" || name == L"tan" || name == L"asin" || name == L"acos" || name == L"atan" || name == L"sinh" || name == L"cosh") {
+            double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false;
+            double r;
+            if (name == L"abs") r = fabs(x);
+            else if (name == L"sqrt") { if (x < 0) return false; r = sqrt(x); }
+            else if (name == L"ceil") r = ceil(x);
+            else if (name == L"log") { if (x <= 0) return false; r = log(x); }
+            else if (name == L"log10") { if (x <= 0) return false; r = log10(x); }
+            else if (name == L"sin") r = sin(x);
+            else if (name == L"cos") r = cos(x);
+            else if (name == L"tan") r = tan(x);
+            else if (name == L"asin") { if (x < -1 || x > 1) return false; r = asin(x); }
+            else if (name == L"acos") { if (x < -1 || x > 1) return false; r = acos(x); }
+            else if (name == L"atan") r = atan(x);
+            else if (name == L"sinh") r = sinh(x);
+            else r = cosh(x);
+            val = FmtNum(r); return true;
+        }
+        if (name == L"atan2" || name == L"hypot") {   // two-argument math functions
+            CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L','); if (c < 0) return false;
+            double x, y; if (!ParseNum(a.Left(c), x) || !ParseNum(a.Mid(c + 1), y)) return false;
+            val = FmtNum(name == L"atan2" ? atan2(x, y) : hypot(x, y)); return true;
+        }
+        if (name == L"left" || name == L"right") {   // $left(text,N) / $right(text,N) -- N<0 means "all but the last/first |N| characters" from that side
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.ReverseFind(L','); if (c < 0) return false;
+            CString text = a.Left(c); double nD; if (!ParseNum(a.Mid(c + 1), nD)) return false;
+            int N = (int)nD, len = text.GetLength();
+            int take = N >= 0 ? N : len + N;   // N<0: length minus |N|
+            if (take < 0) take = 0; if (take > len) take = len;
+            val = (name == L"left") ? text.Left(take) : text.Right(take);
+            return true;
+        }
+        if (name == L"mid") {   // $mid(text,S[,N]) -- S: 1-based position, negative counts from the end (0 behaves like 1). N omitted: rest of string. N=0: returns the numeric LENGTH from S, not a substring. N<0: everything from S except the last |N| characters of the WHOLE string (not relative to the substring's own end).
+            CString a = EvalIds(w, rawArgs, params);
+            int c1 = a.Find(L','); if (c1 < 0) return false;
+            CString text = a.Left(c1); CString rest = a.Mid(c1 + 1);
+            int c2 = rest.Find(L',');
+            CString sStr = c2 < 0 ? rest : rest.Left(c2);
+            double sD; if (!ParseNum(sStr, sD)) return false;
+            int len = text.GetLength();
+            int S = (int)sD;
+            int startIdx = S > 0 ? S - 1 : (S < 0 ? len + S : 0);   // 0-based; S==0 behaves like position 1
+            if (startIdx < 0) startIdx = 0;
+            if (startIdx >= len) { val.Empty(); return true; }
+            if (c2 < 0) { val = text.Mid(startIdx); return true; }   // N omitted: rest of the string
+            double nD; if (!ParseNum(rest.Mid(c2 + 1), nD)) return false; int N = (int)nD;
+            if (N == 0) { val.Format(L"%d", len - startIdx); return true; }   // N=0: the numeric length from S, not a substring
+            int endIdx = N > 0 ? startIdx + N : len + N;   // N<0: up to (whole-string length - |N|), not relative to startIdx
+            if (endIdx > len) endIdx = len;
+            if (endIdx <= startIdx) { val.Empty(); return true; }
+            val = text.Mid(startIdx, endIdx - startIdx); return true;
+        }
+        if (name == L"str") {   // $str(text,N) -- text repeated N times; $null if N isn't >= 1
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.ReverseFind(L','); if (c < 0) return false;
+            CString text = a.Left(c); double nD; if (!ParseNum(a.Mid(c + 1), nD)) return false;
+            int N = (int)nD; if (N < 1) { val.Empty(); return true; }
+            if ((__int64)N * text.GetLength() > 200000) return false;   // sanity cap against runaway memory use from a huge N
+            CString out; out.Preallocate(N * text.GetLength()); for (int i = 0; i < N; ++i) out += text;
+            val = out; return true;
+        }
+        if (name == L"strip") {   // $strip(text[,burcimoe]) -- strips mIRC control codes; default set is burci (bold/underline/reverse/color/italic)
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L','); CString text = c < 0 ? a : a.Left(c);
+            CString opts = c < 0 ? CString(L"burci") : a.Mid(c + 1); if (opts.IsEmpty()) opts = L"burci";
+            bool b = opts.Find(L'b') >= 0, u = opts.Find(L'u') >= 0, r = opts.Find(L'r') >= 0, cc = opts.Find(L'c') >= 0, it = opts.Find(L'i') >= 0, e = opts.Find(L'e') >= 0;
+            CString out; int n = text.GetLength();
+            for (int i = 0; i < n; ++i) {
+                wchar_t ch = text[i];
+                if (b && ch == 2) continue;
+                if (u && ch == 31) continue;
+                if (r && ch == 22) continue;
+                if (it && ch == 29) continue;
+                if (e && ch == 30) continue;
+                if (ch == 15) continue;   // reset code -- always stripped along with any of the above, it has no meaning once formatting codes are gone
+                if (cc && ch == 3) {   // color code: optional N[,N] digits follow
+                    int j = i + 1, digits = 0;
+                    while (j < n && iswdigit(text[j]) && digits < 2) { j++; digits++; }
+                    if (j < n && text[j] == L',' && digits > 0) { int j2 = j + 1, d2 = 0; while (j2 < n && iswdigit(text[j2]) && d2 < 2) { j2++; d2++; } if (d2 > 0) j = j2; }
+                    i = j - 1; continue;
+                }
+                out += ch;
+            }
+            val = out; return true;
+        }
+        if (name == L"sorttok" || name == L"sorttokcs") {   // $sorttok(list,C[,ncra]) -- default ASCII/alphabetical ascending; n=numeric, r=reverse, a=alphabetical(explicit); 'c' (channel-prefix sort) isn't supported, falls back to default
+            bool cs = (name == L"sorttokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c2 = a.Find(L','); if (c2 < 0) return false;
+            CString list = a.Left(c2); CString rest = a.Mid(c2 + 1);
+            int c3 = rest.Find(L','); CString cStr = c3 < 0 ? rest : rest.Left(c3);
+            CString opts = c3 < 0 ? CString() : rest.Mid(c3 + 1);
+            double cD; if (!ParseNum(cStr, cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            auto toks = SplitTok(list, delim);
+            bool numeric = opts.Find(L'n') >= 0, reverse = opts.Find(L'r') >= 0;
+            if (numeric) std::sort(toks.begin(), toks.end(), [](const CString& x, const CString& y) { double dx = 0, dy = 0; ParseNum(x, dx); ParseNum(y, dy); return dx < dy; });
+            else if (cs) std::sort(toks.begin(), toks.end(), [](const CString& x, const CString& y) { return wcscmp(x, y) < 0; });
+            else std::sort(toks.begin(), toks.end(), [](const CString& x, const CString& y) { return x.CompareNoCase(y) < 0; });
+            if (reverse) std::reverse(toks.begin(), toks.end());
+            val = JoinTok(toks, delim); return true;
+        }
+        if (name == L"matchtok" || name == L"matchtokcs") {   // $matchtok(list,substring,N,C) -- a PARTIAL (substring) match, unlike $findtok's exact match; N=0 returns the match count, N>0 returns the Nth matching TOKEN itself (not its position)
+            bool cs = (name == L"matchtokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c3 = a.ReverseFind(L','); if (c3 < 0) return false;
+            CString rest = a.Left(c3); double cD; if (!ParseNum(a.Mid(c3 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString sub = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            int matchCount = 0; CString foundTok;
+            for (auto& t : toks) {
+                bool matches = cs ? (t.Find(sub) >= 0) : ([&]{ CString h = t; h.MakeLower(); CString s2 = sub; s2.MakeLower(); return h.Find(s2) >= 0; }());
+                if (matches) { ++matchCount; if (N > 0 && matchCount == N) { foundTok = t; break; } }
+            }
+            if (N == 0) val.Format(L"%d", matchCount); else val = foundTok;
+            return true;
+        }
+        if (name == L"wildtok" || name == L"wildtokcs") {   // $wildtok(list,match,N,C) -- the Nth token matching a WILDCARD pattern (*,?); N=0 returns the match count
+            bool cs = (name == L"wildtokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c3 = a.ReverseFind(L','); if (c3 < 0) return false;
+            CString rest = a.Left(c3); double cD; if (!ParseNum(a.Mid(c3 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString pat = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            int matchCount = 0; CString foundTok;
+            for (auto& t : toks) if (GlobMatch(pat, t, cs)) { ++matchCount; if (N > 0 && matchCount == N) { foundTok = t; break; } }
+            if (N == 0) val.Format(L"%d", matchCount); else val = foundTok;
+            return true;
+        }
+        if (name == L"md5") {   // $md5(text) -- hex digest. Uses the multi-step BCryptCreateHash/HashData/FinishHash sequence rather than the simpler one-shot BCryptHash, which wasn't added until Windows 8 -- this project targets Windows 7 (_WIN32_WINNT=0x0601), and the multi-step calls have been available since Vista.
+            CString a = EvalIds(w, rawArgs, params);
+            CStringA utf8 = CW2A(a, CP_UTF8);
+            BCRYPT_ALG_HANDLE hAlg = nullptr; if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_MD5_ALGORITHM, nullptr, 0) != 0 || !hAlg) return false;
+            BYTE hash[16] = {}; bool ok = false;
+            ULONG objLen = 0, cb = 0;
+            if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0) == 0 && objLen > 0) {
+                std::vector<BYTE> obj(objLen);
+                BCRYPT_HASH_HANDLE hHash = nullptr;
+                if (BCryptCreateHash(hAlg, &hHash, obj.data(), objLen, nullptr, 0, 0) == 0 && hHash) {
+                    if (BCryptHashData(hHash, (PUCHAR)(LPCSTR)utf8, utf8.GetLength(), 0) == 0 && BCryptFinishHash(hHash, hash, 16, 0) == 0) ok = true;
+                    BCryptDestroyHash(hHash);
+                }
+            }
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            if (!ok) return false;
+            CString hex; for (int i = 0; i < 16; ++i) { CString b; b.Format(L"%02x", hash[i]); hex += b; }
+            val = hex; return true;
+        }
+        if (name == L"pos" || name == L"poscs") {   // $pos(text,substring[,N]) -- N defaults to 1; N=0 returns the total occurrence count instead of a position
+            bool cs = (name == L"poscs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c2 = a.ReverseFind(L','); CString nStr;
+            CString rest = a; bool hasN = false;
+            // N is optional, so the last comma might belong to it or might be the text/substring boundary -- try
+            // treating the last segment as N first; if it doesn't parse as a plain number, it must be part of
+            // substring/text instead (a substring itself containing a comma), so fall back to N=1.
+            if (c2 >= 0) { double testD; if (ParseNum(a.Mid(c2 + 1), testD)) { nStr = a.Mid(c2 + 1); rest = a.Left(c2); hasN = true; } }
+            int c1 = rest.Find(L','); if (c1 < 0) return false;
+            CString text = rest.Left(c1); CString sub = rest.Mid(c1 + 1);
+            if (sub.IsEmpty()) return false;
+            double nD = 1; if (hasN) ParseNum(nStr, nD); int N = (int)nD;
+            int matchCount = 0, foundPos = 0, pos = 0;
+            while (pos <= text.GetLength()) {
+                int f = cs ? text.Find(sub, pos) : [&]{ CString hay = text.Mid(pos); hay.MakeLower(); CString needle = sub; needle.MakeLower(); int r = hay.Find(needle); return r < 0 ? -1 : pos + r; }();
+                if (f < 0) break;
+                ++matchCount; if (N > 0 && matchCount == N) { foundPos = f + 1; break; }
+                pos = f + 1;   // overlapping occurrences count too, same as mIRC
+            }
+            if (N == 0) val.Format(L"%d", matchCount);
+            else if (foundPos > 0) val.Format(L"%d", foundPos);
+            else val.Empty();
+            return true;
+        }
+        if (name == L"count") {   // $count(string,substring[,substring2,...]) -- sums occurrence counts of every substring, case-insensitive, non-overlapping
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 2) return false;
+            const CString& text = p[0]; int total = 0;
+            for (size_t i = 1; i < p.size(); ++i) {
+                const CString& sub = p[i]; if (sub.IsEmpty()) continue;
+                int pos = 0;
+                while (pos <= text.GetLength()) {
+                    CString hay = text.Mid(pos); hay.MakeLower(); CString needle = sub; needle.MakeLower();
+                    int f = hay.Find(needle); if (f < 0) break;
+                    ++total; pos += f + sub.GetLength();
+                }
+            }
+            val.Format(L"%d", total); return true;
+        }
+        if (name == L"regex") {   // $regex([name],text,/pattern/flags) -- returns the number of matches; capture groups are stashed for $regml(name,N) to retrieve afterward. Supports the i (case-insensitive) and g (global -- all matches, not just the first) flags; the mIRC-specific F modifier (capture-group indexing mode) isn't implemented, groups are always indexed by their position in the pattern.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            CString matchName, text, patternRaw;
+            if (p.size() >= 3) { matchName = p[0]; text = p[1]; patternRaw = p[2]; for (size_t i = 3; i < p.size(); ++i) patternRaw += L"," + p[i]; }   // a pattern itself may legitimately contain commas
+            else if (p.size() == 2) { text = p[0]; patternRaw = p[1]; }
+            else return false;
+            if (patternRaw.GetLength() < 2 || patternRaw[0] != L'/') return false;   // must be /pattern/flags
+            int closeSlash = patternRaw.ReverseFind(L'/'); if (closeSlash <= 0) return false;
+            CString patBody = patternRaw.Mid(1, closeSlash - 1); CString flags = patternRaw.Mid(closeSlash + 1);
+            bool ci = flags.Find(L'i') >= 0, global = flags.Find(L'g') >= 0;
+            try {
+                auto reFlags = std::regex::ECMAScript; if (ci) reFlags |= std::regex::icase;
+                std::wregex re((LPCWSTR)patBody, reFlags);
+                std::wstring input((LPCWSTR)text);
+                std::vector<CString> groups; int matchCount = 0;
+                if (global) {
+                    auto begin = std::wsregex_iterator(input.begin(), input.end(), re);
+                    auto end = std::wsregex_iterator();
+                    for (auto it = begin; it != end; ++it) { ++matchCount; auto& m = *it; for (size_t g = 1; g < m.size(); ++g) groups.push_back(CString(m[g].str().c_str())); }
+                } else {
+                    std::wsmatch m;
+                    if (std::regex_search(input, m, re)) { matchCount = 1; for (size_t g = 1; g < m.size(); ++g) groups.push_back(CString(m[g].str().c_str())); }
+                }
+                StoreRegexResult(matchName, std::move(groups));
+                val.Format(L"%d", matchCount); return true;
+            } catch (std::regex_error&) { return false; }   // malformed pattern -- mIRC would set $regerrstr; not implemented here
+        }
+        if (name == L"regsub" || name == L"regsubex") {   // $regsub([name],input,/pattern/flags,subtext,%var) -- matches like $regex, replaces each match using subtext (which may reference capture groups as \1 \2 etc), writes the whole result into %var, and returns the number of matches. $regsubex's own extra \t/\n/\A markers in subtext aren't implemented -- otherwise identical to $regsub here. The &binvar output form isn't implemented, only %var.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 4) return false;
+            CString varName = p.back(); if (varName.Left(1) != L"%") return false;
+            CString subtext = p[p.size() - 2];
+            int remainingCount = (int)p.size() - 2;   // excludes %var and subtext
+            CString matchName, input, patternRaw;
+            if (remainingCount == 2) { input = p[0]; patternRaw = p[1]; }
+            else if (remainingCount >= 3) {
+                matchName = p[0]; input = p[1];
+                for (int i = 2; i < remainingCount; ++i) { if (i > 2) patternRaw += L","; patternRaw += p[i]; }
+            } else return false;
+            if (patternRaw.GetLength() < 2 || patternRaw[0] != L'/') return false;
+            int closeSlash = patternRaw.ReverseFind(L'/'); if (closeSlash <= 0) return false;
+            CString patBody = patternRaw.Mid(1, closeSlash - 1); CString flags = patternRaw.Mid(closeSlash + 1);
+            bool ci = flags.Find(L'i') >= 0, global = flags.Find(L'g') >= 0;
+            try {
+                auto reFlags = std::regex::ECMAScript; if (ci) reFlags |= std::regex::icase;
+                std::wregex re((LPCWSTR)patBody, reFlags);
+                std::wstring in((LPCWSTR)input);
+                std::vector<CString> groupsForRegml; int matchCount = 0;
+                auto applyBackrefs = [&](const std::wsmatch& m) {   // subtext's own \1 \2 etc -- NOT std::regex's own $1 $2 replacement syntax
+                    CString out; for (int i = 0; i < subtext.GetLength(); ++i) {
+                        if (subtext[i] == L'\\' && i + 1 < subtext.GetLength() && iswdigit(subtext[i + 1])) {
+                            int j = i + 1, gi = 0; while (j < subtext.GetLength() && iswdigit(subtext[j])) { gi = gi * 10 + (subtext[j] - L'0'); j++; }
+                            if (gi >= 0 && gi < (int)m.size()) out += CString(m[gi].str().c_str());
+                            i = j - 1;
+                        } else out += subtext[i];
+                    }
+                    return out;
+                };
+                CString result; size_t lastEnd = 0;
+                if (global) {
+                    auto begin = std::wsregex_iterator(in.begin(), in.end(), re);
+                    auto end = std::wsregex_iterator();
+                    for (auto it = begin; it != end; ++it) {
+                        ++matchCount; auto& m = *it;
+                        result += CString(in.substr(lastEnd, m.position(0) - lastEnd).c_str());
+                        result += applyBackrefs(m);
+                        lastEnd = m.position(0) + m.length(0);
+                        for (size_t g = 1; g < m.size(); ++g) groupsForRegml.push_back(CString(m[g].str().c_str()));
+                    }
+                    result += CString(in.substr(lastEnd).c_str());
+                } else {
+                    std::wsmatch m;
+                    if (std::regex_search(in, m, re)) {
+                        matchCount = 1;
+                        result += CString(in.substr(0, m.position(0)).c_str());
+                        result += applyBackrefs(m);
+                        result += CString(in.substr(m.position(0) + m.length(0)).c_str());
+                        for (size_t g = 1; g < m.size(); ++g) groupsForRegml.push_back(CString(m[g].str().c_str()));
+                    } else result = input;
+                }
+                StoreRegexResult(matchName, std::move(groupsForRegml));
+                StoreVar(varName, result, VarSw(), false);
+                val.Format(L"%d", matchCount); return true;
+            } catch (std::regex_error&) { return false; }
+        }
+        if (name == L"regml") {   // $regml([name],N) -- the Nth backreference from the last $regex (or $regsub/$regsubex) call under that name; N=0 returns the total backreference count. The optional trailing &binvar form (copy into a binary variable) isn't implemented.
+            CString a = EvalIds(w, rawArgs, params);
+            CString matchName, nStr;
+            int c = a.ReverseFind(L',');
+            if (c >= 0) { matchName = a.Left(c); nStr = a.Mid(c + 1); } else { nStr = a; }
+            CString key = matchName; key.MakeLower(); if (key.IsEmpty()) key = L"default";
+            auto it = m_regexResults.find(key);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            if (it == m_regexResults.end()) { val = N == 0 ? CString(L"0") : CString(); return true; }
+            if (N == 0) { val.Format(L"%d", (int)it->second.size()); return true; }
+            if (N < 1 || N > (int)it->second.size()) { val.Empty(); return true; }
+            val = it->second[N - 1]; return true;
+        }
+        if (name == L"encode" || name == L"decode") {   // $encode/$decode(text,flags[,key]) -- $encode's full real syntax covers Uuencode, Base32, Z85, and several encryption modes (CBC/ECB, salting, custom keys); this implements only its by-far most common real-world use, the 'm' (MIME/Base64) mode on plain text, via the Windows Crypto API's own base64 support rather than a hand-rolled codec. Any other flag combination isn't recognized.
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L','); if (c < 0) return false;
+            CString text = a.Left(c); CString flags = a.Mid(c + 1);
+            int c2 = flags.Find(L','); if (c2 >= 0) flags = flags.Left(c2);   // an optional trailing key parameter isn't used by plain 'm' mode
+            if (flags.Find(L'm') < 0) return false;
+            if (name == L"encode") {
+                CStringA utf8 = CW2A(text, CP_UTF8);
+                DWORD outLen = 0;
+                if (!CryptBinaryToStringA((const BYTE*)(LPCSTR)utf8, utf8.GetLength(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &outLen)) return false;
+                std::vector<char> buf(outLen + 1);
+                if (!CryptBinaryToStringA((const BYTE*)(LPCSTR)utf8, utf8.GetLength(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf.data(), &outLen)) return false;
+                val = CString(buf.data()); return true;
+            } else {
+                CStringA ascii = CW2A(text, CP_ACP);
+                DWORD outLen = 0;
+                if (!CryptStringToBinaryA((LPCSTR)ascii, ascii.GetLength(), CRYPT_STRING_BASE64, nullptr, &outLen, nullptr, nullptr)) return false;
+                std::vector<BYTE> buf(outLen);
+                if (!CryptStringToBinaryA((LPCSTR)ascii, ascii.GetLength(), CRYPT_STRING_BASE64, buf.data(), &outLen, nullptr, nullptr)) return false;
+                CStringA raw((LPCSTR)buf.data(), (int)outLen);   // decoded bytes are the original UTF-8 text
+                val = CA2W(raw, CP_UTF8); return true;
+            }
+        }
+        if (name == L"sha1" || name == L"sha256" || name == L"sha384" || name == L"sha512") {   // $shaN(text) -- hex digest, via the same BCrypt sequence as $md5
+            CString a = EvalIds(w, rawArgs, params);
+            CStringA utf8 = CW2A(a, CP_UTF8);
+            LPCWSTR algId = name == L"sha1" ? BCRYPT_SHA1_ALGORITHM : name == L"sha256" ? BCRYPT_SHA256_ALGORITHM : name == L"sha384" ? BCRYPT_SHA384_ALGORITHM : BCRYPT_SHA512_ALGORITHM;
+            int digestLen = name == L"sha1" ? 20 : name == L"sha256" ? 32 : name == L"sha384" ? 48 : 64;
+            BCRYPT_ALG_HANDLE hAlg = nullptr; if (BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, 0) != 0 || !hAlg) return false;
+            std::vector<BYTE> hash(digestLen); bool ok = false;
+            ULONG objLen = 0, cb = 0;
+            if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0) == 0 && objLen > 0) {
+                std::vector<BYTE> obj(objLen);
+                BCRYPT_HASH_HANDLE hHash = nullptr;
+                if (BCryptCreateHash(hAlg, &hHash, obj.data(), objLen, nullptr, 0, 0) == 0 && hHash) {
+                    if (BCryptHashData(hHash, (PUCHAR)(LPCSTR)utf8, utf8.GetLength(), 0) == 0 && BCryptFinishHash(hHash, hash.data(), digestLen, 0) == 0) ok = true;
+                    BCryptDestroyHash(hHash);
+                }
+            }
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            if (!ok) return false;
+            CString hex; for (int i = 0; i < digestLen; ++i) { CString b; b.Format(L"%02x", hash[i]); hex += b; }
+            val = hex; return true;
+        }
+        if (name == L"len") { val.Format(L"%d", EvalIds(w, rawArgs, params).GetLength()); return true; }
+        if (name == L"upper" || name == L"lower") { CString a = EvalIds(w, rawArgs, params); if (name == L"upper") a.MakeUpper(); else a.MakeLower(); val = a; return true; }
+        if (name == L"asc") { CString a = EvalIds(w, rawArgs, params); if (a.IsEmpty()) return false; val.Format(L"%d", (int)(wchar_t)a[0]); return true; }
+        if (name == L"and" || name == L"or" || name == L"xor") {   // bitwise, treating both operands as signed 32-bit
+            CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L','); if (c < 0) return false;
+            double n1, n2; if (!ParseNum(a.Left(c), n1) || !ParseNum(a.Mid(c + 1), n2)) return false;
+            long x = (long)n1, y = (long)n2;
+            long r = (name == L"and") ? (x & y) : (name == L"or") ? (x | y) : (x ^ y);
+            val.Format(L"%ld", r); return true;
+        }
+        if (name == L"not") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false; val.Format(L"%u", (unsigned)~(long)x); return true; }
+        if (name == L"biton" || name == L"bitoff" || name == L"isbit") {   // $biton/$bitoff(A,N) -- set/clear the Nth bit (1 = least significant); $isbit(A,N) -- 1 if it's set, else 0
+            CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L','); if (c < 0) return false;
+            double aD, nD; if (!ParseNum(a.Left(c), aD) || !ParseNum(a.Mid(c + 1), nD)) return false;
+            unsigned long A = (unsigned long)aD; int N = (int)nD; if (N < 1 || N > 32) return false;
+            unsigned long mask = 1UL << (N - 1);
+            if (name == L"biton") val.Format(L"%lu", A | mask);
+            else if (name == L"bitoff") val.Format(L"%lu", A & ~mask);
+            else val = (A & mask) ? L"1" : L"0";
+            return true;
+        }
+        if (name == L"isalias") { CString a = EvalIds(w, rawArgs, params); bool found = false; for (auto& al : m_aliases) if (al.name.CompareNoCase(a) == 0) { found = true; break; } if (!found) for (auto& al : m_remoteAliases) if (al.name.CompareNoCase(a) == 0) { found = true; break; } val = found ? L"$true" : L"$false"; return true; }
+        if (name == L"islower" || name == L"isupper") {   // true if the text has at least one letter and none of its letters are the opposite case
+            CString a = EvalIds(w, rawArgs, params); bool anyLetter = false, ok = true;
+            for (int i = 0; i < a.GetLength(); ++i) { wchar_t c = a[i]; if (!iswalpha(c)) continue; anyLetter = true; if (name == L"islower" ? !!iswupper(c) : !!iswlower(c)) { ok = false; break; } }
+            val = (anyLetter && ok) ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"base") {   // $base(N,inBase,outBase[,zeropad]) -- integer base conversion, bases 2-36; fractional precision handling (mIRC's 5th parameter) isn't implemented
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 3) return false;
+            double inBaseD, outBaseD; if (!ParseNum(p[1], inBaseD) || !ParseNum(p[2], outBaseD)) return false;
+            int inBase = (int)inBaseD, outBase = (int)outBaseD; if (inBase < 2 || inBase > 36 || outBase < 2 || outBase > 36) return false;
+            CString nStr = p[0]; nStr.Trim(); bool neg = false; if (!nStr.IsEmpty() && nStr[0] == L'-') { neg = true; nStr = nStr.Mid(1); }
+            if (nStr.Left(2).CompareNoCase(L"0x") == 0 && inBase == 16) nStr = nStr.Mid(2);   // mIRC accepts an 0x prefix for hex input
+            unsigned __int64 value = 0;
+            for (int i = 0; i < nStr.GetLength(); ++i) {
+                wchar_t ch = nStr[i]; int digit;
+                if (ch >= L'0' && ch <= L'9') digit = ch - L'0';
+                else if (ch >= L'a' && ch <= L'z') digit = ch - L'a' + 10;
+                else if (ch >= L'A' && ch <= L'Z') digit = ch - L'A' + 10;
+                else continue;   // mIRC treats any other character's value the same way it would appear in base36, but skipping non-alnum keeps this simple and safe
+                if (digit >= inBase) continue;
+                value = value * inBase + digit;
+            }
+            CString out; if (value == 0) out = L"0";
+            else { while (value > 0) { int d = (int)(value % outBase); out = CString((wchar_t)(d < 10 ? L'0' + d : L'A' + d - 10)) + out; value /= outBase; } }
+            int zeroPad = 0; if (p.size() > 3) { double zp; if (ParseNum(p[3], zp)) zeroPad = (int)zp; }
+            while (out.GetLength() < zeroPad) out = L"0" + out;
+            if (neg) out = L"-" + out;
+            val = out; return true;
+        }
+        if (name == L"ord") {   // $ord(N) -- appends st/nd/rd/th as appropriate; 11/12/13 are always "th" regardless of what they end in
+            CString a = EvalIds(w, rawArgs, params); double nD; if (!ParseNum(a, nD)) return false;
+            long long n = (long long)(nD < 0 ? -nD : nD);
+            long long last2 = n % 100, last1 = n % 10;
+            CString suffix = (last2 >= 11 && last2 <= 13) ? L"th" : (last1 == 1) ? L"st" : (last1 == 2) ? L"nd" : (last1 == 3) ? L"rd" : L"th";
+            val = a + suffix; return true;
+        }
+        if (name == L"noqt") {   // $noqt(text) -- removes one leading double-quote and one trailing double-quote, each only if present there; the reverse of $qt
+            CString a = EvalIds(w, rawArgs, params);
+            if (!a.IsEmpty() && a[a.GetLength() - 1] == L'"') a = a.Left(a.GetLength() - 1);
+            if (!a.IsEmpty() && a[0] == L'"') a = a.Mid(1);
+            val = a; return true;
+        }
+        if (name == L"nopath") {   // $nopath(filename) -- the filename with any leading path stripped
+            CString a = EvalIds(w, rawArgs, params);
+            int s = a.ReverseFind(L'\\'); if (s < 0) s = a.ReverseFind(L'/');
+            val = s >= 0 ? a.Mid(s + 1) : a; return true;
+        }
+        if (name == L"mknickfn") {   // $mknickfn(nickname) -- strips characters that aren't valid in a Windows filename
+            CString a = EvalIds(w, rawArgs, params);
+            CString out; for (int i = 0; i < a.GetLength(); ++i) { wchar_t c = a[i]; if (!wcschr(L"\\/:*?\"<>|", c) && c >= 32) out += c; }
+            val = out; return true;
+        }
+        if (name == L"samepath") {   // $samepath(path1,path2) -- $true if both resolve to the same file/folder on disk; relative paths are resolved against the current directory, matching GetFullPathName's own behaviour
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.ReverseFind(L','); if (c < 0) return false;
+            CString p1 = a.Left(c), p2 = a.Mid(c + 1);
+            wchar_t full1[MAX_PATH], full2[MAX_PATH];
+            if (!GetFullPathNameW(p1, MAX_PATH, full1, nullptr) || !GetFullPathNameW(p2, MAX_PATH, full2, nullptr)) return false;
+            val = (_wcsicmp(full1, full2) == 0) ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"input") {   // $input(prompt,options,window,title,text) -- a simplified version of a feature-rich mIRC dialog: this always shows a plain text editbox (the by-far most common real use), returning the typed text on OK or $null on Cancel. The o/y/r (Yes/No/Retry-style, returning $true/$false) and p (password masking) variants, and the timeout-related switches, aren't implemented.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.empty() || p[0].IsEmpty()) return false;
+            CString title = p.size() > 3 && !p[3].IsEmpty() ? p[3] : CString(L"Input");
+            CString text = p.size() > 4 ? p[4] : CString();
+            CPromptDlg dlg(text, title, p[0], this);
+            if (dlg.DoModal() == IDOK) val = text; else val.Empty();
+            return true;
+        }
+        if (name == L"qt") {   // $qt(text) -- adds a double-quote at the start if one isn't already there, and likewise at the end, independently
+            CString a = EvalIds(w, rawArgs, params);
+            if (a.IsEmpty() || a[0] != L'"') a = L"\"" + a;
+            if (a.IsEmpty() || a[a.GetLength() - 1] != L'"') a += L"\"";
+            val = a; return true;
+        }
+        if (name == L"rgb") {   // $rgb(R,G,B) -> single 24-bit number (mIRC packs it as B,G,R internally); $rgb(N) -> "R,G,B" text. System-color-name form isn't implemented.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() == 3) {
+                double r, g, b; if (!ParseNum(p[0], r) || !ParseNum(p[1], g) || !ParseNum(p[2], b)) return false;
+                int ri = (int)r & 0xFF, gi = (int)g & 0xFF, bi = (int)b & 0xFF;
+                val.Format(L"%d", bi << 16 | gi << 8 | ri); return true;
+            } else if (p.size() == 1) {
+                double nD; if (!ParseNum(p[0], nD)) return false; unsigned long n = (unsigned long)nD;
+                val.Format(L"%d,%d,%d", (int)(n & 0xFF), (int)((n >> 8) & 0xFF), (int)((n >> 16) & 0xFF)); return true;
+            }
+            return false;
+        }
+        if (name == L"eval") {   // $eval(text,N) -- evaluates text N times total. The common case is N=2, for deferring evaluation of a dynamically-built identifier/variable name by one extra pass.
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.ReverseFind(L','); if (c < 0) return false;
+            CString text = a.Left(c); double nD; if (!ParseNum(a.Mid(c + 1), nD)) return false; int N = (int)nD;
+            for (int i = 1; i < N && i < 20; ++i) text = EvalIds(w, text, params);   // text has already been evaluated once above (that's evaluation #1), so N-1 more passes; capped well under any realistic use to avoid a runaway loop on bad input
+            val = text; return true;
+        }
+        if (name == L"evalnext") { val = EvalIds(w, EvalIds(w, rawArgs, params), params); return true; }   // same as $eval(text,2)
+        if (name == L"pi") { val = FmtNum(3.14159265358979323846); return true; }
+        // $mircexe/$mircdir/$mircini/$script/$scriptdir are bare (no-parens) identifiers in real mIRC, so they
+        // belong in IdentValue, not here -- see the ones right next to $ircdir/$ircexe/$ircini there.
+        if (name == L"fopen") {   // $fopen(name/N)[.fname/.pos/.eof/.err] -- .bom (encoding detection) isn't implemented; .eof/.err report the same last-global-operation state as the bare $feof/$ferr, not anything specific to this one handle
+            CString a = EvalIds(w, rawArgs, params);
+            FileHandleEntry* h = nullptr; double nD;
+            if (ParseNum(a, nD)) { int N = (int)nD; if (N >= 1 && N <= (int)m_fileHandles.size()) h = &m_fileHandles[N - 1]; }
+            else h = FindFileHandle(a);
+            if (!h) { val.Empty(); return true; }
+            if (prop == L"fname") val = h->filename;
+            else if (prop == L"pos") val.Format(L"%d", h->file ? (int)h->file->GetPosition() : 0);
+            else if (prop == L"eof") val = m_lastFileEof ? L"1" : L"0";
+            else if (prop == L"err") val = m_lastFileErr ? L"1" : L"0";
+            else val = h->name;
+            return true;
+        }
+        if (name == L"fread") {   // $fread(name/N) -- the next CRLF-delimited line, advancing the handle's own read position; the &binvar byte-count form isn't implemented (this client has no binary-variable system)
+            CString a = EvalIds(w, rawArgs, params);
+            FileHandleEntry* h = nullptr; double nD;
+            if (ParseNum(a, nD)) { int N = (int)nD; if (N >= 1 && N <= (int)m_fileHandles.size()) h = &m_fileHandles[N - 1]; }
+            else h = FindFileHandle(a);
+            if (!h || !h->file) { m_lastFileErr = true; val.Empty(); return true; }
+            CString line;
+            if (!h->file->ReadString(line)) { m_lastFileEof = true; val.Empty(); return true; }
+            m_lastFileEof = false; m_lastFileErr = false; val = line; return true;
+        }
+        if (name == L"fgetc") {   // $fgetc(name/N) -- the next single character from the file, advancing the handle's own read position
+            CString a = EvalIds(w, rawArgs, params);
+            FileHandleEntry* h = nullptr; double nD;
+            if (ParseNum(a, nD)) { int N = (int)nD; if (N >= 1 && N <= (int)m_fileHandles.size()) h = &m_fileHandles[N - 1]; }
+            else h = FindFileHandle(a);
+            if (!h || !h->file) { m_lastFileErr = true; val.Empty(); return true; }
+            char ch;
+            if (h->file->Read(&ch, 1) == 0) { m_lastFileEof = true; val.Empty(); return true; }
+            m_lastFileEof = false; m_lastFileErr = false;
+            val = CString((wchar_t)(unsigned char)ch); return true;
+        }
+        if (name == L"hget") {
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L',');
+            if (c < 0) {   // single-arg form: $hget(name) -- table name if it exists; $hget(N) -- the Nth table's name, N=0 is the total table count
+                double nD;
+                if (ParseNum(a, nD)) {
+                    int N = (int)nD;
+                    if (N == 0) { val.Format(L"%d", (int)m_hashTables.size()); return true; }
+                    if (N < 1 || N > (int)m_hashTables.size()) { val.Empty(); return true; }
+                    if (prop == L"size") val.Format(L"%d", m_hashTables[N - 1].size); else val = m_hashTables[N - 1].name;
+                    return true;
+                }
+                HashTableEntry* t = FindHashTable(a);
+                if (!t) { val.Empty(); return true; }
+                if (prop == L"size") val.Format(L"%d", t->size); else val = t->name;
+                return true;
+            }
+            // two-arg form: $hget(name,item) returns that item's data (item is a literal key, looked up by name,
+            // not a position) -- except $hget(name,0), which returns the item count instead; with a .item
+            // property and a positive N, the second argument is instead a 1-based POSITION, and the result is
+            // that item's key name rather than its data (matches mIRC's own documented $hget(table,N).item form).
+            CString tname = a.Left(c); CString second = a.Mid(c + 1);
+            HashTableEntry* t = FindHashTable(tname);
+            if (!t) { val.Empty(); return true; }
+            double nD; bool isNum = ParseNum(second, nD);
+            if (isNum && (int)nD == 0) { val.Format(L"%d", (int)t->items.size()); return true; }
+            if (prop == L"item" && isNum) {
+                int N = (int)nD;
+                if (N < 1 || N > (int)t->items.size()) { val.Empty(); return true; }
+                val = t->items[N - 1].first; return true;
+            }
+            for (auto& kv : t->items) if (kv.first.CompareNoCase(second) == 0) { val = kv.second; return true; }
+            val.Empty(); return true;
+        }
+        if (name == L"hfind") {   // $hfind(name,text,N[,type]) -- type: w=wildcard match (default), s=plain substring match; searches item NAMES; N=0 returns the match count, N>0 returns the Nth matching item's name
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c2 = a.Find(L',', start); if (c2 < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c2 - start)); start = c2 + 1; } }
+            if (p.size() < 3) return false;
+            HashTableEntry* t = FindHashTable(p[0]);
+            if (!t) { val.Empty(); return true; }
+            CString text = p[1]; double nD; if (!ParseNum(p[2], nD)) return false; int N = (int)nD;
+            CString type = p.size() > 3 ? p[3] : CString(L"w"); type.MakeLower();
+            int matchCount = 0; CString foundName;
+            for (auto& kv : t->items) {
+                bool matches = (type.Find(L's') >= 0) ? (kv.first.Find(text) >= 0) : GlobMatch(text, kv.first);
+                if (matches) { ++matchCount; if (N > 0 && matchCount == N) { foundName = kv.first; break; } }
+            }
+            if (N == 0) val.Format(L"%d", matchCount); else val = foundName;
+            return true;
+        }
+        if (name == L"bytes") {   // $bytes(N[,bkmgtp][,3])[.suf] -- formats a byte count; without a unit letter, picks the largest unit where the value is still >= 1. The 'd'/'e' scientific-notation input and the "3-digit" precision mode aren't implemented -- this always shows up to 2 decimal places.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.empty()) return false;
+            double n; if (!ParseNum(p[0], n)) return false;
+            CString opts = p.size() > 1 ? p[1] : CString(); opts.MakeLower();
+            static const wchar_t* units[] = { L"B", L"KB", L"MB", L"GB", L"TB", L"PB" };
+            int unitIdx = -1;
+            if (opts.Find(L'b') >= 0) unitIdx = 0; else if (opts.Find(L'k') >= 0) unitIdx = 1; else if (opts.Find(L'm') >= 0) unitIdx = 2;
+            else if (opts.Find(L'g') >= 0) unitIdx = 3; else if (opts.Find(L't') >= 0) unitIdx = 4; else if (opts.Find(L'p') >= 0) unitIdx = 5;
+            double v = n;
+            if (unitIdx < 0) { unitIdx = 0; while (fabs(v) >= 1024.0 && unitIdx < 5) { v /= 1024.0; unitIdx++; } }
+            else for (int i = 0; i < unitIdx; ++i) v /= 1024.0;
+            CString numStr = FmtNum(unitIdx == 0 ? v : (double)((__int64)(v * 100 + 0.5)) / 100.0);   // whole bytes stay exact; other units get up to 2 decimals
+            val = numStr + (prop == L"suf" ? CString(units[unitIdx]) : CString());
+            return true;
+        }
+        if (name == L"iptype") {   // $iptype(text) -- "ipv4"/"ipv6" if text is a valid address in that format, else empty. The .compress/.expand IPv6 properties aren't implemented.
+            CString a = EvalIds(w, rawArgs, params);
+            IN_ADDR a4; IN6_ADDR a6;
+            if (InetPtonW(AF_INET, a, &a4) == 1) val = L"ipv4";
+            else if (InetPtonW(AF_INET6, a, &a6) == 1) val = L"ipv6";
+            else val.Empty();
+            return true;
+        }
+        if (name == L"longip") {   // $longip(ip) -- dotted IPv4 -> its 32-bit integer form, or the reverse if given a number
+            CString a = EvalIds(w, rawArgs, params);
+            double nD;
+            if (ParseNum(a, nD) && a.Find(L'.') < 0) {   // a plain number (no dots) -> convert back to dotted form
+                unsigned long v = (unsigned long)nD;
+                IN_ADDR addr; addr.S_un.S_addr = htonl(v);
+                wchar_t buf[64]; if (InetNtopW(AF_INET, &addr, buf, 64)) val = buf; else return false;
+                return true;
+            }
+            IN_ADDR addr;
+            if (InetPtonW(AF_INET, a, &addr) != 1) return false;
+            val.Format(L"%lu", ntohl(addr.S_un.S_addr)); return true;
+        }
+        if (name == L"envvar") {   // $envvar(name|N)[.name/.value] -- N=0 returns the total count
+            CString a = EvalIds(w, rawArgs, params);
+            double nD;
+            if (ParseNum(a, nD)) {
+                int N = (int)nD;
+                LPWCH block = ::GetEnvironmentStringsW();
+                if (!block) { val.Empty(); return true; }
+                std::vector<std::pair<CString, CString>> vars;
+                for (LPWCH p = block; *p; ) {
+                    CString entry = p;
+                    if (entry[0] != L'=') {   // a few pseudo-vars (like "=C:") start with '=' and aren't real named variables
+                        int eq = entry.Find(L'=');
+                        if (eq > 0) vars.push_back({ entry.Left(eq), entry.Mid(eq + 1) });
+                    }
+                    p += entry.GetLength() + 1;
+                }
+                ::FreeEnvironmentStringsW(block);
+                if (N == 0) { val.Format(L"%d", (int)vars.size()); return true; }
+                if (N < 1 || N > (int)vars.size()) { val.Empty(); return true; }
+                if (prop == L"value") val = vars[N - 1].second; else val = vars[N - 1].first;
+                return true;
+            }
+            wchar_t buf[4096]; DWORD len = ::GetEnvironmentVariableW(a, buf, 4096);
+            if (len == 0 || len >= 4096) { val.Empty(); return true; }
+            val = (prop == L"name") ? a : buf;
+            return true;
+        }
+        if (name == L"isutf") {   // $isutf(text) -- 0/1/2 as mIRC documents; this client stores strings as proper Unicode already, not raw bytes, so there's no real "invalid UTF8 byte sequence" case to detect the way original mIRC can on its legacy byte-string storage -- this instead reports 1 (plain text) for pure-ASCII input and 2 (contains UTF8-worthy content) for anything with non-ASCII characters, which is the closest meaningful equivalent given how this client actually stores text
+            CString a = EvalIds(w, rawArgs, params);
+            bool hasNonAscii = false; for (int i = 0; i < a.GetLength(); ++i) if ((unsigned)a[i] > 127) { hasNonAscii = true; break; }
+            val = hasNonAscii ? L"2" : L"1"; return true;
+        }
+        if (name == L"utfencode") {   // $utfencode(text) -- UTF-8-encodes text, then represents each resulting byte as one character (0-255) in the returned string, matching mIRC's own legacy "UTF8 bytes stuffed into a byte-string" convention
+            CString a = EvalIds(w, rawArgs, params);
+            CStringA utf8 = CW2A(a, CP_UTF8);
+            CString out; for (int i = 0; i < utf8.GetLength(); ++i) out += (wchar_t)(unsigned char)utf8[i];
+            val = out; return true;
+        }
+        if (name == L"utfdecode") {   // the reverse of $utfencode -- treats each character of text as one raw byte (0-255), reassembles the byte sequence, and UTF-8-decodes it back into a proper string
+            CString a = EvalIds(w, rawArgs, params);
+            CStringA bytes; for (int i = 0; i < a.GetLength(); ++i) bytes += (char)(unsigned char)(a[i] & 0xFF);
+            val = CA2W(bytes, CP_UTF8); return true;
+        }
+        if (name == L"send" || name == L"get") {   // $send(N/nick[,N2])[.property] | $get(...) -- info about an active DCC Send/Get transfer. Properties: file, path, pc (percent complete), rcvd (bytes so far), cps (bytes/sec), secs (elapsed), done, ip, status. .cid/.hwnd/.wid aren't implemented (this client has no separate numeric connection-id or window-id concept distinct from the session itself).
+            DccSession::Kind wantKind = (name == L"send") ? DccSession::SEND : DccSession::GET;
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L',');
+            CString primary = c < 0 ? a : a.Left(c);
+            double n2D = 0; bool haveN2 = false;
+            if (c >= 0) { if (ParseNum(a.Mid(c + 1), n2D)) haveN2 = true; }
+            DccSession* found = nullptr;
+            double nD;
+            if (ParseNum(primary, nD)) {
+                int N = (int)nD, idx = 0;
+                for (auto& s : m_dcc) if (s->kind == wantKind) { ++idx; if (idx == N) { found = s.get(); break; } }
+            } else {
+                int matchIdx = haveN2 ? (int)n2D : 1, count = 0;
+                for (auto& s : m_dcc) if (s->kind == wantKind && s->nick.CompareNoCase(primary) == 0) { ++count; if (count == matchIdx) { found = s.get(); break; } }
+            }
+            if (!found) { val.Empty(); return true; }
+            CString p = prop; p.MakeLower();
+            if (p == L"file") val = found->filename;
+            else if (p == L"path") val = found->localPath;
+            else if (p == L"pc") val.Format(L"%d", found->fileSize > 0 ? (int)(found->bytesDone * 100 / found->fileSize) : 0);
+            else if (p == L"rcvd") val.Format(L"%I64u", found->bytesDone);
+            else if (p == L"cps") { ULONGLONG elapsedMs = ::GetTickCount64() - found->startTick; val.Format(L"%I64u", elapsedMs > 0 ? found->bytesDone * 1000 / elapsedMs : 0); }
+            else if (p == L"secs") val.Format(L"%I64u", (::GetTickCount64() - found->startTick) / 1000);
+            else if (p == L"done") val = found->state == DccSession::DONE ? L"$true" : L"$false";
+            else if (p == L"ip") val = found->address;
+            else if (p == L"status") val = found->state == DccSession::ACTIVE ? L"active" : found->state == DccSession::DONE ? L"done" : found->state == DccSession::FAILED ? L"failed" : L"waiting";
+            else val = found->nick;
+            return true;
+        }
+        if (name == L"group") {   // $group(N/name)[.status/.name/.fname] -- N=0 returns the total group count. .fname isn't implemented: group state here isn't tracked per-source-file, so there's no filename to report.
+            CString a = EvalIds(w, rawArgs, params);
+            const GroupState* g = nullptr;
+            double nD;
+            if (ParseNum(a, nD)) {
+                int N = (int)nD;
+                if (N == 0) { val.Format(L"%d", (int)m_groups.size()); return true; }
+                if (N >= 1 && N <= (int)m_groups.size()) g = &m_groups[N - 1];
+            } else {
+                CString gname = a; if (gname.Left(1) == L"#") gname = gname.Mid(1);
+                for (auto& gs : m_groups) if (gs.name.CompareNoCase(gname) == 0) { g = &gs; break; }
+            }
+            if (!g) { val.Empty(); return true; }
+            if (prop == L"status") val = g->enabled ? L"on" : L"off";
+            else if (prop == L"fname") val.Empty();
+            else val = L"#" + g->name;
+            return true;
+        }
+        if (name == L"hotp" || name == L"totp") {   // $hotp(key,counter[,hash][,digits]) | $totp(key[,time][,hash][,digits][,timestep]) -- RFC 4226/6238. key is auto-detected as hex (40/64/128 hex chars), Base32 (16/26/32 chars, the common Google-Authenticator-secret case), or otherwise treated as plain text; the explicit 'encoding' parameter some implementations also accept isn't implemented, only the auto-detection.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.empty()) return false;
+            CString keyStr = p[0];
+            CString keyNoSpaces = keyStr; keyNoSpaces.Remove(L' ');
+            int klen = keyNoSpaces.GetLength();
+            bool allHex = klen > 0; for (int i = 0; i < klen && allHex; ++i) if (!iswxdigit(keyNoSpaces[i])) allHex = false;
+            bool isHex = allHex && (klen == 40 || klen == 64 || klen == 128);
+            bool allB32 = false;
+            if (!isHex) { allB32 = klen > 0; for (int i = 0; i < klen && allB32; ++i) { wchar_t c = towupper(keyNoSpaces[i]); if (!((c >= L'A' && c <= L'Z') || (c >= L'2' && c <= L'7'))) allB32 = false; } }
+            bool isB32 = allB32 && (klen == 16 || klen == 26 || klen == 32);
+            std::vector<BYTE> keyBytes;
+            if (isHex) { for (int i = 0; i + 1 < klen; i += 2) keyBytes.push_back((BYTE)wcstol(keyNoSpaces.Mid(i, 2), nullptr, 16)); }
+            else if (isB32) keyBytes = Base32Decode(keyNoSpaces);
+            else { CStringA utf8 = CW2A(keyStr, CP_UTF8); keyBytes.assign((const BYTE*)utf8.GetString(), (const BYTE*)utf8.GetString() + utf8.GetLength()); }
+            double counterOrTime = 0; CString hashAlg = L"sha1"; int digits = 6, timestep = 30;
+            if (name == L"hotp") {
+                if (p.size() < 2 || !ParseNum(p[1], counterOrTime)) return false;
+                if (p.size() > 2 && !p[2].IsEmpty()) hashAlg = p[2];
+                if (p.size() > 3) { double d; if (ParseNum(p[3], d)) digits = (int)d; }
+            } else {
+                double timeVal;
+                if (p.size() > 1 && !p[1].IsEmpty()) { if (!ParseNum(p[1], timeVal)) return false; } else timeVal = (double)time(nullptr);
+                if (p.size() > 2 && !p[2].IsEmpty()) hashAlg = p[2];
+                if (p.size() > 3) { double d; if (ParseNum(p[3], d)) digits = (int)d; }
+                if (p.size() > 4) { double ts; if (ParseNum(p[4], ts) && ts > 0) timestep = (int)ts; }
+                counterOrTime = floor(timeVal / timestep);
+            }
+            if (digits < 1 || digits > 10) digits = 6;
+            hashAlg.MakeLower();
+            LPCWSTR algId = hashAlg == L"sha256" ? BCRYPT_SHA256_ALGORITHM : hashAlg == L"sha384" ? BCRYPT_SHA384_ALGORITHM : hashAlg == L"sha512" ? BCRYPT_SHA512_ALGORITHM : hashAlg == L"md5" ? BCRYPT_MD5_ALGORITHM : BCRYPT_SHA1_ALGORITHM;
+            unsigned __int64 counter64 = (unsigned __int64)counterOrTime;
+            BYTE counterBytes[8]; for (int i = 7; i >= 0; --i) { counterBytes[i] = (BYTE)(counter64 & 0xFF); counter64 >>= 8; }
+            std::vector<BYTE> hmacResult;
+            if (!HmacCompute(algId, keyBytes, counterBytes, 8, hmacResult) || hmacResult.empty()) return false;
+            int offset = hmacResult.back() & 0x0F;
+            if (offset + 4 > (int)hmacResult.size()) return false;
+            unsigned int binCode = ((hmacResult[offset] & 0x7F) << 24) | ((hmacResult[offset + 1] & 0xFF) << 16) | ((hmacResult[offset + 2] & 0xFF) << 8) | (hmacResult[offset + 3] & 0xFF);
+            unsigned int mod = 1; for (int i = 0; i < digits; ++i) mod *= 10;
+            unsigned int code = binCode % mod;
+            CString fmt; fmt.Format(L"%%0%dd", digits);
+            val.Format(fmt, code);
+            return true;
+        }
+        if (name == L"rand") {   // $rand(N,M) -- a random integer between N and M inclusive, in either order
+            CString a = EvalIds(w, rawArgs, params); int c = a.Find(L','); if (c < 0) return false;
+            double n1, n2; if (!ParseNum(a.Left(c), n1) || !ParseNum(a.Mid(c + 1), n2)) return false;
+            __int64 lo = (__int64)(n1 < n2 ? n1 : n2), hi = (__int64)(n1 < n2 ? n2 : n1);
+            __int64 span = hi - lo + 1; if (span <= 0) { val.Format(L"%I64d", lo); return true; }
+            __int64 r = ((__int64)rand() << 32 | (unsigned)rand()) % span; if (r < 0) r += span;
+            val.Format(L"%I64d", lo + r); return true;
+        }
+        if (name == L"replace" || name == L"replacecs") {   // $replace(text,old1,new1[,old2,new2,...]) -- pairs applied in sequence, each seeing the previous pair's result
+            bool cs = (name == L"replacecs");
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 3 || (p.size() - 1) % 2 != 0) return false;
+            CString text = p[0];
+            for (size_t i = 1; i + 1 < p.size(); i += 2) {
+                const CString& oldS = p[i]; const CString& newS = p[i + 1];
+                if (oldS.IsEmpty()) continue;
+                CString rebuilt; int pos = 0;
+                while (pos < text.GetLength()) {
+                    int f = cs ? text.Find(oldS, pos) : [&]{ CString hay = text.Mid(pos); hay.MakeLower(); CString needle = oldS; needle.MakeLower(); int r = hay.Find(needle); return r < 0 ? -1 : pos + r; }();
+                    if (f < 0) { rebuilt += text.Mid(pos); break; }
+                    rebuilt += text.Mid(pos, f - pos); rebuilt += newS; pos = f + oldS.GetLength();
+                }
+                text = rebuilt;
+            }
+            val = text; return true;
+        }
+        if (name == L"remove" || name == L"removecs") {   // $remove(string,sub1[,sub2,...]) -- each substring removed in turn from the result of the previous removal
+            bool cs = (name == L"removecs");
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 2) return false;
+            CString text = p[0];
+            for (size_t i = 1; i < p.size(); ++i) {
+                const CString& sub = p[i]; if (sub.IsEmpty()) continue;
+                CString rebuilt; int pos = 0;
+                while (pos < text.GetLength()) {
+                    int f = cs ? text.Find(sub, pos) : [&]{ CString hay = text.Mid(pos); hay.MakeLower(); CString needle = sub; needle.MakeLower(); int r = hay.Find(needle); return r < 0 ? -1 : pos + r; }();
+                    if (f < 0) { rebuilt += text.Mid(pos); break; }
+                    rebuilt += text.Mid(pos, f - pos); pos = f + sub.GetLength();
+                }
+                text = rebuilt;
+            }
+            val = text; return true;
+        }
+        // The $xxxtok family all share the same trailing shape: list is everything before a known, fixed number
+        // of final comma-separated parameters (N, C, etc) -- splitting from the RIGHT, by exactly that many
+        // commas, is what keeps this safe even when the list itself happens to contain commas.
+        if (name == L"gettok") {   // $gettok(list,N,C) -- N: a single index (negative counts from the end), "N-M" or open-ended "N-" range, or 0 for the total token count (same as $numtok)
+            CString a = EvalIds(w, rawArgs, params);
+            int c2 = a.ReverseFind(L','); if (c2 < 0) return false;
+            CString cStr = a.Mid(c2 + 1); CString rest = a.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString nStr = rest.Mid(c1 + 1); nStr.Trim(); CString list = rest.Left(c1);
+            double cD; if (!ParseNum(cStr, cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            auto toks = SplitTok(list, delim);
+            if (nStr == L"0") { val.Format(L"%d", (int)toks.size()); return true; }
+            int dash = nStr.Find(L'-', nStr[0] == L'-' ? 1 : 0);   // skip a leading minus sign itself when looking for a range dash
+            if (dash > 0) {
+                CString afterDash = nStr.Mid(dash + 1);
+                double n1D; if (!ParseNum(nStr.Left(dash), n1D)) return false;
+                int i1 = TokIndex((int)n1D, toks.size());
+                int i2;
+                if (afterDash.IsEmpty()) i2 = (int)toks.size() - 1;   // open-ended "N-": from the Nth token to the last one
+                else { double n2D; if (!ParseNum(afterDash, n2D)) return false; i2 = TokIndex((int)n2D, toks.size()); }
+                if (i1 < 0 || i2 < 0) { val.Empty(); return true; }
+                if (i1 > i2) { int t = i1; i1 = i2; i2 = t; }
+                CString out; for (int i = i1; i <= i2; ++i) { if (i > i1) out += delim; out += toks[i]; }
+                val = out; return true;
+            }
+            double nD; if (!ParseNum(nStr, nD)) return false;
+            int idx = TokIndex((int)nD, toks.size());
+            val = idx < 0 ? CString() : toks[idx]; return true;
+        }
+        if (name == L"numtok") {   // $numtok(list,C)
+            CString a = EvalIds(w, rawArgs, params);
+            int c1 = a.ReverseFind(L','); if (c1 < 0) return false;
+            double cD; if (!ParseNum(a.Mid(c1 + 1), cD)) return false;
+            val.Format(L"%d", (int)SplitTok(a.Left(c1), (wchar_t)(int)cD).size()); return true;
+        }
+        if (name == L"istok" || name == L"istokcs") {   // $istok(list,token,C) -> $true/$false
+            bool cs = (name == L"istokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c2 = a.ReverseFind(L','); if (c2 < 0) return false;
+            CString rest = a.Left(c2); double cD; if (!ParseNum(a.Mid(c2 + 1), cD)) return false;
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), (wchar_t)(int)cD);
+            bool found = false; for (auto& t : toks) if (cs ? (t == tok) : (t.CompareNoCase(tok) == 0)) { found = true; break; }
+            val = found ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"findtok" || name == L"findtokcs") {   // $findtok(list,token,N,C) -- position of the Nth matching token
+            bool cs = (name == L"findtokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c3 = a.ReverseFind(L','); if (c3 < 0) return false;
+            CString rest = a.Left(c3); double cD; if (!ParseNum(a.Mid(c3 + 1), cD)) return false;
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), (wchar_t)(int)cD);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;   // N=0: return the total number of matching tokens, not a position
+            int matchCount = 0, foundPos = 0;
+            for (size_t i = 0; i < toks.size(); ++i) if (cs ? (toks[i] == tok) : (toks[i].CompareNoCase(tok) == 0)) { ++matchCount; if (N > 0 && matchCount == N) { foundPos = (int)i + 1; break; } }
+            val.Format(L"%d", N == 0 ? matchCount : foundPos); return true;
+        }
+        if (name == L"addtok" || name == L"addtokcs") {   // $addtok(list,token,C) -- adds only if not already present
+            bool cs = (name == L"addtokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c2 = a.ReverseFind(L','); if (c2 < 0) return false;
+            CString rest = a.Left(c2); double cD; if (!ParseNum(a.Mid(c2 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            if (tok.IsEmpty()) { val = JoinTok(toks, delim); return true; }
+            bool exists = false; for (auto& t : toks) if (cs ? (t == tok) : (t.CompareNoCase(tok) == 0)) { exists = true; break; }
+            if (!exists) toks.push_back(tok);
+            val = JoinTok(toks, delim); return true;
+        }
+        if (name == L"deltok") {   // $deltok(list,N-N2,C) -- deletes the Nth token, or a range
+            CString a = EvalIds(w, rawArgs, params);
+            int c2 = a.ReverseFind(L','); if (c2 < 0) return false;
+            CString rest = a.Left(c2); double cD; if (!ParseNum(a.Mid(c2 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString nStr = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            int dash = nStr.Find(L'-', nStr[0] == L'-' ? 1 : 0);
+            int i1, i2;
+            if (dash > 0) {
+                double n1D, n2D; if (!ParseNum(nStr.Left(dash), n1D) || !ParseNum(nStr.Mid(dash + 1), n2D)) return false;
+                i1 = TokIndex((int)n1D, toks.size()); i2 = TokIndex((int)n2D, toks.size());
+            } else { double nD; if (!ParseNum(nStr, nD)) return false; i1 = i2 = TokIndex((int)nD, toks.size()); }
+            if (i1 < 0 || i2 < 0) { val = JoinTok(toks, delim); return true; }
+            if (i1 > i2) { int t = i1; i1 = i2; i2 = t; }
+            toks.erase(toks.begin() + i1, toks.begin() + i2 + 1);
+            val = JoinTok(toks, delim); return true;
+        }
+        if (name == L"puttok") {   // $puttok(list,data,N,C) -- overwrites the Nth token
+            CString a = EvalIds(w, rawArgs, params);
+            int c3 = a.ReverseFind(L','); if (c3 < 0) return false;
+            CString rest = a.Left(c3); double cD; if (!ParseNum(a.Mid(c3 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString data = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            double nD; if (!ParseNum(nStr, nD)) return false; int idx = TokIndex((int)nD, toks.size());
+            if (idx < 0) { val = JoinTok(toks, delim); return true; }
+            toks[idx] = data; val = JoinTok(toks, delim); return true;
+        }
+        if (name == L"remtok" || name == L"remtokcs") {   // $remtok(list,token,N,C) -- removes the Nth MATCHING token (N=0: all matches)
+            bool cs = (name == L"remtokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c3 = a.ReverseFind(L','); if (c3 < 0) return false;
+            CString rest = a.Left(c3); double cD; if (!ParseNum(a.Mid(c3 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            std::vector<CString> outv; int matchCount = 0;
+            for (auto& t : toks) {
+                bool matches = cs ? (t == tok) : (t.CompareNoCase(tok) == 0);
+                if (matches) { ++matchCount; if (N == 0 || matchCount == N) continue; }
+                outv.push_back(t);
+            }
+            val = JoinTok(outv, delim); return true;
+        }
+        if (name == L"reptok" || name == L"reptokcs") {   // $reptok(list,token,new,N,C) -- replaces the Nth MATCHING token (N=0: all matches)
+            bool cs = (name == L"reptokcs");
+            CString a = EvalIds(w, rawArgs, params);
+            int c4 = a.ReverseFind(L','); if (c4 < 0) return false;
+            CString rest = a.Left(c4); double cD; if (!ParseNum(a.Mid(c4 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c3 = rest.ReverseFind(L','); if (c3 < 0) return false;
+            CString nStr = rest.Mid(c3 + 1); rest = rest.Left(c3);
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString newTok = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            int matchCount = 0;
+            for (auto& t : toks) {
+                bool matches = cs ? (t == tok) : (t.CompareNoCase(tok) == 0);
+                if (matches) { ++matchCount; if (N == 0 || matchCount == N) t = newTok; }
+            }
+            val = JoinTok(toks, delim); return true;
+        }
         if (name == L"tip") {   // $tip(name,title,text[,delay,iconfn,iconpos,alias,wid]) creates/replaces a tip; $tip(name/N) queries one
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> parts; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { parts.push_back(a.Mid(start)); break; } parts.push_back(a.Mid(start, c - start)); start = c + 1; } }
@@ -6400,6 +7529,102 @@ class CMainFrame : public CMDIFrameWnd {
             val = FormatMircDate(t, L"HH:nn:ss");
             return true;
         }
+        if (name == L"didwm" || name == L"didreg") {   // $didwm(id,wildcard[,N]) | $didwm(name,id,wildcard[,N]) -- the line number of the first item/line matching, searching from line N (default 1) onward; $didreg is the same with a regex instead of a wildcard. Returns 0 if nothing matches.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> fields; { CString s = a; int start = 0; while (start <= s.GetLength()) { int c = s.Find(L',', start); CString piece = c < 0 ? s.Mid(start) : s.Mid(start, c - start); piece.Trim(); fields.push_back(piece); if (c < 0) break; start = c + 1; } }
+            double tmp; bool firstIsNum = !fields.empty() && ParseNum(fields[0], tmp);
+            CString dlgName; int ctrlId = 0; CString pat; int startLine = 1;
+            if (firstIsNum) {
+                if (fields.size() < 2) return false;
+                dlgName = m_curDlgName; ctrlId = (int)tmp; pat = fields[1];
+                if (fields.size() >= 3) { double nd; if (ParseNum(fields[2], nd)) startLine = (int)nd; }
+            } else {
+                if (fields.size() < 3) return false;
+                dlgName = fields[0]; double idd; if (!ParseNum(fields[1], idd)) return false; ctrlId = (int)idd; pat = fields[2];
+                if (fields.size() >= 4) { double nd; if (ParseNum(fields[3], nd)) startLine = (int)nd; }
+            }
+            if (startLine < 1) startLine = 1;
+            CCustomDialogWnd* dw = dlgName.IsEmpty() ? m_curDlgWnd : FindOpenDialog(dlgName);
+            if (!dw) { val.Empty(); return true; }
+            CString kind = dw->CtrlKind(ctrlId);
+            std::vector<CString> items;
+            if (kind == L"list" || kind == L"combo") {
+                UINT getCountMsg = kind == L"list" ? LB_GETCOUNT : CB_GETCOUNT;
+                UINT getLenMsg = kind == L"list" ? LB_GETTEXTLEN : CB_GETLBTEXTLEN, getTextMsg = kind == L"list" ? LB_GETTEXT : CB_GETLBTEXT;
+                int count = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), getCountMsg, 0, 0);
+                for (int i = 0; i < count; ++i) {
+                    int bufLen = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), getLenMsg, i, 0);
+                    if (bufLen < 0) { items.push_back(CString()); continue; }
+                    std::vector<wchar_t> buf(bufLen + 1);
+                    dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), getTextMsg, i, (LPARAM)buf.data());
+                    items.push_back(CString(buf.data()));
+                }
+            } else {
+                int count = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_GETLINECOUNT, 0, 0);
+                for (int i = 0; i < count; ++i) {
+                    int charIdx = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_LINEINDEX, i, 0);
+                    if (charIdx < 0) { items.push_back(CString()); continue; }
+                    int lineLen = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_LINELENGTH, charIdx, 0);
+                    std::vector<wchar_t> buf(lineLen + 2); *(WORD*)buf.data() = (WORD)(lineLen + 1);
+                    int got = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_GETLINE, i, (LPARAM)buf.data());
+                    items.push_back(CString(buf.data(), got));
+                }
+            }
+            val = L"0";
+            if (name == L"didwm") {
+                for (int i = startLine - 1; i < (int)items.size(); ++i) if (GlobMatch(pat, items[i])) { val.Format(L"%d", i + 1); break; }
+            } else {
+                try {
+                    std::wregex re((LPCWSTR)pat);
+                    for (int i = startLine - 1; i < (int)items.size(); ++i) if (std::regex_search((LPCWSTR)items[i], re)) { val.Format(L"%d", i + 1); break; }
+                } catch (std::regex_error&) { return false; }
+            }
+            return true;
+        }
+        if (name == L"didtok") {   // $didtok(id,C) | $didtok(name,id,C) -- a tokenized list of every item in a combo/list box's items, or every line of a multi-line edit box; name optional only within an on DIALOG event's own script, same convention as $did
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> fields; { CString s = a; int start = 0; while (start <= s.GetLength()) { int c = s.Find(L',', start); CString piece = c < 0 ? s.Mid(start) : s.Mid(start, c - start); piece.Trim(); fields.push_back(piece); if (c < 0) break; start = c + 1; } }
+            double tmp; bool firstIsNum = !fields.empty() && ParseNum(fields[0], tmp);
+            CString dlgName; int ctrlId = 0; double cD;
+            if (firstIsNum) {
+                if (fields.size() < 2) return false;
+                dlgName = m_curDlgName; ctrlId = (int)tmp;
+                if (!ParseNum(fields[1], cD)) return false;
+            } else {
+                if (fields.size() < 3) return false;
+                dlgName = fields[0]; double idd; if (!ParseNum(fields[1], idd)) return false; ctrlId = (int)idd;
+                if (!ParseNum(fields[2], cD)) return false;
+            }
+            wchar_t delim = (wchar_t)(int)cD;
+            CCustomDialogWnd* dw = dlgName.IsEmpty() ? m_curDlgWnd : FindOpenDialog(dlgName);
+            if (!dw) { val.Empty(); return true; }
+            CString kind = dw->CtrlKind(ctrlId);
+            std::vector<CString> items;
+            if (kind == L"list" || kind == L"combo") {
+                UINT getCountMsg = kind == L"list" ? LB_GETCOUNT : CB_GETCOUNT;
+                UINT getLenMsg = kind == L"list" ? LB_GETTEXTLEN : CB_GETLBTEXTLEN, getTextMsg = kind == L"list" ? LB_GETTEXT : CB_GETLBTEXT;
+                int count = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), getCountMsg, 0, 0);
+                for (int i = 0; i < count; ++i) {
+                    int bufLen = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), getLenMsg, i, 0);
+                    if (bufLen < 0) continue;
+                    std::vector<wchar_t> buf(bufLen + 1);
+                    dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), getTextMsg, i, (LPARAM)buf.data());
+                    items.push_back(CString(buf.data()));
+                }
+            } else {   // multi-line edit box: every line
+                int count = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_GETLINECOUNT, 0, 0);
+                for (int i = 0; i < count; ++i) {
+                    int charIdx = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_LINEINDEX, i, 0);
+                    if (charIdx < 0) continue;
+                    int lineLen = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_LINELENGTH, charIdx, 0);
+                    std::vector<wchar_t> buf(lineLen + 2); *(WORD*)buf.data() = (WORD)(lineLen + 1);
+                    int got = (int)dw->SendDlgItemMessage(dw->CtrlIdOf(ctrlId), EM_GETLINE, i, (LPARAM)buf.data());
+                    items.push_back(CString(buf.data(), got));
+                }
+            }
+            val = JoinTok(items, delim);
+            return true;
+        }
         if (name == L"did") {   // $did(id) | $did(id,N) | $did(name,id) | $did(name,id,N) -- name optional only within an on DIALOG event's own script, where it defaults to the dialog currently running it
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> fields; { CString s = a; int start = 0; while (start <= s.GetLength()) { int c = s.Find(L',', start); CString piece = c < 0 ? s.Mid(start) : s.Mid(start, c - start); piece.Trim(); fields.push_back(piece); if (c < 0) break; start = c + 1; } }
@@ -6644,6 +7869,33 @@ class CMainFrame : public CMDIFrameWnd {
             else if (prop == L"anysc") val = cw->m_cwAnysc ? L"$true" : L"$false";
             else if (prop == L"lb") val = cw->m_cwListMode ? L"1" : L"0";
             else val = cw->m_name;   // default: the name itself
+            return true;
+        }
+        if (name == L"fline") {   // $fline(win,expr,N,T,S)[.text] -- the Nth line matching expr (wildcard by default); T: 1=search the side-listbox instead of the main lines, 2=expr is a regex, 3=both; S=an optional starting line number. N=0 returns the match count. Same scope as $line/$sline: only works on a custom @window, since that's the only window type this client keeps as a plain line array rather than RTF content.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 3) return false;
+            CString wn = p[0]; wn.Trim();
+            CString expr = p[1];
+            double nD; if (!ParseNum(p[2], nD)) return false; int N = (int)nD;
+            int T = 0; if (p.size() > 3) { double tD; if (ParseNum(p[3], tD)) T = (int)tD; }
+            int S = 1; if (p.size() > 4) { double sD; if (ParseNum(p[4], sD) && sD >= 1) S = (int)sD; }
+            CChatWnd* cw = Find(nullptr, wn);
+            if (!cw || !cw->m_custom) { val.Empty(); m_flinen = 0; return true; }
+            bool useRegex = (T == 2 || T == 3);
+            auto& lines = cw->m_cwLines;   // this client has no separate side-listbox line array from the main lines, so T's "search the listbox instead" distinction (T=1/3) isn't modeled -- every T value searches the same m_cwLines
+            int matchCount = 0, foundLine = 0; CString foundText;
+            try {
+                std::wregex re; if (useRegex) re = std::wregex((LPCWSTR)expr);
+                for (int i = S - 1; i < (int)lines.size(); ++i) {
+                    bool matches = useRegex ? std::regex_search((LPCWSTR)lines[i], re) : GlobMatch(expr, lines[i]);
+                    if (matches) { ++matchCount; if (N > 0 && matchCount == N) { foundLine = i + 1; foundText = lines[i]; break; } }
+                }
+            } catch (std::regex_error&) { return false; }
+            if (N == 0) { val.Format(L"%d", matchCount); m_flinen = 0; return true; }
+            m_flinen = foundLine;
+            if (foundLine == 0) { val.Empty(); return true; }
+            val = (prop == L"text") ? foundText : CString(std::to_wstring(foundLine).c_str());
             return true;
         }
         if (name == L"line" || name == L"sline") {   // $line(@name,N) / $sline(@name,N): .state .color for $line; .ln for $sline
@@ -7695,7 +8947,8 @@ class CMainFrame : public CMDIFrameWnd {
             if (!eff.dbu) {
                 auto cvtW = [&](int v) { return MulDiv(v, 4, duW); }; auto cvtH = [&](int v) { return MulDiv(v, 8, duH); };
                 eff.sw = cvtW(eff.sw); eff.sh = cvtH(eff.sh);
-                for (auto& c : eff.controls) {
+
+				for (auto& c : eff.controls) {
                     c.x = cvtW(c.x); c.y = cvtH(c.y); c.w = cvtW(c.w); c.h = cvtH(c.h);
                     // Rounding to the nearest DBU (MulDiv's own behaviour) can still lose a fractional pixel here
                     // and there -- usually invisible, but a "text" label sized exactly to its own text, with no
@@ -7715,6 +8968,7 @@ class CMainFrame : public CMDIFrameWnd {
                     if (c.kind == L"text") c.w += 10;
                     else if (c.kind == L"radio" || c.kind == L"check") c.w += 6;
                 }
+			
             } else {
                 // eff.sx/eff.sy are used later only for the SetWindowPos screen-position call below, which wants
                 // real pixels -- the opposite direction from the template conversion just above, since a DBU
@@ -8146,7 +9400,15 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"echo") {   // /echo [color] [-switches] [-c color name] [#channel|nick] <text>  (local only: never sent to the server)
             CString a = arg; a.Trim();
             int colorNum = -1;
-            { CString tmp = a; CString first = Word(tmp); if (!first.IsEmpty() && IsAllDigits(first)) { colorNum = _wtoi(first); a = tmp; } }
+            // Only a leading number that's actually a VALID color code (0-98, matching MircColor's own range) is
+            // consumed as one -- anything else purely numeric (a phone number, a year, any other number the user
+            // just wants echoed as their message text) was previously being silently swallowed here and vanishing
+            // entirely, since it got treated as "the color number" and stripped out, leaving nothing left to
+            // actually display. 
+			//mIRC have same bug with echo too!  
+            { CString tmp = a; CString first = Word(tmp);
+              if (!first.IsEmpty() && IsAllDigits(first)) { int n = _wtoi(first); if (n >= 0 && n <= 98) { colorNum = n; a = tmp; } } }
+            ///{ CString tmp = a; CString first = Word(tmp); if (!first.IsEmpty() && IsAllDigits(first)) { colorNum = _wtoi(first); a = tmp; } }
             bool eFlag = false, hFlag = false, tFlag = false, sFlag = false, aFlagSw = false, qFlag = false, lFlag = false,
                  bFlag = false, fFlag = false, nFlag = false, gFlag = false, cFlag = false;
             int indentN = 0;
@@ -8495,6 +9757,112 @@ class CMainFrame : public CMDIFrameWnd {
             if (a.IsEmpty()) Show(w, L"* Usage: /remove [-b] <filename>", cPart);
             else if (bin) { SHFILEOPSTRUCTW op = {}; CString z = a + CString(L'\0'); op.wFunc = FO_DELETE; op.pFrom = z; op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT; SHFileOperationW(&op); }
             else if (!DeleteFileW(a)) Show(w, L"* /remove: couldn't delete " + a, cPart);
+        }
+        else if (cmd == L"hmake") {   // /hmake [-s] <name> [N] -- N (bucket count) is accepted and reported back via $hget(table).size but otherwise purely cosmetic, see the HashTableEntry comment
+            CString a = arg; bool showMsg = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L's') >= 0) showMsg = true; }
+            CString tname = Word(a);
+            if (tname.IsEmpty()) Show(w, L"* /hmake: insufficient parameters", cPart);
+            else if (FindHashTable(tname)) Show(w, L"* /hmake: table '" + tname + L"' already exists", cPart);
+            else {
+                HashTableEntry t; t.name = tname;
+                CString nStr = Word(a); double nD; if (!nStr.IsEmpty() && ParseNum(nStr, nD) && nD > 0) t.size = (int)nD;
+                m_hashTables.push_back(t);
+                if (showMsg) Show(w, L"* /hmake: created hash table '" + tname + L"', " + CString(std::to_wstring(t.size).c_str()) + L" buckets", cPart);
+            }
+        }
+        else if (cmd == L"hfree") {   // /hfree [-sw] <name> -- -w treats <name> as a wildcard, freeing every matching table
+            CString a = arg; bool showMsg = false, wild = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L's') >= 0) showMsg = true; if (sw.Find(L'w') >= 0) wild = true; }
+            CString pat = Word(a);
+            if (pat.IsEmpty()) { Show(w, L"* /hfree: insufficient parameters", cPart); }
+            else if (wild) {
+                int removed = 0;
+                m_hashTables.erase(std::remove_if(m_hashTables.begin(), m_hashTables.end(), [&](const HashTableEntry& t) { if (GlobMatch(pat, t.name)) { ++removed; return true; } return false; }), m_hashTables.end());
+                if (showMsg) Show(w, L"* /hfree: freed " + CString(std::to_wstring(removed).c_str()) + L" table(s)", cPart);
+            } else {
+                auto it = std::find_if(m_hashTables.begin(), m_hashTables.end(), [&](const HashTableEntry& t) { return t.name.CompareNoCase(pat) == 0; });
+                if (it == m_hashTables.end()) { Show(w, L"* /hfree: table '" + pat + L"' doesn't exist", cPart); m_halt = true; }   // a non-wildcard /hfree on a missing table is a halting error, matching real mIRC
+                else { m_hashTables.erase(it); if (showMsg) Show(w, L"* /hfree: freed table '" + pat + L"'", cPart); }
+            }
+        }
+        else if (cmd == L"hadd") {   // /hadd [-m[N]] <name> <item> [data]
+            CString a = arg; bool makeIfMissing = false; int makeSize = 100;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                int mPos = sw.Find(L'm');
+                if (mPos >= 0) { makeIfMissing = true; CString numPart = sw.Mid(mPos + 1); double nD; if (!numPart.IsEmpty() && ParseNum(numPart, nD) && nD > 0) makeSize = (int)nD; }
+            }
+            CString tname = Word(a); CString item = Word(a); CString data = a;   // whatever remains is the data, spaces and all
+            if (tname.IsEmpty() || item.IsEmpty()) { Show(w, L"* /hadd: insufficient parameters", cPart); }
+            else {
+                HashTableEntry* t = FindHashTable(tname);
+                if (!t) {
+                    if (!makeIfMissing) { Show(w, L"* /hadd: table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
+                    HashTableEntry nt; nt.name = tname; nt.size = makeSize; m_hashTables.push_back(nt); t = &m_hashTables.back();
+                }
+                bool found = false;
+                for (auto& kv : t->items) if (kv.first.CompareNoCase(item) == 0) { kv.second = data; found = true; break; }
+                if (!found) t->items.push_back({ item, data });
+            }
+        }
+        else if (cmd == L"hdel") {   // /hdel [-sw] <name> <item> -- -w treats <item> as a wildcard, deleting every matching item in that table
+            CString a = arg; bool showMsg = false, wild = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L's') >= 0) showMsg = true; if (sw.Find(L'w') >= 0) wild = true; }
+            CString tname = Word(a); CString item = Word(a);
+            HashTableEntry* t = FindHashTable(tname);
+            if (!t) { Show(w, L"* /hdel: table '" + tname + L"' doesn't exist", cPart); m_halt = true; }
+            else if (item.IsEmpty()) { Show(w, L"* /hdel: insufficient parameters", cPart); }
+            else if (wild) {
+                int removed = 0;
+                t->items.erase(std::remove_if(t->items.begin(), t->items.end(), [&](const std::pair<CString, CString>& kv) { if (GlobMatch(item, kv.first)) { ++removed; return true; } return false; }), t->items.end());
+                if (showMsg) Show(w, L"* /hdel: removed " + CString(std::to_wstring(removed).c_str()) + L" item(s)", cPart);
+            } else {
+                auto it = std::find_if(t->items.begin(), t->items.end(), [&](const std::pair<CString, CString>& kv) { return kv.first.CompareNoCase(item) == 0; });
+                if (it != t->items.end()) { t->items.erase(it); if (showMsg) Show(w, L"* /hdel: removed item '" + item + L"'", cPart); }
+                // deleting a non-existent single item (no -w) is quietly a no-op in real mIRC too, unlike a missing table
+            }
+        }
+        else if (cmd == L"fopen") {   // /fopen [-nox] <handle> <filename> -- -x (exclusive access) is accepted but not distinguished from the default (this app always opens shared read/write already)
+            CString a = arg; bool createNew = false, overwrite = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'n') >= 0) createNew = true; if (sw.Find(L'o') >= 0) overwrite = true; }
+            CString hname = Word(a); CString fname = a; fname.Trim();
+            if (hname.IsEmpty() || fname.IsEmpty()) { Show(w, L"* /fopen: insufficient parameters", cPart); return; }
+            if (FindFileHandle(hname)) { Show(w, L"* /fopen: handle '" + hname + L"' already in use", cPart); return; }
+            bool exists = PathExistsFn(fname);
+            UINT mode;
+            if (overwrite) mode = CFile::modeCreate | CFile::modeReadWrite | CFile::shareDenyNone;
+            else if (createNew) {
+                if (exists) { m_lastFileErr = true; Show(w, L"* /fopen: '" + fname + L"' already exists", cPart); return; }
+                mode = CFile::modeCreate | CFile::modeReadWrite | CFile::shareDenyNone;
+            } else {
+                if (!exists) { m_lastFileErr = true; Show(w, L"* /fopen: '" + fname + L"' doesn't exist", cPart); return; }
+                mode = CFile::modeReadWrite | CFile::shareDenyNone;
+            }
+            CStdioFile* f = new CStdioFile();
+            CFileException fe;
+            if (!f->Open(fname, mode, &fe)) { delete f; m_lastFileErr = true; Show(w, L"* /fopen: couldn't open '" + fname + L"'", cPart); return; }
+            FileHandleEntry h; h.name = hname; h.filename = fname; h.file = f;
+            m_fileHandles.push_back(h);
+            m_lastFileErr = false; m_lastFileEof = false;
+        }
+        else if (cmd == L"fclose") {   // /fclose <handle | wildcard>
+            CString pat = Word(arg);
+            if (pat.IsEmpty()) { Show(w, L"* /fclose: insufficient parameters", cPart); return; }
+            m_fileHandles.erase(std::remove_if(m_fileHandles.begin(), m_fileHandles.end(), [&](FileHandleEntry& h) { if (GlobMatch(pat, h.name)) { CloseFileHandle(h); return true; } return false; }), m_fileHandles.end());
+        }
+        else if (cmd == L"fwrite") {   // /fwrite [-n] <handle> <text> -- -n appends a CRLF after the text, for writing successive lines
+            CString a = arg; bool addCrlf = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'n') >= 0) addCrlf = true; }
+            CString hname = Word(a); CString text = a;
+            FileHandleEntry* h = FindFileHandle(hname);
+            if (!h || !h->file) { m_lastFileErr = true; Show(w, L"* /fwrite: handle '" + hname + L"' doesn't exist", cPart); return; }
+            try {
+                CStringA utf8 = CW2A(text, CP_UTF8);
+                h->file->Write((LPCSTR)utf8, utf8.GetLength());
+                if (addCrlf) h->file->Write("\r\n", 2);
+                m_lastFileErr = false;
+            } catch (CFileException* fe) { fe->Delete(); m_lastFileErr = true; Show(w, L"* /fwrite: write error on '" + hname + L"'", cPart); }
         }
         else if (cmd == L"rename") {
             CString a = arg; bool force = false;
