@@ -361,10 +361,40 @@ static unsigned __int64 Crc64Of(const unsigned char* data, size_t len) {   // EC
     for (size_t i = 0; i < len; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     return ~crc;
 }
-static std::vector<CString> ReadAllLinesOf(const CString& path) {
-    std::vector<CString> lines; CStdioFile f;
-    if (f.Open(path, CFile::modeRead | CFile::typeText)) { CString ln; while (f.ReadString(ln)) lines.push_back(ln); }
+static std::vector<CString> SplitLinesRobust(const CString& text) {
+    // Splits on any of the three line-ending conventions a real-world script file might use: \r\n (Windows), \n
+    // (Unix), or a bare \r alone (old Mac-style -- rare, but real: a loose .mrc someone's been carrying around for
+    // years can easily have picked this up from whatever last saved it). Without handling the bare-\r case, a file
+    // using it reads as a single giant line with every intended line break sitting inside it as plain, inert
+    // text -- which is exactly what every downstream parser (events, aliases, menu blocks, popups) then silently
+    // fails to recognize as separate lines at all.
+    std::vector<CString> lines; CString cur;
+    int n = text.GetLength();
+    for (int i = 0; i < n; i++) {
+        wchar_t c = text[i];
+        if (c == L'\r') {
+            lines.push_back(cur); cur.Empty();
+            if (i + 1 < n && text[i + 1] == L'\n') i++;   // \r\n counts as one line break, not two
+        } else if (c == L'\n') {
+            lines.push_back(cur); cur.Empty();
+        } else cur += c;
+    }
+    lines.push_back(cur);
+    while (!lines.empty() && lines.back().IsEmpty()) lines.pop_back();   // drop the trailing blank line left by a final line break
     return lines;
+}
+static std::vector<CString> ReadAllLinesOf(const CString& path) {
+    // Reads the file exactly as before (same CFile::typeText mode, same encoding handling -- unchanged, since
+    // that part isn't known to be broken) but assembles every ReadString() result into one string and runs it
+    // through SplitLinesRobust, rather than trusting ReadString's own line breaks directly. ReadString only
+    // recognizes \n (Windows text-mode translation already collapses \r\n to \n before it sees it), so a file
+    // using bare \r line endings alone comes back from ReadString as a single giant "line" with every intended
+    // break sitting inside it as inert text; re-splitting with SplitLinesRobust catches that case too.
+    CStdioFile f;
+    if (!f.Open(path, CFile::modeRead | CFile::typeText)) return {};
+    CString all; CString ln;
+    while (f.ReadString(ln)) { all += ln; all += L'\n'; }
+    return SplitLinesRobust(all);
 }
 // ---- Multi-file script/alias/vars/users loading (File > Load... / Unload, /load, /unload; IRC.ini's own
 // [afiles]/[rfiles]/[pfiles] sections list which files are currently loaded, exactly matching real mIRC's own
@@ -2852,19 +2882,6 @@ static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos,
 // Splits text into lines without stopping early at a blank line, unlike the CString::Tokenize loops used elsewhere
 // in this file (those treat an empty token as "done"), which the Script Editor's Popups tab specifically needs
 // since it uses blank lines as spacing between sections.
-static std::vector<CString> SplitLinesRobust(const CString& text) {
-    std::vector<CString> lines; int pos = 0;
-    for (;;) {
-        int nl = text.Find(L'\n', pos);
-        CString piece = nl < 0 ? text.Mid(pos) : text.Mid(pos, nl - pos);
-        piece.TrimRight(L'\r');
-        lines.push_back(piece);
-        if (nl < 0) break;
-        pos = nl + 1;
-    }
-    while (!lines.empty() && lines.back().IsEmpty()) lines.pop_back();   // drop the trailing blank line left by a final \r\n
-    return lines;
-}
 class CAliasDlg : public CDialog {
     CString& val; std::vector<WORD> t; int cnt = 0;
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
@@ -2907,6 +2924,7 @@ enum {   // this dialog's own control/menu ids -- kept separate from (and define
     IDC_SE_TABALIASES = 3900, IDC_SE_TABPOPUPS, IDC_SE_TABVARS, IDC_SE_TABREMOTE, IDC_SE_TABUSERS,
     IDC_SE_EDITALIASES, IDC_SE_EDITPOPUPS, IDC_SE_EDITVARS, IDC_SE_EDITREMOTE, IDC_SE_EDITUSERS,
     IDC_SE_STATUSFILE, IDC_SE_STATUSPOS, IDM_SE_SAVE, IDM_SE_UNDO, IDM_SE_CUT, IDM_SE_COPY, IDM_SE_PASTE, IDM_SE_SELALL, IDM_SE_ABOUT,
+    IDM_SE_LOAD, IDM_SE_UNLOAD,
     IDM_SE_VIEWFILE0 = 3950   // ..+49: one id per file in the current tab's "View" menu (switching which loaded file it's showing) -- up to 50 files per category, comfortably more than anyone will ever load
 };
 class CScriptEditorDlg : public CDialog {
@@ -2970,6 +2988,8 @@ public:
     std::function<void(const CString&)> onSavePopups;   // popups keep their own single-call save -- that category's multi-file model (one file per section) isn't part of this switchable-list mechanism
     std::function<CString(const CString& path, const CString& kind)> onReadFile;          // kind: "aliases"/"remote"/"users"/"variables"
     std::function<void(const CString& path, const CString& text, const CString& kind)> onWriteFile;
+    std::function<bool(const CString& path, const CString& kind)> onLoadFile;             // File > Load...: registers path in the right list on the CMainFrame side too (IRC.ini's [afiles]/[rfiles]) and reloads; returns false on failure
+    std::function<void(const CString& path, const CString& kind)> onUnloadFile;           // File > Unload: removes path from the CMainFrame-side list and reloads
 
     CScriptEditorDlg(CWnd* parent) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
@@ -3025,6 +3045,9 @@ public:
         CDialog::OnInitDialog();
         m_menu = new CMenu(); m_menu->CreateMenu();
         CMenu file; file.CreatePopupMenu();
+        file.AppendMenu(MF_STRING, IDM_SE_LOAD, L"&Load...");
+        file.AppendMenu(MF_STRING, IDM_SE_UNLOAD, L"&Unload");
+        file.AppendMenu(MF_SEPARATOR);
         file.AppendMenu(MF_STRING, IDM_SE_SAVE, L"&Save this tab");
         file.AppendMenu(MF_SEPARATOR);
         file.AppendMenu(MF_STRING, IDOK, L"&Close (save all)");
@@ -3043,6 +3066,13 @@ public:
         help.AppendMenu(MF_STRING, IDM_SE_ABOUT, L"&About the Scripts Editor");
         m_menu->AppendMenu(MF_POPUP, (UINT_PTR)help.Detach(), L"&Help");
         SetMenu(m_menu);
+        // Plain (non-rich) edit controls default to roughly a 30,000-character limit unless raised explicitly.
+        // A script like a multi-hundred-line remote .mrc file, especially one full of colour-code-heavy ASCII
+        // art, routinely runs well past that -- SetDlgItemText below would silently truncate it to fit, and once
+        // a control is sitting at its limit it simply refuses any further keystrokes typed into it, which looks
+        // exactly like the box being uneditable even though nothing else is actually wrong with it.
+        for (int id : { IDC_SE_EDITALIASES, IDC_SE_EDITPOPUPS, IDC_SE_EDITREMOTE, IDC_SE_EDITVARS, IDC_SE_EDITUSERS })
+            SendDlgItemMessage(id, EM_SETLIMITTEXT, 0, 0);   // 0 = the maximum a plain edit control supports
         SetDlgItemText(IDC_SE_EDITALIASES, aliasText);
         SetDlgItemText(IDC_SE_EDITPOPUPS, popupText);
         SetDlgItemText(IDC_SE_EDITREMOTE, remoteText);
@@ -3070,12 +3100,15 @@ public:
         if (path.IsEmpty() || !text || !onWriteFile) return;
         onWriteFile(path, *text, KindForTab(tab));
     }
-    afx_msg void OnViewFile(UINT id) {
-        int idx = (int)id - IDM_SE_VIEWFILE0;
+    // The shared "make the current tab show a different already-listed file" operation -- used by clicking an
+    // entry in the View menu, and by Load.../Unload once they've updated the list itself. saveOld controls
+    // whether whatever's currently in the box gets stashed and written back to its own file first: yes when
+    // switching away from a file that's staying in the list (View menu, Load...), no when the file being left is
+    // the one that was just unloaded (nothing to save it back to).
+    void SwitchToFileIndex(int idx, bool saveOld) {
         auto* files = FilesForTab(m_curTab); auto* activeIdx = ActiveIdxForTab(m_curTab);
-        if (!files || !activeIdx || idx < 0 || idx >= (int)files->size() || idx == *activeIdx) return;
-        StashCurrentTabText();
-        SaveActiveFileOfTab(m_curTab);   // whatever was just typed into the file being left isn't lost
+        if (!files || !activeIdx || idx < 0 || idx >= (int)files->size()) return;
+        if (saveOld) { StashCurrentTabText(); SaveActiveFileOfTab(m_curTab); }
         *activeIdx = idx;
         CString newPath = (*files)[idx];
         CString text = onReadFile ? onReadFile(newPath, KindForTab(m_curTab)) : CString();
@@ -3085,6 +3118,43 @@ public:
         SetDlgItemText(IDC_SE_STATUSFILE, L"File: " + newPath);
         RebuildViewMenu();
         UpdateStatus();
+        GetDlgItem(CurEditId())->SetFocus();   // ShowTab() does this on every tab switch; this is the same kind of "swap what the box shows" operation -- without it, keyboard focus can be left on the menu/elsewhere afterward, making the box look uneditable even though nothing is actually wrong with it
+    }
+    afx_msg void OnViewFile(UINT id) {
+        int idx = (int)id - IDM_SE_VIEWFILE0;
+        auto* activeIdx = ActiveIdxForTab(m_curTab);
+        if (!activeIdx || idx == *activeIdx) return;
+        SwitchToFileIndex(idx, true);
+    }
+    afx_msg void OnMenuLoad() {
+        if (m_curTab == 1) { AfxMessageBox(L"Load/Unload isn't available for Popups yet -- each popup section (status, channel, query, nicklist, menu bar) has its own single file rather than a switchable list.", MB_ICONINFORMATION); return; }
+        auto* files = FilesForTab(m_curTab); auto* activeIdx = ActiveIdxForTab(m_curTab);
+        if (!files || !activeIdx) return;
+        CFileDialog fd(TRUE, L"ini", nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"Script/INI Files (*.ini;*.mrc)|*.ini;*.mrc|All Files (*.*)|*.*||", this);
+        if (fd.DoModal() != IDOK) return;
+        CString path = fd.GetPathName();
+        for (size_t i = 0; i < files->size(); i++) {
+            if ((*files)[i].CompareNoCase(path) == 0) { SwitchToFileIndex((int)i, true); return; }   // already loaded: "its contents are updated and its position... is maintained" -- just re-show it, SwitchToFileIndex's own onReadFile call refreshes its content from disk
+        }
+        CString kind = KindForTab(m_curTab);
+        if (onLoadFile && !onLoadFile(path, kind)) { AfxMessageBox(L"Could not load that file.", MB_ICONERROR); return; }
+        StashCurrentTabText();
+        SaveActiveFileOfTab(m_curTab);   // whatever was just typed into the file being left isn't lost
+        files->push_back(path);
+        SwitchToFileIndex((int)files->size() - 1, false);   // the old file was already saved just above; SwitchToFileIndex need not save it again
+    }
+    afx_msg void OnMenuUnload() {
+        if (m_curTab == 1) { AfxMessageBox(L"Load/Unload isn't available for Popups yet -- each popup section (status, channel, query, nicklist, menu bar) has its own single file rather than a switchable list.", MB_ICONINFORMATION); return; }
+        auto* files = FilesForTab(m_curTab); auto* activeIdx = ActiveIdxForTab(m_curTab);
+        if (!files || !activeIdx || files->empty()) return;
+        if (files->size() == 1) { AfxMessageBox(L"Can't unload the only file currently loaded for this tab.", MB_ICONINFORMATION); return; }
+        CString path = (*files)[*activeIdx];
+        if (AfxMessageBox(L"Unload " + path + L"?\n\nAny unsaved changes in it will be lost.", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        CString kind = KindForTab(m_curTab);
+        if (onUnloadFile) onUnloadFile(path, kind);
+        files->erase(files->begin() + *activeIdx);
+        int newIdx = *activeIdx; if (newIdx >= (int)files->size()) newIdx = (int)files->size() - 1;
+        SwitchToFileIndex(newIdx, false);   // the file just removed is gone, not saved back to
     }
     afx_msg void OnMenuUndo() { GetDlgItem(CurEditId())->SendMessage(EM_UNDO, 0, 0); }
     afx_msg void OnMenuCut() { GetDlgItem(CurEditId())->SendMessage(WM_CUT, 0, 0); }
@@ -3107,6 +3177,7 @@ BEGIN_MESSAGE_MAP(CScriptEditorDlg, CDialog)
     ON_BN_CLICKED(IDC_SE_TABALIASES, OnTabAliases) ON_BN_CLICKED(IDC_SE_TABPOPUPS, OnTabPopups) ON_BN_CLICKED(IDC_SE_TABREMOTE, OnTabRemote) ON_BN_CLICKED(IDC_SE_TABVARS, OnTabVars) ON_BN_CLICKED(IDC_SE_TABUSERS, OnTabUsers)
     ON_COMMAND(IDM_SE_SAVE, OnMenuSave) ON_COMMAND(IDM_SE_UNDO, OnMenuUndo) ON_COMMAND(IDM_SE_CUT, OnMenuCut) ON_COMMAND(IDM_SE_COPY, OnMenuCopy)
     ON_COMMAND(IDM_SE_PASTE, OnMenuPaste) ON_COMMAND(IDM_SE_SELALL, OnMenuSelAll) ON_COMMAND(IDM_SE_ABOUT, OnMenuAbout) ON_WM_TIMER()
+    ON_COMMAND(IDM_SE_LOAD, OnMenuLoad) ON_COMMAND(IDM_SE_UNLOAD, OnMenuUnload)
     ON_COMMAND_RANGE(IDM_SE_VIEWFILE0, IDM_SE_VIEWFILE0 + 49, OnViewFile)
 END_MESSAGE_MAP()
 
@@ -6395,6 +6466,21 @@ class CMainFrame : public CMDIFrameWnd {
         dlg.onSavePopups = [this](const CString& text) { ApplyPopupsText(text); };
         dlg.onReadFile = [this](const CString& path, const CString& kind) { return ReadFileTextForKind(path, kind); };
         dlg.onWriteFile = [this](const CString& path, const CString& text, const CString& kind) { WriteFileTextForKind(path, text, kind); };
+        dlg.onLoadFile = [this](const CString& path, const CString& kind) -> bool {
+            if (kind == L"aliases") { InsertIntoFileList(m_afiles, path, 0); SaveFileList(L"afiles", m_afiles); LoadAliases(); }
+            else { InsertIntoFileList(m_rfiles, path, 0); SaveFileList(L"rfiles", m_rfiles); LoadRemote(); }   // "remote"/"users"/"variables" all share m_rfiles, same as real mIRC's own [rfiles]
+            return true;
+        };
+        dlg.onUnloadFile = [this](const CString& path, const CString& kind) {
+            if (kind == L"aliases") {
+                for (auto it = m_afiles.begin(); it != m_afiles.end(); ++it) if (it->CompareNoCase(path) == 0) { m_afiles.erase(it); break; }
+                if (m_afiles.empty()) m_afiles.push_back(IniPath(L"aliases.ini"));
+                SaveFileList(L"afiles", m_afiles); LoadAliases();
+            } else {
+                for (auto it = m_rfiles.begin(); it != m_rfiles.end(); ++it) if (it->CompareNoCase(path) == 0) { m_rfiles.erase(it); break; }
+                SaveFileList(L"rfiles", m_rfiles); LoadRemote();
+            }
+        };
         dlg.DoModal();
     }
     afx_msg void OnColorsDialog() {
