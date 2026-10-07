@@ -3789,7 +3789,7 @@ struct RemoteEvent {
     CString groupName;              // empty = not in any #group block, always active -- see IsGroupMarkerLine
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
-    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS" };
+    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal
     static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC" };
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
@@ -3805,7 +3805,7 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
         RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0; ev.groupName = curGroup;
         int c2 = rest.Find(L':'); if (c2 < 0) continue;
         ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
-        if (inList(ev.eventName, kNeedsMatch, 4)) {
+        if (inList(ev.eventName, kNeedsMatch, 5)) {
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
@@ -5924,6 +5924,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"chan") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
+        if (name == L"signal") { val = m_evSignal; return true; }   // the signal name that triggered the current on SIGNAL event; empty outside one
         if (name == L"target") { val = !m_evChan.IsEmpty() ? m_evChan : m_evNick; return true; }   // "where the event took place" -- a channel or query's nick, for the common events (text/join/part/etc) that already track $chan/$nick; events this client doesn't give a distinct target for (like on CLOSE's own window name) aren't specifically covered
 
         if (name == L"wildsite") {   // the host portion of $address, wildcarded to *!*@host form -- empty outside an event, same as $address itself
@@ -8646,6 +8647,7 @@ class CMainFrame : public CMDIFrameWnd {
         for (int i = 0; i < s.GetLength(); i++) { wchar_t c = s[i]; if (!iswdigit(c) && c != L',' && c != L'=') return false; }
         return true;
     }
+    CString m_evSignal;   // what $signal returns -- the name passed to /signal that triggered the current on SIGNAL event
     CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName, m_evNumeric;   // what $nick, $chan, $address, $knick,
     bool m_evHaltDef = false;   // $newnick, $event, $numeric resolve to while an event's commands are running
     // Internal Address List: nick (lowercase) -> user@host, learned passively from any prefixed line we see (JOIN,
@@ -8762,6 +8764,21 @@ class CMainFrame : public CMDIFrameWnd {
         }
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
         return suppress;
+    }
+    // SIGNAL: matched by wildcard against the signal name itself (no channel/where concept -- a signal isn't tied
+    // to any particular chat window). $1- is set to the signal's own parameters, and $signal to its name, for the
+    // duration of each matching event's run.
+    void FireSignalEvent(CChatWnd* w, const CString& signalName, const CString& params) {
+        if (!m_remoteOn || !m_eventsOn) return;
+        CString savedSignal = m_evSignal;
+        for (auto& ev : m_events) {
+            if (ev.eventName != L"SIGNAL") continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            if (!GlobMatch(ev.matchText, signalName)) continue;
+            m_evSignal = signalName;
+            RunScript(w, ev.lines, params);
+        }
+        m_evSignal = savedSignal;
     }
     // TEXT/ACTION/NOTICE: matched against both matchtext (wildcard, against the message) and where (#, ?, *, or a
     // specific channel). $1- is set to the message text itself.
@@ -9757,6 +9774,13 @@ class CMainFrame : public CMDIFrameWnd {
             if (a.IsEmpty()) Show(w, L"* Usage: /remove [-b] <filename>", cPart);
             else if (bin) { SHFILEOPSTRUCTW op = {}; CString z = a + CString(L'\0'); op.wFunc = FO_DELETE; op.pFrom = z; op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT; SHFileOperationW(&op); }
             else if (!DeleteFileW(a)) Show(w, L"* /remove: couldn't delete " + a, cPart);
+        }
+        else if (cmd == L"signal") {   // /signal [-n] <name> [parameters] -- triggers every matching on SIGNAL event. Real mIRC's default (no -n) actually defers the signal until the current script finishes running, firing it immediately only with -n; this always fires immediately either way, a deliberate simplification rather than building a separate deferred-signal queue for a timing distinction most scripts won't depend on. The existing script recursion-depth guard already protects against runaway signal-triggers-signal loops, so no separate iteration cap was added on top of that.
+            CString a = arg;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) Word(a);   // -n accepted and ignored, per the simplification above
+            CString sigName = Word(a);
+            if (sigName.IsEmpty()) { Show(w, L"* /signal: insufficient parameters", cPart); return; }
+            FireSignalEvent(w, sigName, a);
         }
         else if (cmd == L"hmake") {   // /hmake [-s] <name> [N] -- N (bucket count) is accepted and reported back via $hget(table).size but otherwise purely cosmetic, see the HashTableEntry comment
             CString a = arg; bool showMsg = false;
