@@ -387,13 +387,26 @@ static std::vector<CString> SplitLinesRobust(const CString& text) {
     // using it reads as a single giant line with every intended line break sitting inside it as plain, inert
     // text -- which is exactly what every downstream parser (events, aliases, menu blocks, popups) then silently
     // fails to recognize as separate lines at all.
+    //
+    // A run of SEVERAL consecutive \r characters immediately before the \n (\r\r\n, \r\r\r\n, ...) is still just
+    // ONE intended line break, not one plus an extra blank line per repeated \r: real files carrying this (a
+    // round-trip through some other tool, or -- the case that surfaced this -- a save path here that itself used
+    // to treat a \r\r\n file's \r\r as two separate breaks, bake the resulting extra blank lines back in with
+    // fresh \r\n of their own, and double the line count on every single save) need every \r in that run
+    // collapsed into the one break it represents, not expanded into N-1 new blank lines each time the file
+    // round-trips. This only ever collapses \r's that are directly adjacent to each other with nothing in
+    // between; a file with genuinely separate blank lines, each its own proper "\r\n\r\n", is completely
+    // unaffected, since those \r's are never consecutive to begin with -- each has its own \n right after it.
     std::vector<CString> lines; CString cur;
     int n = text.GetLength();
     for (int i = 0; i < n; i++) {
         wchar_t c = text[i];
         if (c == L'\r') {
             lines.push_back(cur); cur.Empty();
-            if (i + 1 < n && text[i + 1] == L'\n') i++;   // \r\n counts as one line break, not two
+            int j = i + 1;
+            while (j < n && text[j] == L'\r') j++;   // swallow any further repeats of \r in this same run
+            if (j < n && text[j] == L'\n') j++;       // then the run's own trailing \n, if present
+            i = j - 1;   // the for loop's own i++ lands exactly at j next
         } else if (c == L'\n') {
             lines.push_back(cur); cur.Empty();
         } else cur += c;
@@ -402,17 +415,58 @@ static std::vector<CString> SplitLinesRobust(const CString& text) {
     while (!lines.empty() && lines.back().IsEmpty()) lines.pop_back();   // drop the trailing blank line left by a final line break
     return lines;
 }
+// True if every byte in the buffer forms valid, strict UTF-8 (proper continuation bytes, no overlong encodings,
+// no surrogate halves, no codepoints past U+10FFFF). A plain 7-bit ASCII file trivially passes this (every byte
+// is its own 1-byte sequence), which is why this check is safe to run unconditionally before deciding how to
+// decode a text file -- it only ever changes behavior for files that actually contain bytes >= 0x80.
+static bool IsValidUtf8(const BYTE* b, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        BYTE c = b[i];
+        if (c < 0x80) { i++; continue; }
+        int extra; unsigned cp;
+        if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; if (c < 0xC2) return false; }   // 0xC0/0xC1 are always overlong
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; if (c > 0xF4) return false; }
+        else return false;
+        if (i + extra >= n) return false;
+        for (int k = 1; k <= extra; k++) { BYTE cc = b[i + k]; if ((cc & 0xC0) != 0x80) return false; cp = (cp << 6) | (cc & 0x3F); }
+        if (extra == 2 && cp < 0x800) return false;        // overlong 3-byte
+        if (extra == 3 && cp < 0x10000) return false;       // overlong 4-byte
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;      // lone surrogate half -- never valid in UTF-8
+        if (cp > 0x10FFFF) return false;
+        i += extra + 1;
+    }
+    return true;
+}
 static std::vector<CString> ReadAllLinesOf(const CString& path) {
-    // Reads the file exactly as before (same CFile::typeText mode, same encoding handling -- unchanged, since
-    // that part isn't known to be broken) but assembles every ReadString() result into one string and runs it
-    // through SplitLinesRobust, rather than trusting ReadString's own line breaks directly. ReadString only
-    // recognizes \n (Windows text-mode translation already collapses \r\n to \n before it sees it), so a file
-    // using bare \r line endings alone comes back from ReadString as a single giant "line" with every intended
-    // break sitting inside it as inert text; re-splitting with SplitLinesRobust catches that case too.
-    CStdioFile f;
-    if (!f.Open(path, CFile::modeRead | CFile::typeText)) return {};
-    CString all; CString ln;
-    while (f.ReadString(ln)) { all += ln; all += L'\n'; }
+    // Reads the file's raw bytes and decodes them as UTF-8 only if they're actually valid UTF-8; otherwise falls
+    // back to Windows-1252 (the old Windows ANSI codepage). This matters a great deal for real-world .mrc script
+    // files: mIRC itself predates UTF-8 and has always saved scripts in the system ANSI codepage, so any script
+    // with non-ASCII bytes -- extended "elite text" decoration using CP437/Latin-1-range characters being one very
+    // common case -- is Windows-1252 text, not UTF-8. Decoding it as UTF-8 regardless (the previous CStdioFile
+    // text-mode behavior) doesn't error out -- arbitrary bytes >= 0x80 often still form some interpretable,
+    // wrong sequence -- so the symptom isn't a load failure, just silently garbled text wherever those bytes are.
+    // A genuinely UTF-8 file (anything this app itself writes, or any modern script) still decodes correctly here,
+    // since IsValidUtf8 only takes the Windows-1252 path for bytes that could never be valid UTF-8 in the first
+    // place.
+    CFile f;
+    if (!f.Open(path, CFile::modeRead)) return {};
+    ULONGLONG len = f.GetLength();
+    if (len == 0) return {};
+    std::vector<BYTE> bytes((size_t)len);
+    f.Read(bytes.data(), (UINT)len);
+    f.Close();
+    size_t start = 0;
+    if (len >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) start = 3;   // UTF-8 BOM, if present -- skip it, the rest is still decoded as UTF-8 below either way
+    bool utf8 = IsValidUtf8(bytes.data() + start, bytes.size() - start);
+    UINT cp = utf8 ? CP_UTF8 : 1252;
+    int n = bytes.size() > start ? (int)(bytes.size() - start) : 0;
+    CString all;
+    if (n > 0) {
+        int wlen = ::MultiByteToWideChar(cp, 0, (LPCSTR)(bytes.data() + start), n, nullptr, 0);
+        if (wlen > 0) { std::vector<wchar_t> wbuf(wlen); ::MultiByteToWideChar(cp, 0, (LPCSTR)(bytes.data() + start), n, wbuf.data(), wlen); all = CString(wbuf.data(), wlen); }
+    }
     return SplitLinesRobust(all);
 }
 // ---- Multi-file script/alias/vars/users loading (File > Load... / Unload, /load, /unload; IRC.ini's own
@@ -2777,18 +2831,102 @@ static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> c
     out.push_back(cur);
     return out;
 }
-static int BraceDelta(const CString& s) { int d = 0; for (int i = 0; i < s.GetLength(); i++) { if (s[i] == L'{') d++; else if (s[i] == L'}') d--; } return d; }
+// Used by ParseAliases and the on/raw/ctcp/dialog-event parsers below to find where a multi-line "{ ... }" body
+// ends. A plain "{"/"}" tally here has the exact same failure this whole family of functions exists to fix (see
+// SegmentAwareBraceDelta's own full comment, further down, which this now defers to): a say/echo/msg/etc line's
+// own decorative text -- ASCII art, routinely -- can contain any number of unmatched "{"/"}" characters with no
+// structural meaning at all, and naively tallying them miscounts the body's real nesting depth, closing a large
+// alias (or on/raw/ctcp handler) like one built around hand-drawn ASCII art several lines early and leaking the
+// remainder out as separate, bogus top-level definitions -- including, when one of those leaked lines happens to
+// start with "say", silently redefining the real say command/alias itself with that one line's leftover text,
+// so every future /say call in the whole client produces that same fixed, wrong output regardless of what it
+// was actually asked to say. Forwarding to SegmentAwareBraceDelta (rather than keeping a second, separately
+// unfixed copy of the same naive tally here) means every caller below is fixed by the one change.
+static int BraceDelta(const CString& s);
 // A line-level (not character-count) brace delta, used only by StripForeignBlocks below: a line is a structural
 // closer ONLY if its trimmed content is exactly "}", and a structural opener ONLY if it ENDS with "{". Everything
 // else is 0, even if "{" or "}" characters appear elsewhere in it. This matters because BraceDelta's plain
 // character count breaks inside a menu block full of ASCII-art say lines -- real mIRC scripts like this routinely
 // contain a lone "}" as part of the drawing itself (e.g. a bear's paw), which, counted naively, closes one brace
 // level too many and makes the skip below end partway through the block instead of at its real closing brace.
-static int LineStructuralBraceDelta(const CString& trimmed) {
-    if (trimmed == L"}") return -1;
-    if (!trimmed.IsEmpty() && trimmed.Right(1) == L"{") return 1;
-    return 0;
+// Same "pair up what's on this one line first, only unmatched braces reach the outer count" approach as
+// PopupBodyBraceDelta just above (see its own, fuller comment) -- fixes the same two real patterns a plain
+// first/last-character peek gets wrong: "} else {" (closes one block, opens another, same line -- net should be
+// 0) and a fully self-contained inline "if (...) { body }" (its own "{" and "}" both on this one line, fully
+// paired -- net should also be 0, not -1 from the trailing "}" alone). Getting either wrong puts StripForeignBlocks
+// one nesting level off from that line on, which can make it mistake the menu/dialog block's real closing brace
+// for one line early and leak the rest of the block's raw script lines out as if they belonged at the top level.
+// A single, truly unmatched "}" sitting alone in drawn ASCII-art text -- the original reason this isn't a plain
+// character count -- still correctly contributes once, same as always.
+// True for a bit of text that IS a freeform-text command (say/echo/msg/notice/describe/me/action) on its own --
+// everything after the command word is arbitrary text being sent or displayed, never script syntax, so any "{"
+// or "}" characters in it (ASCII-art drawings being the classic case -- a clock face, a bear's paw, a border --
+// routinely contain one with no structural meaning at all) must never be treated as structural. Takes any
+// already-isolated piece of text, not just a whole line -- see SegmentAwareBraceDelta just below for why a
+// single line can contain several such pieces chained with "|", each needing this same check applied to it
+// individually, not just to the line as a whole.
+static bool IsFreeformTextLine(const CString& trimmed) {
+    static const wchar_t* const kWords[] = { L"say", L"echo", L"msg", L"notice", L"describe", L"me", L"action" };
+    int sp = trimmed.Find(L' ');
+    CString first = sp < 0 ? trimmed : trimmed.Left(sp);
+    first.TrimLeft(); if (first.Left(1) == L"/") first = first.Mid(1);   // a leading "/" (explicit command marker) doesn't change which word this is
+    first.MakeLower();
+    for (auto w : kWords) if (first == w) return true;
+    return false;
 }
+// A single physical line can be several pieces chained with "|" ("Title:/say A | /say B | /say C"), and the
+// VERY FIRST piece can itself be "Title:command" -- a popup item's whole definition on one line. Checking only
+// the line's own first word for IsFreeformTextLine misses this entirely: a line starting with "...pig time:/say
+// ..." doesn't start with "say" at all, so the old whole-line check never exempted it, even though everything
+// after the ':' (and after each '|') genuinely is freeform say-text that can contain any number of decorative,
+// non-structural "{"/"}" characters. The fix: split on spaced '|' first (matching SplitPipes' own rule -- a '|'
+// only counts as a separator with whitespace on both sides, so one embedded tight in ASCII art is left alone),
+// then, ONLY for the first piece and ONLY when that whole piece ISN'T already a freeform command on its own, look
+// for a title-separating ':' (outside parentheses) to split off a leading title. That "isn't already freeform"
+// guard matters just as much: a plain "say ...: ..." line can legitimately contain a ':' deep in its own
+// decorative text that has nothing to do with a title at all (a clock face or emoticon, say), and blindly
+// splitting on it there would wrongly carve the line into an exempt prefix and a NOT-exempt suffix, miscounting
+// whatever braces happen to fall on the far side of that incidental colon. Each resulting piece is then checked
+// for IsFreeformTextLine on its own, and only non-exempt pieces contribute to the brace count at all -- using the
+// same local-pairing scheme as before (braces that match up within one piece cancel out; only genuinely unmatched
+// ones count), so a real "if (...) { ... } else { ... }" elsewhere in the same line is still counted precisely.
+static int SegmentAwareBraceDelta(const CString& trimmed) {
+    std::vector<CString> pieces; CString cur; int parenDepth = 0; int n = trimmed.GetLength();
+    for (int i = 0; i < n; i++) {
+        wchar_t c = trimmed[i];
+        if (c == L'(') parenDepth++; else if (c == L')' && parenDepth > 0) parenDepth--;
+        bool spacedBefore = i == 0 || trimmed[i - 1] == L' ' || trimmed[i - 1] == L'\t';
+        bool spacedAfter = i + 1 >= n || trimmed[i + 1] == L' ' || trimmed[i + 1] == L'\t';
+        if (c == L'|' && parenDepth == 0 && spacedBefore && spacedAfter) { pieces.push_back(cur); cur.Empty(); } else cur += c;
+    }
+    pieces.push_back(cur);
+    std::vector<CString> segments;
+    for (size_t idx = 0; idx < pieces.size(); idx++) {
+        CString piece = pieces[idx];
+        if (idx == 0 && !IsFreeformTextLine(piece)) {
+            int d = 0, colonAt = -1;
+            for (int k = 0; k < piece.GetLength(); k++) {
+                wchar_t ch = piece[k];
+                if (ch == L'(') d++; else if (ch == L')' && d > 0) d--;
+                else if (ch == L':' && d == 0) { colonAt = k; break; }
+            }
+            if (colonAt >= 0) { segments.push_back(piece.Left(colonAt)); piece = piece.Mid(colonAt + 1); }
+        }
+        segments.push_back(piece);
+    }
+    int localDepth = 0, outerDelta = 0;
+    for (auto& seg : segments) {
+        if (IsFreeformTextLine(seg)) continue;
+        for (int i = 0; i < seg.GetLength(); i++) {
+            wchar_t c = seg[i];
+            if (c == L'{') localDepth++;
+            else if (c == L'}') { if (localDepth > 0) localDepth--; else outerDelta--; }
+        }
+    }
+    return outerDelta + localDepth;
+}
+static int LineStructuralBraceDelta(const CString& trimmed) { return SegmentAwareBraceDelta(trimmed); }
+static int BraceDelta(const CString& s) { return SegmentAwareBraceDelta(s); }
 // Strips out whole "menu { ... }" / "dialog { ... }" / "xdialog { ... }" block bodies before the real on/raw/
 // ctcp/alias line scanners ever see them. Without this, a popup item inside a menu block like
 // "/say some colour-coded text" gets misread by the alias scanner as top-level "/name body" syntax (valid for
@@ -2932,6 +3070,20 @@ static std::vector<CString> ScriptTokens(const std::vector<CString>& lines) {
     return toks;
 }
 static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos, bool inBlock);
+// Finds the "}" that actually matches the "{" at s[0] (proper depth counting over nested braces), not just
+// whatever character happens to sit at the very end of the string. Needed because a fully inline "if (...) {
+// bodyA } else { bodyB }" -- condition, both branches, and the else keyword all on one physical line -- never
+// gets split into separate tokens by ScriptTokens (it only splits a line that ENDS in "{"), so by the time this
+// code sees it, everything after the condition arrives as one single string. Blindly trimming the first "{" and
+// the string's own last "}" then silently merges the if-body, the literal word "else", and the else-body all
+// into one opaque blob -- the else clause is lost entirely, not mishandled, just gone. Returns -1 if s doesn't
+// start with "{" or has no properly matching close.
+static int MatchBrace(const CString& s) {
+    if (s.Left(1) != L"{") return -1;
+    int depth = 0;
+    for (int i = 0; i < s.GetLength(); i++) { if (s[i] == L'{') depth++; else if (s[i] == L'}') { depth--; if (depth == 0) return i; } }
+    return -1;
+}
 static std::vector<SNode> ParseBody(const std::vector<CString>& t, size_t& pos, CString after) {   // what follows "if (...)": a { block } or a command on the same line
     if (after.Left(1) == L"{" && after.Right(1) == L"}") { after = after.Mid(1, after.GetLength() - 2); after.Trim(); }
     if (after.IsEmpty()) {
@@ -2941,10 +3093,77 @@ static std::vector<SNode> ParseBody(const std::vector<CString>& t, size_t& pos, 
     std::vector<CString> one; one.push_back(after); size_t p = 0;
     return ParseNodes(one, p, false);
 }
-static SNode ParseCtrl(const std::vector<CString>& t, size_t& pos, CString kw, CString rest, int kind) {   // if / elseif / while
+// Returns the if/while node AND any leftover text still on the same physical line after the whole if/elseif/else
+// chain finishes consuming its own bodies -- e.g. the "| :end" in "if (...) { ... } | else { ... } | :end". The
+// caller turns that leftover into additional SIBLING nodes at the if's own level, not nested inside it: this
+// matters because a goto from inside the if's own body can target a label defined this way, and goto's label
+// search only ever looks at the current level, never down into an if/else's own branches.
+static std::pair<SNode, CString> ParseCtrl(const std::vector<CString>& t, size_t& pos, CString kw, CString rest, int kind);
+// Parses what follows an if/while's condition, correctly handling a fully inline "{ bodyA } else { bodyB }" --
+// condition, both branches and the else keyword all on one physical line -- by finding the if-body's own properly
+// matched close brace (MatchBrace) first, rather than letting ParseBody's "strip first { and last }" logic run on
+// the whole thing and swallow the else clause as inert text. Falls back to plain ParseBody when 'after' doesn't
+// start with a self-contained "{ ... }" (the ordinary multi-line case, where the body's own "{" and "}" arrive as
+// separate tokens on later lines, or 'after' is empty, or it's a single inline command with no braces at all).
+// Returns whatever trailing text is left on the same physical line after the if's own body (and, if present, its
+// elseif/else chain) is fully consumed -- the caller is responsible for turning that into sibling nodes (see
+// ParseCtrl's own comment for why that has to be siblings, not nested content).
+static CString ParseIfBodyAndElse(const std::vector<CString>& t, size_t& pos, CString after, std::vector<SNode>& bodyOut, std::vector<SNode>& elseOut, bool allowElse) {
+    int m = MatchBrace(after);
+    CString trailing;   // whatever's left to check for an else clause -- either text still on this same physical line (inline case), or empty, meaning "look at the next token/line instead" (multi-line case)
+    if (m >= 0) {
+        size_t dummyPos = 0;
+        bodyOut = ParseBody(t, dummyPos, after.Left(m + 1));   // already a properly matched "{ ... }"; dummyPos is unused since ParseBody only consults t/pos when 'after' is empty, which it never is here
+        trailing = after.Mid(m + 1); trailing.TrimLeft();
+    } else {
+        bodyOut = ParseBody(t, pos, after);
+    }
+    if (!allowElse) return trailing;
+    // A pipe-separated else ("{ body } | else { ... }") is just as valid, ordinary syntax as one with no pipe --
+    // real scripts chain statements with "|" routinely, and an if/else is no exception. Not stripping it here
+    // used to mean the "else" keyword was never recognized at all: the whole else clause, and anything chained
+    // after it on the same line (a label, most critically -- see this function's own header comment), was simply
+    // lost, parsed as neither a valid command nor a real else, and silently dropped.
+    CString afterPipe = trailing;
+    if (afterPipe.Left(1) == L"|") { afterPipe = afterPipe.Mid(1); afterPipe.TrimLeft(); }
+    if (!afterPipe.IsEmpty()) {   // inline: "{ body } else { ... }" (or "| else") all on the same line
+        if (IsKw(afterPipe, L"elseif")) { auto r = ParseCtrl(t, pos, CString(L"elseif"), afterPipe.Mid(6), 1); elseOut.push_back(r.first); return r.second; }
+        if (IsKw(afterPipe, L"else")) { CString ea = afterPipe.Mid(4); ea.Trim(); return ParseIfBodyAndElse(t, pos, ea, elseOut, elseOut, false); }   // elseOut passed as both outputs is safe here: allowElse=false means the (unused) second one is never written, only the body (the else's own) ever is
+        return trailing;   // trailing text that isn't elseif/else -- not consumed, left for the caller to turn into sibling statements
+    }
+    if (pos < t.size()) {   // multi-line: the if-body ended (inline or not), and the next token/line may continue with elseif/else
+        CString nx = t[pos];
+        if (IsKw(nx, L"elseif")) { pos++; auto r = ParseCtrl(t, pos, CString(L"elseif"), nx.Mid(6), 1); elseOut.push_back(r.first); return r.second; }
+        if (IsKw(nx, L"else")) { pos++; CString ea = nx.Mid(4); ea.Trim(); elseOut = ParseBody(t, pos, ea); }
+    }
+    return CString();
+}
+static std::pair<SNode, CString> ParseCtrl(const std::vector<CString>& t, size_t& pos, CString kw, CString rest, int kind) {   // if / elseif / while
     SNode n; rest.TrimLeft();
-    int cl = rest.Left(1) == L"(" ? MatchParen(rest, 0) : -1;
-    if (cl < 0) { n.kind = 0; n.text = kw + L" " + rest; return n; }   // malformed: leave it as a command so the user sees the error
+    // Real mIRC allows the condition to be written WITHOUT wrapping parentheses at all -- "if %x == 1 {" is just
+    // as valid as "if (%x == 1) {", not an error. Requiring a leading "(" here used to treat that whole line as
+    // one malformed, literal command instead of a real if-statement -- and since ScriptTokens already splits a
+    // trailing "{" off into its own separate token before this code ever runs, the "{" meant to open the if's own
+    // body was left to be picked up by the OUTER parser instead, as an unconditional, always-runs bare block.
+    // With a goto back to a label inside that block, the "condition" no longer gated anything at all, which is
+    // exactly what turned this into a genuine infinite loop rather than a normal parse error.
+    if (rest.Left(1) != L"(") {
+        // The condition itself and an inline body ("if %x == 1 { ... }", no parens, body on the SAME line) both
+        // still arrive in rest together when the line doesn't end in "{" -- ScriptTokens only splits off a
+        // trailing "{", so a line ending in "}" (the body closes on the same line) never gets split at all.
+        // Scanning for the first top-level "{" (outside any nested parentheses, so a condition containing its own
+        // $identifier(...) calls is left alone) finds exactly where the condition ends and the body begins.
+        int braceAt = -1, depth = 0;
+        for (int i = 0; i < rest.GetLength(); i++) { wchar_t c = rest[i]; if (c == L'(') depth++; else if (c == L')') { if (depth > 0) depth--; } else if (c == L'{' && depth == 0) { braceAt = i; break; } }
+        CString after;
+        if (braceAt >= 0) { n.text = rest.Left(braceAt); n.text.TrimRight(); after = rest.Mid(braceAt); }
+        else n.text = rest;   // no inline body at all -- body is a separate "{" token next, or this if has no body
+        n.kind = kind;
+        CString trailing = ParseIfBodyAndElse(t, pos, after, n.a, n.b, kind == 1);
+        return { n, trailing };
+    }
+    int cl = MatchParen(rest, 0);
+    if (cl < 0) { n.kind = 0; n.text = kw + L" " + rest; return { n, CString() }; }   // malformed: leave it as a command so the user sees the error
     // Real mIRC syntax allows chaining several parenthesized conditions with && / ||, e.g.
     // "if (a) && (b) && (c) { ... }" -- each is its own group, not one big expression in a single pair of
     // parens. MatchParen above only finds the FIRST group's own closing paren; without the loop below, every
@@ -2969,13 +3188,8 @@ static SNode ParseCtrl(const std::vector<CString>& t, size_t& pos, CString kw, C
     }
     n.kind = kind; n.text = condText;   // kept with its own outer parens per group, unlike the old single-group code's stripped form -- EvalCond's own leading loop already strips a single fully-wrapping pair when there's just one group, and correctly leaves a multi-group chain alone to split on its top-level && / || instead
     CString after = remaining; after.Trim();
-    n.a = ParseBody(t, pos, after);
-    if (kind == 1 && pos < t.size()) {
-        CString nx = t[pos];
-        if (IsKw(nx, L"elseif")) { pos++; n.b.push_back(ParseCtrl(t, pos, CString(L"elseif"), nx.Mid(6), 1)); }
-        else if (IsKw(nx, L"else")) { pos++; CString ea = nx.Mid(4); ea.Trim(); n.b = ParseBody(t, pos, ea); }
-    }
-    return n;
+    CString trailing = ParseIfBodyAndElse(t, pos, after, n.a, n.b, kind == 1);
+    return { n, trailing };
 }
 static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos, bool inBlock) {
     std::vector<SNode> out;
@@ -2984,11 +3198,39 @@ static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos,
         if (s == L"}") { pos++; if (inBlock) return out; continue; }
         if (s == L"{") { pos++; std::vector<SNode> inner = ParseNodes(t, pos, true); for (size_t i = 0; i < inner.size(); i++) out.push_back(inner[i]); continue; }
         pos++;
-        if (IsKw(s, L"if")) { out.push_back(ParseCtrl(t, pos, CString(L"if"), s.Mid(2), 1)); continue; }
-        if (IsKw(s, L"while")) { out.push_back(ParseCtrl(t, pos, CString(L"while"), s.Mid(5), 2)); continue; }
+        if (IsKw(s, L"if")) {
+            auto r = ParseCtrl(t, pos, CString(L"if"), s.Mid(2), 1);
+            out.push_back(r.first);
+            // Any text still left on this same physical line after the if's own body (and elseif/else chain, if
+            // any) -- e.g. the "| :end" in "if (...) { ... } | else { ... } | :end" -- becomes SIBLING nodes
+            // here, at the same level as the if itself, not content nested inside it. Routed back through
+            // ParseNodes (same single-string-as-one-token trick ParseBody already uses) so it gets the exact same
+            // treatment any other line would: pipe-split into separate commands, a ":label" recognized as one,
+            // even another if/while handled correctly if present. This has to be a sibling, never nested, because
+            // a goto from inside the if's own body can target a label defined this way, and goto's label search
+            // only ever looks at the current level, never down into an if/else's own branches.
+            if (!r.second.IsEmpty()) { std::vector<CString> one; one.push_back(r.second); size_t p = 0; auto extra = ParseNodes(one, p, false); for (auto& e : extra) out.push_back(e); }
+            continue;
+        }
+        if (IsKw(s, L"while")) {
+            auto r = ParseCtrl(t, pos, CString(L"while"), s.Mid(5), 2);
+            out.push_back(r.first);
+            if (!r.second.IsEmpty()) { std::vector<CString> one; one.push_back(r.second); size_t p = 0; auto extra = ParseNodes(one, p, false); for (auto& e : extra) out.push_back(e); }
+            continue;
+        }
         if (s.GetLength() > 1 && s[0] == L':' && s.Find(L' ') < 0) { SNode n; n.kind = 3; n.text = s.Mid(1); out.push_back(n); continue; }   // :label
         std::vector<CString> parts = SplitPipes(s);
-        for (size_t i = 0; i < parts.size(); i++) { CString c = parts[i]; c.Trim(); if (!c.IsEmpty()) { SNode n; n.text = c; out.push_back(n); } }
+        // Each piece gets the same ":label" check the whole token already gets further up -- not just the first
+        // one. A pipe-separated line with a label in the middle or at the end ("cmd1 | :mylabel | cmd2") is
+        // completely ordinary syntax, same as this whole function's own if/else trailing-text handling routes
+        // back through here expecting; without this, every piece became a plain command node regardless of
+        // content, so a label written this way was never recognized as one at all -- just a literal, bogus
+        // command sent as typed, with goto never able to find it.
+        for (size_t i = 0; i < parts.size(); i++) {
+            CString c = parts[i]; c.Trim(); if (c.IsEmpty()) continue;
+            if (c.GetLength() > 1 && c[0] == L':' && c.Find(L' ') < 0) { SNode n; n.kind = 3; n.text = c.Mid(1); out.push_back(n); continue; }
+            SNode n; n.text = c; out.push_back(n);
+        }
     }
     return out;
 }
@@ -3310,12 +3552,19 @@ static const wchar_t* const kPopType[5] = { L"status", L"channel", L"query", L"n
 // ASCII art that happens to contain a lone "}" mid-line (part of a drawing) with no matching "{" -- counted
 // naively, that single stray character closes the whole multi-line body one line early, leaking every remaining
 // line of that submenu out as its own separate top-level popup item instead.
-static int PopupBodyBraceDelta(const CString& trimmed) {
-    int d = 0;
-    if (!trimmed.IsEmpty() && trimmed.Right(1) == L"}") d--;
-    if (!trimmed.IsEmpty() && trimmed.Right(1) == L"{") d++;
-    return d;
-}
+// A line's net contribution to the OUTER nesting depth is however many of its own braces are left unmatched
+// after pairing up whatever opens and closes within that single line against each other -- not just a peek at
+// the line's first or last character. That first-or-last-character approach gets two completely ordinary,
+// everyday patterns wrong: "} else {" (closes the previous block and opens a new one on the same line -- the
+// leading "}" was silently dropped entirely, a bug shared with the old LineStructuralBraceDelta, see its own
+// comment) registered as a net +1 instead of the correct net 0; and a fully self-contained inline "if (...) {
+// goto done }" -- its own "{" and "}" both sitting on the one line, fully balanced -- registered as a net -1
+// (from the trailing "}") instead of the correct net 0, since the "{" in the middle of the line was never looked
+// at. Both put every subsequent line's tracked depth off by one, eventually closing a popup item's real
+// multi-line body at the wrong place and leaking the remainder of it out as separate, phantom sibling items.
+// SegmentAwareBraceDelta (above) handles the ASCII-art case this pairing approach can't handle on its own,
+// including the single-line "Title:/say A | /say B" form a whole popup item can take -- see its own full comment.
+static int PopupBodyBraceDelta(const CString& trimmed) { return SegmentAwareBraceDelta(trimmed); }
 static std::vector<PopupItem> ParsePopupItems(const std::vector<CString>& in) {
     std::vector<PopupItem> out;
     for (size_t i = 0; i < in.size(); i++) {
@@ -3427,6 +3676,24 @@ static std::vector<CString> SplitTopLevelCommas(const CString& s) {
     }
     out.push_back(cur);
     for (auto& f : out) f.Trim();
+    return out;
+}
+// Splits by comma, but only at paren depth 0 -- unlike SplitTopLevelCommas just above (which only tracks quotes,
+// built for dialog table fields that are quote-delimited, not paren-delimited), this is for splitting a /var-style
+// comma-separated declaration list, where any one item can itself be a $identifier(args) call whose own arguments
+// contain commas (e.g. "%x = $replace($1-,$chr(32),  )"). A naive, depth-unaware comma split breaks straight
+// through those inner commas, fragmenting one item into several -- which is exactly what was producing a stray
+// piece like "$chr(32)" on its own, not starting with %, and tripping /var's "variable names start with %" check
+// on input that's actually entirely valid mIRC. [ ] (eval brackets) are tracked the same way, for the same reason.
+static std::vector<CString> SplitTopLevelCommasParen(const CString& s) {
+    std::vector<CString> out; CString cur; int depth = 0;
+    for (int i = 0; i < s.GetLength(); i++) {
+        wchar_t c = s[i];
+        if (c == L'(' || c == L'[') depth++;
+        else if (c == L')' || c == L']') { if (depth > 0) depth--; }
+        if (c == L',' && depth == 0) { out.push_back(cur); cur.Empty(); } else cur += c;
+    }
+    out.push_back(cur);
     return out;
 }
 static CString UnquoteField(CString f) {
@@ -3787,6 +4054,7 @@ public:
 // separate lists, not a unified /level), so every event matches regardless of what level was written.
 struct RemoteEvent {
     CString eventName;              // JOIN, PART, TEXT, ACTION, NOTICE, KICK, QUIT, NICK, TOPIC, CONNECT, WALLOPS (always uppercase)
+    int level = 0;                  // the <level> number as written, purely for $clevel to report -- NOT an enforced access gate the way real mIRC's is; this client has no per-user level check wired into the general event system (see the comment above), so an event fires regardless of what level it declares
     bool haltDefaultPrefix = false; // a ^ anywhere in the level field: on ^1:JOIN:... -- lets /halt in this event's
                                      // body suppress the built-in join/part/text/etc. line, same as real mIRC
     CString matchText;              // TEXT/ACTION/NOTICE/WALLOPS only
@@ -3798,7 +4066,7 @@ struct RemoteEvent {
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
     static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal
-    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC" };
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN" };
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
     CString curGroup;
@@ -3811,13 +4079,14 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
         int c1 = rest.Find(L':'); if (c1 < 0) continue;
         CString level = rest.Left(c1); rest = rest.Mid(c1 + 1);
         RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0; ev.groupName = curGroup;
+        { CString levelNum = level; levelNum.Remove(L'^'); levelNum.Remove(L'*'); ev.level = _wtoi(levelNum); }   // "*" (any level) parses to 0, same as a bare level field would
         int c2 = rest.Find(L':'); if (c2 < 0) continue;
         ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
         if (inList(ev.eventName, kNeedsMatch, 5)) {
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
-        if (inList(ev.eventName, kNeedsWhere, 7)) {
+        if (inList(ev.eventName, kNeedsWhere, 14)) {
             int c4 = rest.Find(L':'); if (c4 < 0) continue;
             ev.whereSpec = rest.Left(c4); rest = rest.Mid(c4 + 1);
         }
@@ -3857,6 +4126,33 @@ struct RawEvent {
     std::vector<CString> lines;
     CString groupName;       // empty = not in any #group block, always active
 };
+struct ParsedModeChange { wchar_t modeChar; bool adding; CString param; };
+// Parses a channel mode string ("+ov-b" etc) against its parameters, correctly determining which mode letters
+// consume a parameter and which don't -- using the server's own CHANMODES= groups (net->chanmodes, already parsed
+// from 005), not a fixed guess at which letters matter. CHANMODES defines four comma-separated groups: A (list
+// type -- ban/except/invex, e.g. "beI") always takes a parameter both ways; B (e.g. "k", a key) always takes one;
+// C (e.g. "l", a limit) takes one only when being SET, not when being cleared; D (e.g. "imnpst") never takes one.
+// op/voice ('o'/'v') aren't part of CHANMODES at all (they're the separate PREFIX= token) but always take a
+// parameter regardless of +/-, so they're handled as their own fixed case -- matching how the rest of this
+// codebase already hardcodes '@'/'+' for op/voice rather than a general PREFIX= parse (see NickPrefixChar).
+static std::vector<ParsedModeChange> ParseModeString(const CString& chanmodes, const CString& modeStr, const std::vector<CString>& params, size_t paramStart) {
+    std::vector<ParsedModeChange> out;
+    CString groupA, groupB, groupC;
+    { CString cm = chanmodes; int c1 = cm.Find(L','); if (c1 >= 0) { groupA = cm.Left(c1); cm = cm.Mid(c1 + 1);
+      int c2 = cm.Find(L','); if (c2 >= 0) { groupB = cm.Left(c2); cm = cm.Mid(c2 + 1);
+      int c3 = cm.Find(L','); if (c3 >= 0) groupC = cm.Left(c3); } } }
+    bool adding = true; size_t paramIdx = paramStart;
+    for (int i = 0; i < modeStr.GetLength(); i++) {
+        wchar_t c = modeStr[i];
+        if (c == L'+') { adding = true; continue; }
+        if (c == L'-') { adding = false; continue; }
+        bool consumesParam = (c == L'o' || c == L'v') || groupA.Find(c) >= 0 || groupB.Find(c) >= 0 || (groupC.Find(c) >= 0 && adding);
+        ParsedModeChange pmc; pmc.modeChar = c; pmc.adding = adding;
+        if (consumesParam && paramIdx < params.size()) pmc.param = params[paramIdx++];
+        out.push_back(pmc);
+    }
+    return out;
+}
 static std::vector<RawEvent> ParseRawEvents(const std::vector<CString>& in) {
     std::vector<RawEvent> out;
     CString curGroup;
@@ -5798,6 +6094,11 @@ class CMainFrame : public CMDIFrameWnd {
 
     // ---- identifiers: $me $chan $network $os $date $adate $day $daylight $fulldate $gmt $time, and $0 $N $N- $N-M ----
     // Evaluated by "//cmd ..." and inside aliases (like mIRC: a plain "/cmd" line is NOT evaluated).
+    CString ReadClipboardText() {   // used by both the bare $cb and $cb(N) forms
+        CString clip;
+        if (OpenClipboard()) { HANDLE h = GetClipboardData(CF_UNICODETEXT); if (h) clip = (LPCWSTR)GlobalLock(h); if (h) GlobalUnlock(h); CloseClipboard(); }
+        return clip;
+    }
     bool IdentValue(CChatWnd* w, const CString& name, const CString& prop, CString& val) {
         Net* net = w ? w->net : nullptr;
         CTime now = CTime::GetCurrentTime();
@@ -5937,7 +6238,14 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"chan") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
-        if (name == L"signal") { val = m_evSignal; return true; }   // the signal name that triggered the current on SIGNAL event; empty outside one
+        if (name == L"signal") { val = m_evSignal; return true; }
+        if (name == L"ulevel") { val.Format(L"%d", m_defaultLevel); return true; }   // the current default level for unlisted users, as set by /dlevel
+        if (name == L"clevel") { val = m_evLevel; return true; }
+        if (name == L"rawmsg") { val = m_evRawMsg; return true; }   // the exact, unparsed server line, only set within a matching on RAW event
+        if (name == L"regerrstr") { val = m_regErrStr; return true; }   // the last $regex/$regsub/$regsubex compile error, if any -- std::regex's own error text, not literally PCRE's wording
+        if (name == L"appactive") { val = (::GetForegroundWindow() && ::GetWindowThreadProcessId(::GetForegroundWindow(), nullptr) == ::GetCurrentProcessId()) ? L"$true" : L"$false"; return true; }   // $true if any window of this process (not necessarily this specific one) currently has focus
+        if (name == L"cb") { val = ReadClipboardText(); return true; }   // bare form: the full clipboard text, newlines included -- same as $cb(-1)
+        if (name == L"ial") { val = L"$true"; return true; }   // bare form: on/off status -- always on here, since this client has no /ial off equivalent to actually disable it   // the <level> number from the specific "on <level>:EVENT:..." declaration currently running -- written as-is, NOT an enforced access check (see RemoteEvent::level's own comment); empty outside an event   // the signal name that triggered the current on SIGNAL event; empty outside one
         if (name == L"target") { val = !m_evChan.IsEmpty() ? m_evChan : m_evNick; return true; }   // "where the event took place" -- a channel or query's nick, for the common events (text/join/part/etc) that already track $chan/$nick; events this client doesn't give a distinct target for (like on CLOSE's own window name) aren't specifically covered
 
         if (name == L"wildsite") {   // the host portion of $address, wildcarded to *!*@host form -- empty outside an event, same as $address itself
@@ -5947,6 +6255,9 @@ class CMainFrame : public CMDIFrameWnd {
             return true;
         }
         if (name == L"knick") { val = m_evKnick; return true; }   // on KICK only: the nick who got kicked ($nick is the kicker)
+        if (name == L"opnick") { val = m_evOpnick; return true; }     // on OP/DEOP only: the nick who was given/removed op ($nick is who made the change)
+        if (name == L"vnick") { val = m_evVnick; return true; }       // on VOICE/DEVOICE only: the nick who was given/removed voice
+        if (name == L"bnick") { val = m_evBnick; return true; }       // on BAN/UNBAN only: the ban mask that was set/removed (not necessarily a nick, despite the name -- matches mIRC's own naming)
         if (name == L"newnick") { val = m_evNewnick; return true; }   // on NICK only: the nick they changed to ($nick is the old one)
         if (name == L"halted") { val = m_evHaltDef ? L"$true" : L"$false"; return true; }
         if (name == L"event") { val = m_evName; return true; }   // the name of the currently-running remote event: "JOIN", "TEXT", etc.
@@ -6136,8 +6447,23 @@ class CMainFrame : public CMDIFrameWnd {
         return true;
     }
     // The value given to /set, /var and "%x = ...": trimmed (unless -p), and a single "5 + 1" style operation is worked out (unless -n).
+    // "var %x = 5" / "%x = 5": the single space right after the '=' is part of the syntax delimiter (matching
+    // /var's own documented "[= ]value" notation -- the space is bundled with the '=' as one unit), not part of
+    // the value itself, the same way /set's plain "%x value" form already only consumes a single delimiter space
+    // via Word() and leaves any further spaces as part of the value. Now that FinalValue no longer trims leading
+    // whitespace at all (needed so a deliberately whitespace-only value, like a block-letter ASCII art script
+    // produces, survives intact), that one delimiter space has to be stripped explicitly here instead, or every
+    // ordinary "%x = 5" would end up storing " 5" with a stray leading space.
+    static CString StripOneLeadingSpace(const CString& s) { return (s.Left(1) == L" ") ? s.Mid(1) : s; }
     bool FinalValue(CChatWnd* w, const CString& cmd, CString v, const VarSw& sw, CString& out) {
-        if (!sw.p) v.Trim();
+        // Real mIRC's default (-p not given) rule here is much narrower than a blanket trim: "does not allow
+        // value to... end with a single $chr(32) space (multiple spaces CAN be set)." Only a value ending in
+        // EXACTLY one trailing space gets that one space removed; two or more trailing spaces are left completely
+        // untouched, and leading whitespace isn't touched at all. A plain v.Trim() here previously stripped ALL
+        // leading/trailing whitespace regardless of how much there was, which silently destroys any value that's
+        // deliberately whitespace-heavy or whitespace-only (a script building block-letter ASCII art out of
+        // padded spaces, for instance, which needs exactly this real-mIRC distinction to survive at all).
+        if (!sw.p && v.GetLength() >= 1 && v.Right(1) == L" " && !(v.GetLength() >= 2 && v[v.GetLength() - 2] == L' ')) v = v.Left(v.GetLength() - 1);
         out = v;
         if (!sw.n) {
             CString r; int m = TryMath(v, r);
@@ -6160,13 +6486,12 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void CmdVar(CChatWnd* w, CString arg) {   // /var %x = hello, %y, %z = $me   (local to this script run)
         VarSw sw; if (!ParseVarSw(w, L"var", arg, sw, L"snzeglkipu")) return;
-        int pos = 0;
-        for (CString item = arg.Tokenize(L",", pos); !item.IsEmpty(); item = arg.Tokenize(L",", pos)) {
-            item.Trim(); if (item.IsEmpty()) continue;
+        for (auto& itemRaw : SplitTopLevelCommasParen(arg)) {   // paren-aware: a declaration's own value can be a $identifier(args) call whose arguments contain commas of their own, which a plain comma split would incorrectly cut through
+            CString item = itemRaw; item.Trim(); if (item.IsEmpty()) continue;
             int k = 0; while (k < item.GetLength() && item[k] != L' ' && item[k] != L'=') k++;
             CString name = item.Left(k), tail = item.Mid(k), val; tail.TrimLeft();
             if (name.Left(1) != L"%") { Show(w, L"* /var: variable names start with %", cPart); return; }
-            if (tail.Left(1) == L"=") { if (!FinalValue(w, L"var", tail.Mid(1), sw, val)) return; }
+            if (tail.Left(1) == L"=") { if (!FinalValue(w, L"var", StripOneLeadingSpace(tail.Mid(1)), sw, val)) return; }
             StoreVar(name, val, sw, true);
         }
         FlushVars();
@@ -6193,7 +6518,7 @@ class CMainFrame : public CMDIFrameWnd {
     void CmdAssign(CChatWnd* w, const CString& name, CString arg) {   // "%x = 5 + 1"  (arg starts at the '=')
         arg.TrimLeft();
         if (arg.Left(1) != L"=") { Show(w, L"* Expected:  " + name + L" = value", cPart); return; }
-        VarSw sw; CString v; if (!FinalValue(w, L"set", arg.Mid(1), sw, v)) return;
+        VarSw sw; CString v; if (!FinalValue(w, L"set", StripOneLeadingSpace(arg.Mid(1)), sw, v)) return;
         StoreVar(name, v, sw, false); FlushVars();
     }
 
@@ -6431,8 +6756,9 @@ class CMainFrame : public CMDIFrameWnd {
                     if (std::regex_search(input, m, re)) { matchCount = 1; for (size_t g = 1; g < m.size(); ++g) groups.push_back(CString(m[g].str().c_str())); }
                 }
                 StoreRegexResult(matchName, std::move(groups));
+                m_regErrStr.Empty();
                 val.Format(L"%d", matchCount); return true;
-            } catch (std::regex_error&) { return false; }   // malformed pattern -- mIRC would set $regerrstr; not implemented here
+            } catch (std::regex_error& re) { m_regErrStr = CA2W(re.what(), CP_ACP); return false; }   // malformed pattern -- captures the error text for $regerrstr
         }
         if (name == L"regsub" || name == L"regsubex") {   // $regsub([name],input,/pattern/flags,subtext,%var) -- matches like $regex, replaces each match using subtext (which may reference capture groups as \1 \2 etc), writes the whole result into %var, and returns the number of matches. $regsubex's own extra \t/\n/\A markers in subtext aren't implemented -- otherwise identical to $regsub here. The &binvar output form isn't implemented, only %var.
             CString a = EvalIds(w, rawArgs, params);
@@ -6490,8 +6816,9 @@ class CMainFrame : public CMDIFrameWnd {
                 }
                 StoreRegexResult(matchName, std::move(groupsForRegml));
                 StoreVar(varName, result, VarSw(), false);
+                m_regErrStr.Empty();
                 val.Format(L"%d", matchCount); return true;
-            } catch (std::regex_error&) { return false; }
+            } catch (std::regex_error& re) { m_regErrStr = CA2W(re.what(), CP_ACP); return false; }
         }
         if (name == L"regml") {   // $regml([name],N) -- the Nth backreference from the last $regex (or $regsub/$regsubex) call under that name; N=0 returns the total backreference count. The optional trailing &binvar form (copy into a binary variable) isn't implemented.
             CString a = EvalIds(w, rawArgs, params);
@@ -6707,6 +7034,19 @@ class CMainFrame : public CMDIFrameWnd {
             m_lastFileEof = false; m_lastFileErr = false;
             val = CString((wchar_t)(unsigned char)ch); return true;
         }
+        if (name == L"level") {   // $level(address) -- the comma-separated levels list of every m_levelEntries entry matching that address, "=N" for an exact-only grant, plain "N" for a cumulative one
+            CString addr = EvalIds(w, rawArgs, params);
+            CString out;
+            for (auto& e : m_levelEntries) {
+                bool maskIsBareNick = e.mask.Find(L'!') < 0 && e.mask.Find(L'@') < 0;
+                CString against = maskIsBareNick ? CString(addr).SpanExcluding(L"!") : addr;   // a bare-nick mask only ever matches the nick portion of the address
+                if (!GlobMatch(e.mask, against)) continue;
+                if (!out.IsEmpty()) out += L",";
+                if (e.exact) out += L"=";
+                CString lvl; lvl.Format(L"%d", e.level); out += lvl;
+            }
+            val = out; return true;
+        }
         if (name == L"hget") {
             CString a = EvalIds(w, rawArgs, params);
             int c = a.Find(L',');
@@ -6886,6 +7226,64 @@ class CMainFrame : public CMDIFrameWnd {
             else val = L"#" + g->name;
             return true;
         }
+        if (name == L"cb") {   // $cb(N)[.len] -- N=-1: the full clipboard text, newlines included. N=0 or 1: the first line (both treated the same, since mIRC's own documented example uses $cb(0) as an ordinary, meaningful call rather than a special "count" case the way N=0 means elsewhere). N>=2: that later line. The 'u' (UTF8-encode) parameter and the %var/&binvar output forms aren't implemented -- this always just returns the text.
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L',');
+            CString nStr = c < 0 ? a : a.Left(c);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            CString clip = ReadClipboardText();
+            CString result;
+            if (N < 0) result = clip;
+            else {
+                auto lines = SplitLinesRobust(clip);
+                int idx = (N <= 1) ? 0 : N - 1;
+                result = (idx >= 0 && idx < (int)lines.size()) ? lines[idx] : CString();
+            }
+            if (prop == L"len") val.Format(L"%d", result.GetLength()); else val = result;
+            return true;
+        }
+        if (name == L"ial") {   // $ial(nick/mask,N)[.nick/.user/.host/.addr] -- the Nth entry in the Internal Address List matching a nick or full mask; N=0 is the total match count. .mark/.account/.gecos/.id/.bot/.away aren't implemented -- this client's IAL only ever stores a plain nick->address mapping, none of that extra per-entry info.
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.ReverseFind(L','); if (c < 0) return false;
+            CString mask = a.Left(c); double nD; if (!ParseNum(a.Mid(c + 1), nD)) return false; int N = (int)nD;
+            std::vector<std::pair<CString, CString>> matches;   // nick (display case lost -- m_ial only keys by lowercase), address
+            for (auto& kv : m_ial) { CString full = kv.first + L"!" + kv.second; if (GlobMatch(mask, full) || GlobMatch(mask, kv.first)) matches.push_back(kv); }
+            if (N == 0) { val.Format(L"%d", (int)matches.size()); return true; }
+            if (N < 1 || N > (int)matches.size()) { val.Empty(); return true; }
+            auto& m = matches[N - 1];
+            CString user, host; int at = m.second.Find(L'@'); if (at >= 0) { user = m.second.Left(at); host = m.second.Mid(at + 1); } else host = m.second;
+            if (prop == L"nick") val = m.first;
+            else if (prop == L"user") val = user;
+            else if (prop == L"host") val = host;
+            else if (prop == L"addr") val = m.second;
+            else val = m.first + L"!" + m.second;
+            return true;
+        }
+        if (name == L"hmac") {   // $hmac(text|filename,key,hash,N) -- N=0 (default): text is plain text; N=2: text is a filename to read. N=1 (&binvar) isn't implemented, same as this client's other &binvar-accepting identifiers, since there's no binary-variable system here at all.
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 2) return false;
+            CString text = p[0], key = p[1];
+            CString hashAlg = p.size() > 2 && !p[2].IsEmpty() ? p[2] : CString(L"sha1"); hashAlg.MakeLower();
+            int N = 0; if (p.size() > 3) { double d; if (ParseNum(p[3], d)) N = (int)d; }
+            if (N == 1) return false;   // &binvar form not implemented
+            std::vector<BYTE> dataBytes;
+            if (N == 2) {
+                CFile f; if (!f.Open(text, CFile::modeRead)) return false;
+                ULONGLONG len = f.GetLength(); dataBytes.resize((size_t)len);
+                if (len > 0) f.Read(dataBytes.data(), (UINT)len);
+            } else {
+                CStringA utf8 = CW2A(text, CP_UTF8);
+                dataBytes.assign((const BYTE*)utf8.GetString(), (const BYTE*)utf8.GetString() + utf8.GetLength());
+            }
+            CStringA keyUtf8 = CW2A(key, CP_UTF8);
+            std::vector<BYTE> keyBytes((const BYTE*)keyUtf8.GetString(), (const BYTE*)keyUtf8.GetString() + keyUtf8.GetLength());
+            LPCWSTR algId = hashAlg == L"md5" ? BCRYPT_MD5_ALGORITHM : hashAlg == L"sha256" ? BCRYPT_SHA256_ALGORITHM : hashAlg == L"sha384" ? BCRYPT_SHA384_ALGORITHM : hashAlg == L"sha512" ? BCRYPT_SHA512_ALGORITHM : BCRYPT_SHA1_ALGORITHM;
+            std::vector<BYTE> hmacResult;
+            if (!HmacCompute(algId, keyBytes, dataBytes.data(), (int)dataBytes.size(), hmacResult) || hmacResult.empty()) return false;
+            CString hex; for (auto b : hmacResult) { CString bs; bs.Format(L"%02x", b); hex += bs; }
+            val = hex; return true;
+        }
         if (name == L"hotp" || name == L"totp") {   // $hotp(key,counter[,hash][,digits]) | $totp(key[,time][,hash][,digits][,timestep]) -- RFC 4226/6238. key is auto-detected as hex (40/64/128 hex chars), Base32 (16/26/32 chars, the common Google-Authenticator-secret case), or otherwise treated as plain text; the explicit 'encoding' parameter some implementations also accept isn't implemented, only the auto-detection.
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
@@ -6931,18 +7329,34 @@ class CMainFrame : public CMDIFrameWnd {
             val.Format(fmt, code);
             return true;
         }
-        if (name == L"rand") {   // $rand(N,M) -- a random integer between N and M inclusive, in either order
+        if (name == L"rand" || name == L"r") {   // $rand(N,M) -- a random integer between N and M inclusive, in either order. $r is a plain equivalent alias for $rand (an older, deprecated identifier name -- same arguments, same behaviour), not a different/shorter function, so it's handled right here rather than as a separate case.
             CString a = EvalIds(w, rawArgs, params); int c = a.Find(L','); if (c < 0) return false;
-            double n1, n2; if (!ParseNum(a.Left(c), n1) || !ParseNum(a.Mid(c + 1), n2)) return false;
+            CString p1 = a.Left(c); p1.Trim(); CString p2 = a.Mid(c + 1); p2.Trim();
+            double n1, n2;
+            bool ok1 = ParseNum(p1, n1), ok2 = ParseNum(p2, n2);
+            // $rand(A,Z) / $rand(a,z): a single letter on either side picks by character code instead of by
+            // number -- real mIRC supports this, so a script written against it -- this one included -- is
+            // relying on it working exactly like $rand itself. asChar is decided from the ORIGINAL text, before
+            // the fallback below converts a letter into its numeric code for the actual range math.
+            bool asChar = (p1.GetLength() == 1 && iswalpha(p1[0])) || (p2.GetLength() == 1 && iswalpha(p2[0]));
+            if (!ok1 && p1.GetLength() == 1) { n1 = (double)(wchar_t)p1[0]; ok1 = true; }
+            if (!ok2 && p2.GetLength() == 1) { n2 = (double)(wchar_t)p2[0]; ok2 = true; }
+            if (!ok1 || !ok2) return false;
             __int64 lo = (__int64)(n1 < n2 ? n1 : n2), hi = (__int64)(n1 < n2 ? n2 : n1);
-            __int64 span = hi - lo + 1; if (span <= 0) { val.Format(L"%I64d", lo); return true; }
+            __int64 span = hi - lo + 1; if (span <= 0) { val = asChar ? CString((wchar_t)lo) : CString(); if (!asChar) val.Format(L"%I64d", lo); return true; }
             __int64 r = ((__int64)rand() << 32 | (unsigned)rand()) % span; if (r < 0) r += span;
-            val.Format(L"%I64d", lo + r); return true;
+            __int64 result = lo + r;
+            if (asChar) val = CString((wchar_t)result); else val.Format(L"%I64d", result);
+            return true;
         }
         if (name == L"replace" || name == L"replacecs") {   // $replace(text,old1,new1[,old2,new2,...]) -- pairs applied in sequence, each seeing the previous pair's result
             bool cs = (name == L"replacecs");
-            CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            // Splits the RAW, unevaluated argument text first (paren-aware), THEN evaluates each piece separately
+            // -- not the other way around. Evaluating the whole thing first and splitting the result is wrong
+            // whenever one of the arguments is itself something like $chr(44), deliberately producing a literal
+            // comma as its OUTPUT: evaluate-then-split mistakes that comma for an argument separator too, shifting
+            // every pair after it out of alignment and typically failing the pair-count check entirely.
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
             if (p.size() < 3 || (p.size() - 1) % 2 != 0) return false;
             CString text = p[0];
             for (size_t i = 1; i + 1 < p.size(); i += 2) {
@@ -6960,8 +7374,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"remove" || name == L"removecs") {   // $remove(string,sub1[,sub2,...]) -- each substring removed in turn from the result of the previous removal
             bool cs = (name == L"removecs");
-            CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));   // split raw text first, evaluate each piece after -- see $replace's own comment just above for why
             if (p.size() < 2) return false;
             CString text = p[0];
             for (size_t i = 1; i < p.size(); ++i) {
@@ -8135,15 +8548,32 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (lc == L"unset") return cmd + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params, false));
         if (lc == L"var") {
-            CString res = cmd; switches(res);
-            bool first = true; int pos = 0;
-            for (CString item = rest.Tokenize(L",", pos); !item.IsEmpty(); item = rest.Tokenize(L",", pos)) {
-                item.TrimLeft();
+            // /var's own declarations are evaluated AND STORED here directly, one at a time, in order -- not
+            // pre-evaluated into text for a later, separate /var dispatch to actually store. That two-phase
+            // split was itself the bug: a later item's value expression, in the SAME /var line, can legitimately
+            // reference an EARLIER one just declared in that same line (e.g. "%a = test, %b = $len(%a)", a
+            // completely ordinary pattern) -- pre-evaluating every item's value up front, before any of them are
+            // actually stored, means that reference sees the OLD value %a already held (often $null, i.e. 0 for
+            // $len), not the "test" being assigned to it moments earlier in the very same statement. Storing each
+            // one immediately, before moving on to evaluate the next, is what lets this actually work the way it
+            // does in real mIRC. This runs entirely here (rather than in CmdVar) because params -- needed to
+            // evaluate $1- and friends -- isn't something Dispatch carries through to CmdVar; by the time a
+            // command reaches Dispatch, it's expected to already be fully evaluated text.
+            CString restCopy = rest;
+            VarSw sw; if (!ParseVarSw(w, L"var", restCopy, sw, L"snzeglkipu")) { return L"var"; }   // ParseVarSw already reported its own error
+            for (auto& itemRaw : SplitTopLevelCommasParen(restCopy)) {   // paren-aware -- see $replace's own comment on why a plain comma split breaks a value that's itself a $identifier(args) call with commas of its own
+                CString item = itemRaw; item.Trim(); if (item.IsEmpty()) continue;
                 int k = 0; while (k < item.GetLength() && item[k] != L' ' && item[k] != L'=') k++;
-                res += (first ? L" " : L", ") + item.Left(k) + EvalIds(w, item.Mid(k), params);
-                first = false;
+                CString name = item.Left(k), tail = item.Mid(k), val; tail.TrimLeft();
+                if (name.Left(1) != L"%") { Show(w, L"* /var: variable names start with %", cPart); return L"var"; }
+                if (tail.Left(1) == L"=") {
+                    CString evaluated = EvalIds(w, StripOneLeadingSpace(tail.Mid(1)), params);
+                    if (!FinalValue(w, L"var", evaluated, sw, val)) return L"var";
+                }
+                StoreVar(name, val, sw, true);
             }
-            return res;
+            FlushVars();
+            return L"var";   // the real work already happened above; this just reaches CmdVar with nothing left to do, harmlessly
         }
         if (!lc.IsEmpty() && lc[0] == L'%') {   // "%x = 5 + 1" / "%x=5+1": the name stays as typed, the value is evaluated -- but only when this is actually an assignment (an "=" genuinely present somewhere). A bare "%var" with nothing else on the line is a different, common mIRC idiom instead -- "expand this variable and run whatever command its value holds" (e.g. "if (%todo != $null) { %todo }") -- and needs the same full, normal expansion as any other line, not this assignment-only special case, or it reaches Dispatch() still completely unexpanded and trips its own "%" assignment check there too, producing a spurious "Expected: ... = value" error instead of ever running the intended command.
             int eq = cmd.Find(L'=');
@@ -8263,7 +8693,22 @@ class CMainFrame : public CMDIFrameWnd {
     void WriteFileTextForKind(const CString& path, const CString& text, const CString& kind) {
         std::vector<CString> lines = SplitLinesRobust(text);
         if (kind == L"remote" && !HasIniSection(path, L"remote") && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
-            CStdioFile f; if (f.Open(path, CFile::modeCreate | CFile::modeWrite | CFile::typeText)) for (auto& l : lines) f.WriteString(l + L"\r\n");   // an existing plain .mrc with no "[remote]" section -- keep it plain text rather than converting it to this app's own INI format
+            // Converts to UTF-8 and writes the exact raw bytes with CFile::Write, rather than CStdioFile's own
+            // WriteString. Two different failure modes sit on either side of this, and WriteString can't avoid
+            // both at once: opened with CFile::typeText, its newline translation sees the "\n" inside the "\r\n"
+            // this loop already appends to every line and translates THAT too, turning one intended "\r\n" into
+            // "\r" plus a translated "\r\n" of its own -- "\r\r\n" -- on every line, every save. Dropping
+            // typeText to fix that (an earlier version of this fix) swaps in a worse problem: typeText is also
+            // what makes CStdioFile::WriteString convert a CString's UTF-16 to narrow text before writing it at
+            // all; without it, WriteString writes the wide characters themselves, two raw bytes apiece, which
+            // ReadAllLinesOf -- expecting UTF-8 or Windows-1252, see its own comment -- decodes as mostly null
+            // bytes and stray symbols, reading back as an almost entirely empty file. Doing the UTF-8 conversion
+            // explicitly and writing those exact bytes with Write (never WriteString) sidesteps both: nothing
+            // layers a second newline translation on top of the "\r\n" already in the buffer, and nothing
+            // reinterprets the text's own encoding along the way.
+            CFile f; if (f.Open(path, CFile::modeCreate | CFile::modeWrite | CFile::typeBinary)) {
+                for (auto& l : lines) { CStringA u8 = CW2A(l + L"\r\n", CP_UTF8); f.Write((LPCSTR)u8, u8.GetLength()); }
+            }   // an existing plain .mrc with no "[remote]" section -- keep it plain text rather than converting it to this app's own INI format
         } else {
             const wchar_t* section = kind == L"variables" ? L"variables" : kind == L"users" ? L"users" : kind == L"aliases" ? L"aliases" : L"remote";
             WritePrivateProfileStringW(section, nullptr, nullptr, path);
@@ -8661,6 +9106,10 @@ class CMainFrame : public CMDIFrameWnd {
         return true;
     }
     CString m_evSignal;   // what $signal returns -- the name passed to /signal that triggered the current on SIGNAL event
+    CString m_evLevel;    // what $clevel returns -- the <level> number from the specific "on <level>:EVENT:..." declaration that actually matched and is currently running; empty outside an event
+    CString m_evRawMsg;   // what $rawmsg returns -- the exact, full, unparsed line as received from the server, only set within a matching on RAW event
+    CString m_evOpnick, m_evVnick, m_evBnick;   // $opnick/$vnick/$bnick -- the nick (op/voice) or ban mask that a specific on OP/DEOP/VOICE/DEVOICE/BAN/UNBAN event fired for; $nick in these events is still who MADE the change
+    CString m_regErrStr;   // what $regerrstr returns -- the last $regex/$regsub/$regsubex compile error, if any. std::regex_error's own what() text, not literally PCRE's wording (this client uses std::regex, not PCRE), but the same role: a human-readable reason the pattern failed to compile.
     CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName, m_evNumeric;   // what $nick, $chan, $address, $knick,
     bool m_evHaltDef = false;   // $newnick, $event, $numeric resolve to while an event's commands are running
     // Internal Address List: nick (lowercase) -> user@host, learned passively from any prefixed line we see (JOIN,
@@ -8763,19 +9212,19 @@ class CMainFrame : public CMDIFrameWnd {
         if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
-        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName, savedLevel = m_evLevel;
         bool suppress = false;
         for (int pass = 0; pass < 2; pass++) {   // pass 0: ^-prefixed (can suppress the default); pass 1: normal (independent)
             for (auto& ev : m_events) {
                 if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
                 if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
-                m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evName = eventName;
+                m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, params);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
             }
         }
-        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
     // SIGNAL: matched by wildcard against the signal name itself (no channel/where concept -- a signal isn't tied
@@ -8783,15 +9232,15 @@ class CMainFrame : public CMDIFrameWnd {
     // duration of each matching event's run.
     void FireSignalEvent(CChatWnd* w, const CString& signalName, const CString& params) {
         if (!m_remoteOn || !m_eventsOn) return;
-        CString savedSignal = m_evSignal;
+        CString savedSignal = m_evSignal, savedLevel = m_evLevel;
         for (auto& ev : m_events) {
             if (ev.eventName != L"SIGNAL") continue;
             if (!IsGroupEnabled(ev.groupName)) continue;
             if (!GlobMatch(ev.matchText, signalName)) continue;
-            m_evSignal = signalName;
+            m_evSignal = signalName; m_evLevel.Format(L"%d", ev.level);
             RunScript(w, ev.lines, params);
         }
-        m_evSignal = savedSignal;
+        m_evSignal = savedSignal; m_evLevel = savedLevel;
     }
     // TEXT/ACTION/NOTICE: matched against both matchtext (wildcard, against the message) and where (#, ?, *, or a
     // specific channel). $1- is set to the message text itself.
@@ -8799,7 +9248,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
-        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName, savedLevel = m_evLevel;
         bool suppress = false;
         for (int pass = 0; pass < 2; pass++) {
             for (auto& ev : m_events) {
@@ -8807,12 +9256,12 @@ class CMainFrame : public CMDIFrameWnd {
                 if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesTextWhere(ev.whereSpec, isPriv, chanOrNick)) continue;
                 if (!GlobMatch(ev.matchText, text)) continue;
-                m_evNick = nick; m_evChan = isPriv ? CString() : chanOrNick; m_evAddress = address; m_evName = eventName;
+                m_evNick = nick; m_evChan = isPriv ? CString() : chanOrNick; m_evAddress = address; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, text);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
             }
         }
-        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
     // WALLOPS: matchtext against the message, same as TEXT/ACTION/NOTICE, but no "where" to check at all --
@@ -8821,19 +9270,19 @@ class CMainFrame : public CMDIFrameWnd {
         if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
-        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName, savedLevel = m_evLevel;
         bool suppress = false;
         for (int pass = 0; pass < 2; pass++) {
             for (auto& ev : m_events) {
                 if (ev.eventName != L"WALLOPS" || ev.haltDefaultPrefix != (pass == 0)) continue;
                 if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!GlobMatch(ev.matchText, text)) continue;
-                m_evNick = nick; m_evChan = CString(); m_evAddress = address; m_evName = L"WALLOPS";
+                m_evNick = nick; m_evChan = CString(); m_evAddress = address; m_evName = L"WALLOPS"; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, text);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
             }
         }
-        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName;
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
     // raw events: fires for literally any incoming line, checked once at the very top of dispatch before any
@@ -8842,21 +9291,21 @@ class CMainFrame : public CMDIFrameWnd {
     // mIRC's documented "prevent raw server messages from printing out their default text" behavior. There's no
     // ^-prefix/level field here the way on events have one (raw's own syntax has no level position for it) --
     // /halt is simply always available within a raw event's commands.
-    bool FireRawEvent(CChatWnd* w, const CString& cmd, const CString& paramsText) {
+    bool FireRawEvent(CChatWnd* w, const CString& cmd, const CString& paramsText, const CString& rawLine) {
         if (!m_remoteOn || !m_rawEventsOn) return false;   // /remote, /raw on|off
         if (m_rawEvents.empty()) return false;   // the fast path mIRC's own docs ask scripts to keep in mind, applied here too: skip all matching work when there's nothing to match against
-        CString savedNumeric = m_evNumeric, savedName = m_evName;
+        CString savedNumeric = m_evNumeric, savedName = m_evName, savedRawMsg = m_evRawMsg;
         bool suppress = false;
         for (auto& ev : m_rawEvents) {
             if (ev.numericOrName != cmd) continue;
             if (!IsGroupEnabled(ev.groupName)) continue;
             if (!GlobMatch(ev.matchText, paramsText)) continue;
             bool isNumeric = !cmd.IsEmpty() && IsAllDigits(cmd);
-            m_evNumeric = isNumeric ? cmd : CString(); m_evName = cmd;
+            m_evNumeric = isNumeric ? cmd : CString(); m_evName = cmd; m_evRawMsg = rawLine;
             RunScript(w, ev.lines, paramsText);
             if (m_halt) { suppress = true; break; }
         }
-        m_evNumeric = savedNumeric; m_evName = savedName;
+        m_evNumeric = savedNumeric; m_evName = savedName; m_evRawMsg = savedRawMsg;
         return suppress;
     }
     // %varname -> its current value, for matchtext fields that document %variable support (ctcp events). Only a
@@ -9035,34 +9484,69 @@ class CMainFrame : public CMDIFrameWnd {
         if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
         IalLearn(nick, address);
         m_evHaltDef = false;
-        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedKnick = m_evKnick, savedName = m_evName;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedKnick = m_evKnick, savedName = m_evName, savedLevel = m_evLevel;
         bool suppress = false;
         for (int pass = 0; pass < 2; pass++) {
             for (auto& ev : m_events) {
                 if (ev.eventName != L"KICK" || ev.haltDefaultPrefix != (pass == 0)) continue;
                 if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
-                m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evKnick = knick; m_evName = L"KICK";
+                m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evKnick = knick; m_evName = L"KICK"; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, reason);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
             }
         }
-        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evKnick = savedKnick; m_evName = savedName;
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evKnick = savedKnick; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
+    }
+    // MODE: fires once per incoming MODE line, $1- being the mode string and its parameters together, same as
+    // mIRC's own documented on MODE. Then, separately, derives and fires on OP/DEOP/VOICE/DEVOICE/BAN/UNBAN --
+    // once EACH per individual matching change within that line (so "+oo nick1 nick2" fires on OP twice), using
+    // ParseModeString's CHANMODES-aware parsing to correctly find each one's own target parameter.
+    void FireModeEvents(CChatWnd* w, Net* net, const CString& chan, const CString& nick, const CString& address, const CString& modeStr, const std::vector<CString>& params, size_t paramStart) {
+        if (m_remoteOn && m_eventsOn) {
+            IalLearn(nick, address);
+            CString full = modeStr; for (size_t i = paramStart; i < params.size(); i++) full += L" " + params[i];
+            FireChannelEvent(w, L"MODE", chan, nick, address, full);
+        }
+        auto changes = ParseModeString(net->chanmodes, modeStr, params, paramStart);
+        for (auto& ch : changes) {
+            if (ch.param.IsEmpty() && (ch.modeChar == L'o' || ch.modeChar == L'v' || ch.modeChar == L'b')) continue;   // no target parameter actually available -- nothing meaningful to fire for
+            if (ch.modeChar == L'o') FireModeSubEvent(w, ch.adding ? L"OP" : L"DEOP", chan, nick, address, ch.param, m_evOpnick);
+            else if (ch.modeChar == L'v') FireModeSubEvent(w, ch.adding ? L"VOICE" : L"DEVOICE", chan, nick, address, ch.param, m_evVnick);
+            else if (ch.modeChar == L'b') FireModeSubEvent(w, ch.adding ? L"BAN" : L"UNBAN", chan, nick, address, ch.param, m_evBnick);
+        }
+    }
+    // Shared by the six mode-derived events above: same shape as FireChannelEvent, but also sets whichever single
+    // $opnick/$vnick/$bnick the caller passes a reference to, scoped to just this one event name's own matches
+    // (the other two stay whatever they already were, since a single MODE line can trigger several different
+    // derived events and each should only touch its own identifier).
+    void FireModeSubEvent(CChatWnd* w, const CString& eventName, const CString& chan, const CString& nick, const CString& address, const CString& affected, CString& targetVar) {
+        if (!m_remoteOn || !m_eventsOn) return;
+        CString saved = targetVar;
+        CString savedNick = m_evNick, savedChan = m_evChan, savedAddr = m_evAddress, savedName = m_evName, savedLevel = m_evLevel;
+        for (auto& ev : m_events) {
+            if (ev.eventName != eventName) continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            if (!MatchesWhereSpec(ev.whereSpec, chan)) continue;
+            m_evNick = nick; m_evChan = chan; m_evAddress = address; m_evName = eventName; m_evLevel.Format(L"%d", ev.level); targetVar = affected;
+            RunScript(w, ev.lines, affected);
+        }
+        m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel; targetVar = saved;
     }
     // QUIT/NICK/CONNECT: no "where" to match against, so every matching event always runs.
     void FireSimpleEvent(CChatWnd* w, const CString& eventName, const CString& nick, const CString& address, const CString& params, const CString& newnick = CString()) {
         if (!m_remoteOn || !m_eventsOn) return;   // /remote, /events
         IalLearn(nick, address);
         if (!newnick.IsEmpty()) IalRename(nick, newnick);
-        CString savedNick = m_evNick, savedAddr = m_evAddress, savedNewnick = m_evNewnick, savedName = m_evName;
+        CString savedNick = m_evNick, savedAddr = m_evAddress, savedNewnick = m_evNewnick, savedName = m_evName, savedLevel = m_evLevel;
         for (auto& ev : m_events) {
             if (ev.eventName != eventName) continue;
             if (!IsGroupEnabled(ev.groupName)) continue;
-            m_evNick = nick; m_evAddress = address; m_evNewnick = newnick; m_evName = eventName;
+            m_evNick = nick; m_evAddress = address; m_evNewnick = newnick; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
             RunScript(w, ev.lines, params);
         }
-        m_evNick = savedNick; m_evAddress = savedAddr; m_evNewnick = savedNewnick; m_evName = savedName;
+        m_evNick = savedNick; m_evAddress = savedAddr; m_evNewnick = savedNewnick; m_evName = savedName; m_evLevel = savedLevel;
     }
     // ---- Scripts Editor: the Popups tab shows all five popups.ini sections as one text block, bracketed headers
     // marking where each one starts, same idea as the [Status Window] etc. shown in the real mIRC editor ----
@@ -10399,7 +10883,7 @@ class CMainFrame : public CMDIFrameWnd {
 
         if (!m_rawEvents.empty()) {   // raw events: checked once, here, before any numeric-specific handling -- see FireRawEvent
             CString paramsText; for (size_t i = 0; i < p.size(); i++) paramsText += (i ? L" " : L"") + p[i];
-            if (FireRawEvent(Status(net), cmd, paramsText)) return;   // /halt within a matching raw event suppresses this client's own further handling of the line entirely
+            if (FireRawEvent(Status(net), cmd, paramsText, raw)) return;   // /halt within a matching raw event suppresses this client's own further handling of the line entirely
         }
 
         if (cmd == L"005") {   // RPL_ISUPPORT: pick out NETWORK=<name> for $network (the line itself still prints below, as before)
@@ -10583,6 +11067,7 @@ class CMainFrame : public CMDIFrameWnd {
                     }
                 }
                 w->m_refresh = true; Send(net, L"NAMES " + P(0));
+                FireModeEvents(w, net, P(0), nick, host, P(1), p, 2);
             }
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
