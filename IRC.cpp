@@ -2290,7 +2290,7 @@ struct Net {
 // -- the IRC server is never involved in it at all. ----
 struct DccSession {
     enum Kind { CHAT, SEND, GET } kind = CHAT;
-    enum State { AWAITING_ACCEPT, LISTENING, CONNECTING, ACTIVE, DONE, FAILED } state = AWAITING_ACCEPT;
+    enum State { AWAITING_ACCEPT, LISTENING, CONNECTING, ACTIVE, DONE, FAILED, AWAITING_PASSIVE_REPLY } state = AWAITING_ACCEPT;   // AWAITING_PASSIVE_REPLY: we offered a passive (reverse) send -- no listening socket of our own yet, waiting for the peer's own "I'm listening, here's where" reply before we can connect out to them
     Net* net = nullptr;             // which connection the CTCP request/offer was exchanged over
     CString nick, address;          // the peer: nick and "user@host" (address is for display only)
     bool weOffered = false;         // true: we sent the CTCP and are listening; false: we received it and connect out
@@ -2306,6 +2306,7 @@ struct DccSession {
     ULONGLONG startTick = 0;        // GetTickCount64() when the transfer actually started, for the rate display
     ULONGLONG lastUiTick = 0;       // throttles DccUpdateProgressDisplay -- a large file can generate acks/data far faster than the UI needs to repaint
     bool overwriteConfirmed = false;
+    CString passiveToken;            // non-empty only for a passive (reverse) DCC send: the token that ties our original offer to the peer's reply, so a later "DCC SEND" CTCP from them can be recognized as that reply rather than a brand new, unrelated file offer
 };
 
 // ---------------- DCC Chat incoming-request dialog: Accept / Ignore / Cancel, matching mIRC's own layout ----------------
@@ -4618,10 +4619,10 @@ class CDccOptionsDlg : public CDialog {
         t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
     }
 public:
-    CString firstPort, lastPort;
-    CDccOptionsDlg(CWnd* parent, const CString& firstIn, const CString& lastIn) : firstPort(firstIn), lastPort(lastIn) {
+    CString firstPort, lastPort; bool usePassive;
+    CDccOptionsDlg(CWnd* parent, const CString& firstIn, const CString& lastIn, bool usePassiveIn) : firstPort(firstIn), lastPort(lastIn), usePassive(usePassiveIn) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
-        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(150);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(188);
         t.push_back(0); t.push_back(0); S(L"DCC Options"); t.push_back(9); S(DEFAULT_FONT);
         Item(SS_LEFT, 10, 8, 212, 50, 0xFFFF, 0x0082,
             L"Ports used for listening when offering a DCC Chat or Send. Leave both at 0 to let Windows pick a "
@@ -4630,12 +4631,17 @@ public:
         Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 100, 64, 100, 14, 950, 0x0081, firstPort);
         Item(SS_LEFT, 10, 86, 80, 12, 0xFFFF, 0x0082, L"Last port:");
         Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 100, 84, 100, 14, 951, 0x0081, lastPort);
-        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 40, 116, 60, 14, IDOK, 0x0080, L"OK");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 116, 60, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(SS_LEFT, 10, 106, 212, 32, 0xFFFF, 0x0082,
+            L"Passive (reverse) DCC: if YOU can't be connected to directly (behind a firewall/NAT with no port "
+            L"forwarding), enable this so the other person listens instead and you connect out to them.");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 10, 140, 212, 10, 952, 0x0080, L"Use passive (reverse) DCC when sending");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 40, 154, 60, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 110, 154, 60, 14, IDCANCEL, 0x0080, L"Cancel");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
-    void OnOK() override { GetDlgItemText(950, firstPort); GetDlgItemText(951, lastPort); CDialog::OnOK(); }
+    BOOL OnInitDialog() override { CDialog::OnInitDialog(); CheckDlgButton(952, usePassive ? BST_CHECKED : BST_UNCHECKED); return TRUE; }
+    void OnOK() override { GetDlgItemText(950, firstPort); GetDlgItemText(951, lastPort); usePassive = IsDlgButtonChecked(952) == BST_CHECKED; CDialog::OnOK(); }
 };
 
 // A small square that just draws whatever HICON it's given, centered -- used by the Tray dialog's icon preview.
@@ -12033,11 +12039,12 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void OnDccOptionsDialog() {
         CString firstS, lastS; firstS.Format(L"%d", m_dccPortMin); lastS.Format(L"%d", m_dccPortMax);
-        CDccOptionsDlg dlg(this, firstS, lastS);
+        CDccOptionsDlg dlg(this, firstS, lastS, m_dccUsePassive);
         if (dlg.DoModal() != IDOK) return;
         int first = _wtoi(dlg.firstPort), last = _wtoi(dlg.lastPort);
         if (first > 0 && last > 0 && last < first) std::swap(first, last);   // a reversed range is an easy typo to make and an easy one to just fix rather than reject
         m_dccPortMin = first; m_dccPortMax = last;
+        m_dccUsePassive = dlg.usePassive;
         SaveDccSettings();
     }
     // ---------------- DCC Chat / Send ----------------
@@ -12049,12 +12056,20 @@ class CMainFrame : public CMDIFrameWnd {
     // (not sharing a LAN) can't work at all regardless of how correct the offered IP is. A real range here is what
     // actually makes that possible: forward that range once, and every future DCC offer listens inside it.
     int m_dccPortMin = 0, m_dccPortMax = 0;
+    // Passive (reverse) DCC: when WE offer a send, instead of listening ourselves and telling the peer where to
+    // connect, we tell them we can't listen (port 0) and a token; they listen instead and reply with their own
+    // address/port, and we connect out to them. This is what lets a Send succeed when WE are the one behind a
+    // firewall/NAT that can't be connected into -- the direction nothing else here can work around, since every
+    // other DCC fix (the port range above, local-IP detection) only helps when it's the PEER who can't be reached.
+    bool m_dccUsePassive = false;
+    int m_dccNextPassiveToken = 1;   // just needs to be unique among our own outstanding passive offers, not globally -- a simple incrementing counter is enough
     void LoadDccSettings() {
         CWinApp* a = AfxGetApp();
         m_dccShowFileWarning = a->GetProfileInt(L"DCC", L"ShowFileWarning", 1) != 0;
         m_dccDownloadFolder = a->GetProfileString(L"DCC", L"DownloadFolder", L"");
         m_dccPortMin = a->GetProfileInt(L"DCC", L"PortMin", 0);
         m_dccPortMax = a->GetProfileInt(L"DCC", L"PortMax", 0);
+        m_dccUsePassive = a->GetProfileInt(L"DCC", L"UsePassive", 0) != 0;
     }
     void SaveDccSettings() {
         CWinApp* a = AfxGetApp();
@@ -12062,6 +12077,7 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileString(L"DCC", L"DownloadFolder", m_dccDownloadFolder);
         a->WriteProfileInt(L"DCC", L"PortMin", m_dccPortMin);
         a->WriteProfileInt(L"DCC", L"PortMax", m_dccPortMax);
+        a->WriteProfileInt(L"DCC", L"UsePassive", m_dccUsePassive);
     }
     // Tries each port in the configured range in turn (a given port might already be in use by something else on
     // this machine) until one succeeds; with no range configured, falls back to the original random-port behavior.
@@ -12252,6 +12268,19 @@ class CMainFrame : public CMDIFrameWnd {
         sess->state = DccSession::ACTIVE;
         DccUpdateProgressDisplay(sess);
     }
+    // Passive-Get counterpart to DccGetConnectResult: there, we connected out to the peer; here, the PEER offered
+    // passively, so we're the one listening, and they're the one connecting to us. Same "start receiving" steps
+    // once a live connection exists, after accepting it off the listening socket.
+    void DccGetPeerConnected(DccSession* sess) {
+        auto newSock = std::make_unique<CDccSock>();
+        if (!sess->sock->Accept(*newSock)) { DccProgressFail(sess, L"Accept failed."); return; }
+        sess->live = std::move(newSock);
+        sess->startTick = ::GetTickCount64();
+        sess->live->onData = [this, sess](const char* data, int n) { DccGetOnData(sess, data, n); };
+        sess->live->onClose = [this, sess]() { DccGetOnClose(sess); };
+        sess->state = DccSession::ACTIVE;
+        DccUpdateProgressDisplay(sess);
+    }
     void DccSendInitiate(Net* net, CChatWnd* fromWin, const CString& nick) {
         if (!net || !net->conn) { Show(fromWin, L"* Not connected.", cPart); return; }
         CFileDialog fdlg(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"All Files (*.*)|*.*||", this);
@@ -12262,11 +12291,26 @@ class CMainFrame : public CMDIFrameWnd {
         CString filename = NoPathPart(path);
 
         auto sess = std::make_unique<DccSession>();
-        sess->kind = DccSession::SEND; sess->net = net; sess->nick = nick; sess->weOffered = true; sess->state = DccSession::LISTENING;
+        sess->kind = DccSession::SEND; sess->net = net; sess->nick = nick; sess->weOffered = true;
         sess->filename = filename; sess->localPath = path; sess->fileSize = size;
-        sess->sock = std::make_unique<CDccSock>();
-        if (!DccBindListenPort(sess->sock.get())) { Show(fromWin, L"* DCC Send: couldn't start listening (every port tried was unavailable).", cPart); return; }
-        CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
+        unsigned long ipInt = DccIpToUint(DccLocalIp(net));
+        CString ctcpFilename = filename; ctcpFilename.Replace(L' ', L'_');   // DCC's wire format has no quoting for spaces; replacing them is the standard convention (mIRC's own "Fill Spaces" option)
+        CString ctcp;
+
+        if (m_dccUsePassive) {
+            // Passive: we can't listen (or choose not to), so offer port 0 plus a token instead, and wait for the
+            // peer's own reply -- they listen, and tell us where via a second "DCC SEND" CTCP carrying the same
+            // token, which HandleDccCtcp recognizes as a reply to this pending offer rather than a new file offer.
+            sess->state = DccSession::AWAITING_PASSIVE_REPLY;
+            sess->passiveToken.Format(L"%d", m_dccNextPassiveToken++);
+            ctcp.Format(L"DCC SEND %s %lu 0 %llu %s", (LPCWSTR)ctcpFilename, ipInt, size, (LPCWSTR)sess->passiveToken);
+        } else {
+            sess->state = DccSession::LISTENING;
+            sess->sock = std::make_unique<CDccSock>();
+            if (!DccBindListenPort(sess->sock.get())) { Show(fromWin, L"* DCC Send: couldn't start listening (every port tried was unavailable).", cPart); return; }
+            CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
+            ctcp.Format(L"DCC SEND %s %lu %u %llu", (LPCWSTR)ctcpFilename, ipInt, (unsigned)localPort, size);
+        }
 
         CChatWnd* w = OpenDccProgressWindow(L"Send " + nick + L" " + filename);
         w->m_dccSession = sess.get(); sess->win = w;
@@ -12274,12 +12318,25 @@ class CMainFrame : public CMDIFrameWnd {
             L"\r\n\r\nEstimate:\r\nRate:\r\nStatus:   Awaiting reply");
 
         DccSession* raw = sess.get();
-        sess->sock->onAccept = [this, raw]() { DccSendPeerConnected(raw); };
-        unsigned long ipInt = DccIpToUint(DccLocalIp(net));
-        CString ctcpFilename = filename; ctcpFilename.Replace(L' ', L'_');   // DCC's wire format has no quoting for spaces; replacing them is the standard convention (mIRC's own "Fill Spaces" option)
-        CString ctcp; ctcp.Format(L"DCC SEND %s %lu %u %llu", (LPCWSTR)ctcpFilename, ipInt, (unsigned)localPort, size);
+        if (sess->sock) sess->sock->onAccept = [this, raw]() { DccSendPeerConnected(raw); };
         Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + ctcp + CString(wchar_t(1)));
         m_dcc.push_back(std::move(sess));
+    }
+    // The passive-mode counterpart to DccSendPeerConnected: there, a peer connects TO our listening socket; here,
+    // WE connect OUT to the peer (after they replied to our passive offer with their own listening address). Same
+    // "open the file, wire the callbacks, start pumping" steps, just without an Accept() since sess->sock is
+    // already the live, connected socket rather than a listening one.
+    void DccSendConnectResult(DccSession* sess, int e) {
+        if (e != 0) { DccProgressFail(sess, L"Connection failed."); return; }
+        sess->live = std::move(sess->sock);
+        sess->file = std::make_unique<CFile>();
+        if (!sess->file->Open(sess->localPath, CFile::modeRead)) { DccProgressFail(sess, L"Couldn't reopen the file."); return; }
+        sess->startTick = ::GetTickCount64();
+        sess->live->onData = [this, sess](const char* data, int n) { DccSendOnAck(sess, data, n); };
+        sess->live->onClose = [this, sess]() { DccSendOnClose(sess); };
+        sess->live->onSend = [this, sess]() { DccSendPump(sess); };
+        sess->state = DccSession::ACTIVE;
+        DccSendPump(sess);
     }
     // If an incoming DCC offer's address is the exact same public IP we'd offer ourselves (DccLocalIp), the peer
     // is on this same machine or behind this same router/NAT -- real mIRC evidently detects this and substitutes
@@ -12383,11 +12440,30 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (type == L"SEND") {
             CString fname = Word(rest);
-            CString ipTok = Word(rest), portTok = Word(rest), sizeTok = rest; sizeTok.Trim();
+            CString ipTok = Word(rest), portTok = Word(rest), sizeTok = Word(rest), tokenTok = rest; tokenTok.Trim();
             CString ip = DccMapSelfIp(net, DccParseIpToken(ipTok));
             UINT port = (UINT)_wtoi(portTok);
             unsigned __int64 size = _wtoi64(sizeTok);
-            if (ip.IsEmpty() || port == 0 || fname.IsEmpty()) { Show(Status(net), L"* Malformed DCC SEND request from " + nick, cPart); return; }
+            // Before treating this as a brand-new file offer, check whether it's actually the reply to one of OUR
+            // OWN pending passive sends: same peer, matching token, still waiting. If so, the peer is now
+            // listening at this address/port and it's our turn to connect out to them.
+            if (!tokenTok.IsEmpty()) {
+                for (auto& s : m_dcc) {
+                    if (s->kind != DccSession::SEND || !s->weOffered || s->state != DccSession::AWAITING_PASSIVE_REPLY) continue;
+                    if (s->net != net || s->nick.CompareNoCase(nick) != 0 || s->passiveToken != tokenTok) continue;
+                    if (ip.IsEmpty() || port == 0) { DccProgressFail(s.get(), L"Peer's passive DCC reply was malformed."); return; }
+                    DccSession* raw = s.get();
+                    s->sock = std::make_unique<CDccSock>();
+                    s->sock->Create();
+                    s->state = DccSession::CONNECTING;
+                    DccProgressSetStatus(raw, L"Sending:  " + raw->filename + L"\r\nTo:       " + nick + L"\r\nFrom:     " + NoFilePart(raw->localPath) +
+                        L"\r\n\r\nEstimate:\r\nRate:\r\nStatus:   Connecting...");
+                    s->sock->onConnect = [this, raw](int e) { DccSendConnectResult(raw, e); };
+                    s->sock->Connect(ip, port);
+                    return;
+                }
+            }
+            if (ip.IsEmpty() || fname.IsEmpty() || (port == 0 && tokenTok.IsEmpty())) { Show(Status(net), L"* Malformed DCC SEND request from " + nick, cPart); return; }
             if (m_dccShowFileWarning) {
                 CDccFileWarningDlg warnDlg(this); warnDlg.alwaysShow = m_dccShowFileWarning;
                 warnDlg.DoModal();   // only has an OK (and Help) button -- nothing to decline here, it's purely informational
@@ -12403,20 +12479,37 @@ class CMainFrame : public CMDIFrameWnd {
                 return;
             }
             auto sess = std::make_unique<DccSession>();
-            sess->kind = DccSession::GET; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false; sess->state = DccSession::CONNECTING;
+            sess->kind = DccSession::GET; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false;
             sess->filename = fname; sess->localPath = dlg.savePath; sess->fileSize = size;
             sess->file = std::make_unique<CFile>();
             if (!sess->file->Open(dlg.savePath, CFile::modeCreate | CFile::modeWrite)) { Show(Status(net), L"* DCC Get: couldn't create " + dlg.savePath, cPart); return; }
-            sess->sock = std::make_unique<CDccSock>();
-            sess->sock->Create();
             CChatWnd* w = OpenDccProgressWindow(L"Get " + nick + L" " + fname);
             w->m_dccSession = sess.get(); sess->win = w;
-            DccProgressSetStatus(sess.get(), L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + dlg.savePath +
-                L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Connecting...");
-            if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
             DccSession* raw = sess.get();
-            sess->sock->onConnect = [this, raw](int e) { DccGetConnectResult(raw, e); };
-            sess->sock->Connect(ip, port);
+            if (port == 0) {
+                // The PEER offered passively -- they can't listen, so we do instead, then reply with our own
+                // address/port (same token) so they know where to connect to us.
+                sess->sock = std::make_unique<CDccSock>();
+                if (!DccBindListenPort(sess->sock.get())) { Show(Status(net), L"* DCC Get: couldn't start listening (every port tried was unavailable).", cPart); return; }
+                CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
+                sess->state = DccSession::LISTENING;
+                DccProgressSetStatus(raw, L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + dlg.savePath +
+                    L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Awaiting connection...");
+                if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+                sess->sock->onAccept = [this, raw]() { DccGetPeerConnected(raw); };
+                CString replyFname = fname; replyFname.Replace(L' ', L'_');
+                CString reply; reply.Format(L"DCC SEND %s %lu %u %llu %s", (LPCWSTR)replyFname, DccIpToUint(DccLocalIp(net)), (unsigned)localPort, size, (LPCWSTR)tokenTok);
+                Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + reply + CString(wchar_t(1)));
+            } else {
+                sess->sock = std::make_unique<CDccSock>();
+                sess->sock->Create();
+                sess->state = DccSession::CONNECTING;
+                DccProgressSetStatus(raw, L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + dlg.savePath +
+                    L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Connecting...");
+                if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+                sess->sock->onConnect = [this, raw](int e) { DccGetConnectResult(raw, e); };
+                sess->sock->Connect(ip, port);
+            }
             m_dcc.push_back(std::move(sess));
             return;
         }
