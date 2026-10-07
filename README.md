@@ -28,16 +28,18 @@ you may get random bugs, glitches, or crashes.
 ~~load / unload scripts~~  
 support editing multi scripts in the script editor   
 identifiers  
-scripting support for menu popups  
+~~scripting support for making menu popups~~   
+~~scripting support for making dialogs~~     
 scripting  
 ~~script editor to let you to edit aliases/vars/scripts~~  
 ~~online timer~~  
 ~~timer~~  
-~~tray icon~~ 
+~~tray icon~~  
 ~~identd server~~     
 ~~DCC chat/file send~~  
-DCC server
-FServe      
+DCC server  
+~~Passive DCC option~~  
+~~FServe~~          
 ~~address book~~      
 ~~notify~~  
 ~~play sounds via /splay~~  

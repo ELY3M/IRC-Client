@@ -2307,6 +2307,13 @@ struct DccSession {
     ULONGLONG lastUiTick = 0;       // throttles DccUpdateProgressDisplay -- a large file can generate acks/data far faster than the UI needs to repaint
     bool overwriteConfirmed = false;
     CString passiveToken;            // non-empty only for a passive (reverse) DCC send: the token that ties our original offer to the peer's reply, so a later "DCC SEND" CTCP from them can be recognized as that reply rather than a brand new, unrelated file offer
+    // ---- /fserve only (a CHAT session, just with its incoming lines interpreted as fileserver commands
+    // instead of displayed as plain chat) ----
+    bool isFileServer = false;
+    CString fsHomeDir;                // the fixed root the session can never navigate above -- the actual security boundary
+    CString fsCurDir;                 // where "cd" has navigated to so far, always inside fsHomeDir's own subtree
+    CString fsWelcomeFile;            // sent (its contents) when the peer first connects, if non-empty
+    int fsMaxGets = 1;                // the maxgets argument to /fserve -- checked against currently in-progress sends to this same peer before allowing another "get"
 };
 
 // ---------------- DCC Chat incoming-request dialog: Accept / Ignore / Cancel, matching mIRC's own layout ----------------
@@ -9781,6 +9788,34 @@ class CMainFrame : public CMDIFrameWnd {
             else if (bin) { SHFILEOPSTRUCTW op = {}; CString z = a + CString(L'\0'); op.wFunc = FO_DELETE; op.pFrom = z; op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT; SHFileOperationW(&op); }
             else if (!DeleteFileW(a)) Show(w, L"* /remove: couldn't delete " + a, cPart);
         }
+        else if (cmd == L"fserve") {   // /fserve <nickname> <maxgets> <homedirectory> [welcomefile] -- initiates a DCC Chat whose incoming lines are interpreted as fileserver commands (dir/ls/cd/get/read) instead of displayed as plain chat
+            if (!net || !net->conn) { Show(w, L"* Not connected.", cPart); return; }
+            CString a = arg;
+            CString nick = Word(a), maxGetsStr = Word(a), homeDirRaw = Word(a), welcomeFile = a; welcomeFile.Trim();
+            if (nick.IsEmpty() || maxGetsStr.IsEmpty() || homeDirRaw.IsEmpty()) { Show(w, L"* Usage: /fserve <nickname> <maxgets> <homedirectory> [welcomefile]", cPart); return; }
+            if (!IsDirPath(homeDirRaw)) { Show(w, L"* /fserve: '" + homeDirRaw + L"' is not a valid directory.", cPart); return; }
+            wchar_t fullHome[MAX_PATH];
+            if (!::GetFullPathNameW(homeDirRaw, MAX_PATH, fullHome, nullptr)) { Show(w, L"* /fserve: couldn't resolve '" + homeDirRaw + L"'.", cPart); return; }
+            CString homeDir(fullHome); homeDir.TrimRight(L'\\');
+
+            auto sess = std::make_unique<DccSession>();
+            sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->weOffered = true; sess->state = DccSession::LISTENING;
+            sess->isFileServer = true; sess->fsHomeDir = homeDir; sess->fsCurDir = homeDir; sess->fsWelcomeFile = welcomeFile;
+            sess->fsMaxGets = _wtoi(maxGetsStr); if (sess->fsMaxGets < 1) sess->fsMaxGets = 1;
+            sess->sock = std::make_unique<CDccSock>();
+            if (!DccBindListenPort(sess->sock.get())) { Show(w, L"* /fserve: couldn't start listening (every port tried was unavailable).", cPart); return; }
+            CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
+            CChatWnd* fw = OpenDccChatWindow(nick);
+            fw->m_dccSession = sess.get(); sess->win = fw;
+            Show(fw, L"File server session with " + nick, cJoin);
+            Show(fw, L"Waiting for acknowledgement...", cPart);
+            DccSession* raw = sess.get();
+            sess->sock->onAccept = [this, raw]() { DccChatPeerConnected(raw); };
+            unsigned long ipInt = DccIpToUint(DccLocalIp(net));
+            CString ctcp; ctcp.Format(L"DCC CHAT chat %lu %u", ipInt, (unsigned)localPort);
+            Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + ctcp + CString(wchar_t(1)));
+            m_dcc.push_back(std::move(sess));
+        }
         else if (cmd == L"signal") {   // /signal [-n] <name> [parameters] -- triggers every matching on SIGNAL event. Real mIRC's default (no -n) actually defers the signal until the current script finishes running, firing it immediately only with -n; this always fires immediately either way, a deliberate simplification rather than building a separate deferred-signal queue for a timing distinction most scripts won't depend on. The existing script recursion-depth guard already protects against runaway signal-triggers-signal loops, so no separate iteration cap was added on top of that.
             CString a = arg;
             while (a.Left(1) == L"-" && a.GetLength() > 1) Word(a);   // -n accepted and ignored, per the simplification above
@@ -12285,7 +12320,12 @@ class CMainFrame : public CMDIFrameWnd {
         if (!net || !net->conn) { Show(fromWin, L"* Not connected.", cPart); return; }
         CFileDialog fdlg(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"All Files (*.*)|*.*||", this);
         if (fdlg.DoModal() != IDOK) return;
-        CString path = fdlg.GetPathName();
+        DccSendInitiateFile(net, fromWin, nick, fdlg.GetPathName());
+    }
+    // The actual send-offer logic, factored out of DccSendInitiate so the file server's own "get" command (where
+    // the remote peer names the file, not a local file-picker dialog) can reuse it directly.
+    void DccSendInitiateFile(Net* net, CChatWnd* fromWin, const CString& nick, const CString& path) {
+        if (!net || !net->conn) { Show(fromWin, L"* Not connected.", cPart); return; }
         CFile probe; if (!probe.Open(path, CFile::modeRead)) { Show(fromWin, L"* Couldn't open " + path, cPart); return; }
         unsigned __int64 size = probe.GetLength(); probe.Close();
         CString filename = NoPathPart(path);
@@ -12522,6 +12562,7 @@ class CMainFrame : public CMDIFrameWnd {
         WireDccChatSocket(sess);
         sess->state = DccSession::ACTIVE;
         if (sess->win) { Show(sess->win, L"-", cText); Show(sess->win, L"DCC Chat connection established", cJoin); }
+        if (sess->isFileServer && !sess->fsWelcomeFile.IsEmpty()) FsSendFile(sess, sess->fsWelcomeFile);
     }
     void DccChatConnectResult(DccSession* sess, int e) {   // connecting side
         if (e != 0) { if (sess->win) Show(sess->win, L"* DCC Chat: connection failed.", cPart); sess->state = DccSession::FAILED; return; }
@@ -12541,7 +12582,99 @@ class CMainFrame : public CMDIFrameWnd {
             std::string lineA = sess->inbuf.substr(0, pos); sess->inbuf.erase(0, pos + 1);
             if (!lineA.empty() && lineA.back() == '\r') lineA.pop_back();
             CString line = CString(CA2W(lineA.c_str(), CP_UTF8));
-            if (sess->win) Show(sess->win, L"<" + sess->nick + L"> " + line, cText);
+            if (sess->isFileServer) FsHandleCommand(sess, line);
+            else if (sess->win) Show(sess->win, L"<" + sess->nick + L"> " + line, cText);
+        }
+    }
+    // Resolves a user-supplied relative path (from a fileserver "cd" or "get") against the session's current
+    // directory, then verifies the result is still inside fsHomeDir's own subtree -- the actual security
+    // boundary, since a fileserver exposes part of the local filesystem to anyone who can DCC it. Returns empty
+    // on any attempt to escape it: an absolute path, a drive letter, a UNC path, or a resolved ".." that lands
+    // outside the home directory. Checked as a true path prefix (home directory followed by a '\', not just a
+    // string prefix) so a sibling directory that merely starts with the same characters as the home directory's
+    // name can't be mistaken for being inside it.
+    CString FsResolvePath(DccSession* sess, const CString& userPath) {
+        if (userPath.IsEmpty()) return sess->fsCurDir;
+        if (userPath.Find(L':') >= 0 || userPath.Left(1) == L"\\" || userPath.Left(1) == L"/") return CString();
+        CString combined = sess->fsCurDir + L"\\" + userPath;
+        wchar_t full[MAX_PATH];
+        if (!::GetFullPathNameW(combined, MAX_PATH, full, nullptr)) return CString();
+        CString resolved(full);
+        CString homeNorm = sess->fsHomeDir; homeNorm.TrimRight(L'\\');
+        CString resolvedNorm = resolved; resolvedNorm.TrimRight(L'\\');
+        if (resolvedNorm.CompareNoCase(homeNorm) == 0) return resolved;
+        if (resolvedNorm.GetLength() > homeNorm.GetLength() && resolvedNorm.Left(homeNorm.GetLength()).CompareNoCase(homeNorm) == 0 && resolvedNorm[homeNorm.GetLength()] == L'\\') return resolved;
+        return CString();
+    }
+    void FsSendLine(DccSession* sess, const CString& text) {
+        if (!sess->live) return;
+        CStringA utf8 = CW2A(text, CP_UTF8);
+        sess->live->Send((LPCSTR)utf8, utf8.GetLength());
+        sess->live->Send("\r\n", 2);
+    }
+    void FsSendFile(DccSession* sess, const CString& path) {   // sends a local text file's contents line by line, e.g. a welcome file or dirinfo.srv
+        CStdioFile f;
+        if (!f.Open(path, CFile::modeRead | CFile::typeText)) return;
+        CString line; while (f.ReadString(line)) FsSendLine(sess, line);
+    }
+    int FsActiveGetsFor(DccSession* fsSess) {   // how many SEND sessions this fileserver has currently in flight to its own peer, for maxgets enforcement
+        int n = 0;
+        for (auto& s : m_dcc) if (s->kind == DccSession::SEND && s->weOffered && s->net == fsSess->net && s->nick.CompareNoCase(fsSess->nick) == 0 &&
+            (s->state == DccSession::LISTENING || s->state == DccSession::CONNECTING || s->state == DccSession::ACTIVE || s->state == DccSession::AWAITING_PASSIVE_REPLY)) ++n;
+        return n;
+    }
+    void FsHandleCommand(DccSession* sess, const CString& lineIn) {
+        CString line = lineIn; line.Trim();
+        CString cmd = Word(line); cmd.MakeLower();
+        if (cmd == L"dir" || cmd == L"ls") {
+            bool wide = (cmd == L"ls");
+            CString a = line;
+            while (a.Left(1) == L"-" || a.Left(1) == L"/") { CString sw = Word(a); sw.MakeLower(); if (sw == L"/w") wide = true; }   // -b/-k (byte/KB units) and -# (page size) are accepted but not distinguished -- this always shows sizes in bytes and the full listing in one page
+            a.Trim();
+            if (!a.IsEmpty()) { FsSendLine(sess, L"'" + cmd + L"' doesn't take a directory -- use 'cd' to navigate, then '" + cmd + L"' with no arguments."); return; }   // real mIRC's own dir/ls don't take a path either; being explicit about it here, rather than silently ignoring the extra word and listing the current directory anyway, which looked like it might be a security problem at a glance even though it wasn't one
+            CFileFind ff; BOOL more = ff.FindFile(sess->fsCurDir + L"\\*.*");
+            CString wideLine;
+            while (more) {
+                more = ff.FindNextFile();
+                if (ff.IsDots()) continue;
+                CString name = ff.GetFileName();
+                if (ff.IsDirectory()) {
+                    if (wide) { if (!wideLine.IsEmpty()) wideLine += L"  "; wideLine += L"[" + name + L"]"; }
+                    else FsSendLine(sess, L"[" + name + L"]");
+                } else {
+                    unsigned __int64 sz = ff.GetLength();
+                    if (wide) { if (!wideLine.IsEmpty()) wideLine += L"  "; wideLine += name; }
+                    else { CString out; out.Format(L"%-40s %llu", (LPCWSTR)name, sz); FsSendLine(sess, out); }
+                }
+            }
+            if (wide && !wideLine.IsEmpty()) FsSendLine(sess, wideLine);
+            FsSendLine(sess, L"");
+        } else if (cmd == L"cd") {
+            CString target = line; target.Trim();
+            if (target.IsEmpty()) { FsSendLine(sess, sess->fsCurDir.Mid(sess->fsHomeDir.GetLength()).IsEmpty() ? L"\\" : sess->fsCurDir.Mid(sess->fsHomeDir.GetLength())); return; }
+            CString resolved = FsResolvePath(sess, target);
+            if (resolved.IsEmpty() || !IsDirPath(resolved)) { FsSendLine(sess, L"No such directory."); return; }
+            sess->fsCurDir = resolved;
+            FsSendLine(sess, L"Current directory is now: " + sess->fsCurDir.Mid(sess->fsHomeDir.GetLength()));
+            CString dirinfo = sess->fsCurDir + L"\\dirinfo.srv";
+            if (PathExistsFn(dirinfo)) FsSendFile(sess, dirinfo);
+        } else if (cmd == L"get") {
+            CString fname = line; fname.Trim();
+            if (fname.IsEmpty()) { FsSendLine(sess, L"Usage: get <filename>"); return; }
+            CString resolved = FsResolvePath(sess, fname);
+            if (resolved.IsEmpty() || !IsFilePathFn(resolved)) { FsSendLine(sess, L"No such file."); return; }
+            if (FsActiveGetsFor(sess) >= sess->fsMaxGets) { FsSendLine(sess, L"Maximum simultaneous downloads reached, try again shortly."); return; }
+            FsSendLine(sess, L"Sending you " + NoPathPart(resolved) + L"...");
+            DccSendInitiateFile(sess->net, sess->win, sess->nick, resolved);
+        } else if (cmd == L"read") {
+            CString a = line;
+            while (a.Left(1) == L"-") Word(a);   // -numlines accepted, not implemented -- always sends the whole file
+            CString fname = a; fname.Trim();
+            CString resolved = FsResolvePath(sess, fname);
+            if (resolved.IsEmpty() || !IsFilePathFn(resolved)) { FsSendLine(sess, L"No such file."); return; }
+            FsSendFile(sess, resolved);
+        } else if (!cmd.IsEmpty()) {
+            FsSendLine(sess, L"Unknown command.");
         }
     }
     void DccChatOnClose(DccSession* sess) {
