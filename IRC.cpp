@@ -4168,8 +4168,52 @@ static void ComputeDialogBaseUnits(const wchar_t* fontName, int pointSize, int& 
     }
     ::ReleaseDC(nullptr, dc);
 }
+// Measures a specific string's actual rendered width in the given font/size, in pixels. Used to guarantee a
+// control is really wide enough for its own label, rather than estimating from the font's average-character-width
+// DBU approximation -- which is exactly correct for an "average" string, but any label whose own letters skew
+// wider than that average (and "Password", with its P/d, is a reasonable example) needs more room than the
+// average predicts, and that gap grows along with the font, not just for one word at one size. A fixed safety
+// margin chosen to cover one specific word at one specific size doesn't generalize to every label at every size;
+// measuring the real text directly does.
+static int MeasureTextWidthPixels(const CString& text, const wchar_t* fontName, int pointSize) {
+    if (text.IsEmpty()) return 0;
+    HDC dc = ::GetDC(nullptr);
+    if (!dc) return 0;
+    int logHeight = -MulDiv(pointSize, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    HFONT font = ::CreateFontW(logHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fontName);
+    int width = 0;
+    if (font) {
+        HFONT old = (HFONT)::SelectObject(dc, font);
+        SIZE sz = {};
+        if (::GetTextExtentPoint32W(dc, text, text.GetLength(), &sz)) width = sz.cx;
+        ::SelectObject(dc, old);
+        ::DeleteObject(font);
+    }
+    ::ReleaseDC(nullptr, dc);
+    return width;
+}
+// $width(text,font,size[,bold]) / $height(text,font,size[,bold]) -- real mIRC identifiers scripts use to measure
+// and then hand-position drawn text (Tetris's own drawtext calls center/right-align text this way). Returns both
+// dimensions in one call since they're the same GDI measurement either way; the two identifiers just read
+// different fields of the result.
+static SIZE MeasureTextSizePixels(const CString& text, const wchar_t* fontName, int pointSize, bool bold) {
+    SIZE sz = {};
+    HDC dc = ::GetDC(nullptr);
+    if (!dc) return sz;
+    int logHeight = -MulDiv(pointSize, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    HFONT font = ::CreateFontW(logHeight, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fontName);
+    if (font) {
+        HFONT old = (HFONT)::SelectObject(dc, font);
+        CString t = text.IsEmpty() ? CString(L" ") : text;   // an empty string measures as 0x0 in GDI, but $height(,...) with no text is still expected to return this font's line height, not 0
+        ::GetTextExtentPoint32W(dc, t, t.GetLength(), &sz);
+        ::SelectObject(dc, old);
+        ::DeleteObject(font);
+    }
+    ::ReleaseDC(nullptr, dc);
+    return sz;
+}
 static const int kDlgIdBase = 100;
-static const int kCustomDialogFontPt = 12;   // point size for every custom dialog's text (Fixedsys Excelsior) -- used in both the template itself and the matching base-unit measurement below; change this one value to resize everything (text and, proportionally, the whole dialog and its controls) rather than editing the two call sites separately, which risks them drifting out of sync
+static const int kCustomDialogFontPt = 12;   // point size for every custom dialog's text (Fixedsys Excelsior) -- used in both the template itself and the matching base-unit measurement below; change this one value to resize everything (text and, proportionally, the whole dialog and its controls) rather than editing the two call sites separately, which risks them drifting out of sync. The label-width measurement used when laying controls out (see MeasureTextWidthPixels) reads this same constant, so a size change here doesn't need any other adjustment to stay correctly sized.
 class CCustomDialogWnd : public CDialog {
     std::vector<WORD> t; int cnt = 0;
     void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
