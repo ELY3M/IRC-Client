@@ -503,7 +503,11 @@ static std::vector<CString> ReadScriptFileLines(const CString& path) {
 }
 // A basic recursive directory/file search for $finddir/$findfile -- supports the dir+wildcard+N+depth lookup form
 // only; the @window-fill and per-match-command forms described for these identifiers aren't implemented.
-static bool FindInDirRecursive(const CString& dir, const CString& wildcardCsv, bool wantDirs, int& counter, int targetN, int depth, int maxDepth, CString& result) {
+// collectAll, when non-null, gathers every match into it and the function always returns false (ignoring targetN)
+// -- used by $finddir/$findfile's command-executing form, which needs the WHOLE match list up front (so it can
+// report an accurate total/position via $finddirn/$findfilen while looping), rather than the single Nth-match
+// lookup the plain identifier form uses.
+static bool FindInDirRecursive(const CString& dir, const CString& wildcardCsv, bool wantDirs, int& counter, int targetN, int depth, int maxDepth, CString& result, std::vector<CString>* collectAll = nullptr) {
     if (maxDepth >= 0 && depth > maxDepth) return false;
     CString base = dir; if (base.Right(1) != L"\\") base += L"\\";
     WIN32_FIND_DATAW fd; HANDLE h = ::FindFirstFileW(base + L"*", &fd);
@@ -517,11 +521,15 @@ static bool FindInDirRecursive(const CString& dir, const CString& wildcardCsv, b
         if (isDir == wantDirs) {
             CString wc = wildcardCsv; bool matched = false; int pos = 0;
             while (pos != -1) { CString one = wc.Tokenize(L";", pos); one.Trim(); if (!one.IsEmpty() && GlobMatch(one, name)) { matched = true; break; } }
-            if (matched) { counter++; if (counter == targetN) { result = base + name; ::FindClose(h); return true; } }
+            if (matched) {
+                counter++;
+                if (collectAll) collectAll->push_back(base + name);
+                else if (counter == targetN) { result = base + name; ::FindClose(h); return true; }
+            }
         }
     } while (::FindNextFileW(h, &fd));
     ::FindClose(h);
-    for (auto& sd : subdirs) if (FindInDirRecursive(base + sd, wildcardCsv, wantDirs, counter, targetN, depth + 1, maxDepth, result)) return true;
+    for (auto& sd : subdirs) if (FindInDirRecursive(base + sd, wildcardCsv, wantDirs, counter, targetN, depth + 1, maxDepth, result, collectAll)) return true;
     return false;
 }
 // ---------------- $zip: zlib + minizip-ng wrappers. minizip-ng's whole char* API surface is UTF-8, converted to/from
@@ -782,14 +790,38 @@ public:
         }
         return r;
     }
+    // ---- $ssl* introspection support -- both just read back state SChannel already has once Handshake() has
+    // succeeded (ready == true); neither needs anything beyond what's already included/linked for the handshake
+    // itself (sspi.h/schannel.h/wincrypt.h, secur32.lib/crypt32.lib -- see the top of the file).
+    bool GetServerCertDer(std::vector<BYTE>& out) const {   // the raw DER bytes of the server's leaf certificate, for $sslhash(...,s) to hash
+        if (!ready) return false;
+        PCCERT_CONTEXT cc = nullptr;
+        if (QueryContextAttributesW(const_cast<CtxtHandle*>(&ctx), SECPKG_ATTR_REMOTE_CERT_CONTEXT, &cc) != SEC_E_OK || !cc) return false;
+        out.assign(cc->pbCertEncoded, cc->pbCertEncoded + cc->cbCertEncoded);
+        CertFreeCertificateContext(cc);
+        return true;
+    }
+    CString ProtocolName() const {   // $sslversion -- the actual negotiated TLS protocol version for this connection
+        if (!ready) return CString();
+        SecPkgContext_ConnectionInfo ci = {};
+        if (QueryContextAttributesW(const_cast<CtxtHandle*>(&ctx), SECPKG_ATTR_CONNECTION_INFO, &ci) != SEC_E_OK) return CString();
+        switch (ci.dwProtocol) {
+            case SP_PROT_TLS1_3_CLIENT: case SP_PROT_TLS1_3_SERVER: return L"TLSv1.3";
+            case SP_PROT_TLS1_2_CLIENT: case SP_PROT_TLS1_2_SERVER: return L"TLSv1.2";
+            case SP_PROT_TLS1_1_CLIENT: case SP_PROT_TLS1_1_SERVER: return L"TLSv1.1";
+            case SP_PROT_TLS1_0_CLIENT: case SP_PROT_TLS1_0_SERVER: return L"TLSv1.0";
+            default: { CString s; s.Format(L"SChannel (protocol 0x%X)", ci.dwProtocol); return s; }
+        }
+    }
 };
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
 enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_LOCALSETTINGS, IDM_DCCOPTIONS, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
     IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT,
-       IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX };
+       IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX, IDC_ANICK };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
+    CString anick;   // $anick / /connect's "Alt nick" field -- tried once, automatically, if the primary nick is taken (433) during registration; empty means no alt nick configured, same as real mIRC leaving it blank
     CString email;   // /emailaddr: not actually sent anywhere over IRC (the protocol has no standard field for it) -- stored for scripts/reference only
     int port = 6667; BOOL tls = FALSE, lax = FALSE;
 };
@@ -811,21 +843,23 @@ class CConnDlg : public CDialog {
 public:
     CConnDlg(Opts& op, CWnd* parent) : o(op) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
-        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(232); t.push_back(184);   // cdit, x, y, cx, cy
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(232); t.push_back(200);   // cdit, x, y, cx, cy
         t.push_back(0); t.push_back(0); S(L"Connect to IRC server"); t.push_back(9); S(DEFAULT_FONT); //was Segoe UI
         Row(6, L"Server", IDC_HOST); Row(22, L"Port", IDC_PORT, ES_NUMBER); Row(38, L"Nickname", IDC_NICK);
-        Row(54, L"User name", IDC_USER); Row(70, L"Real name", IDC_REAL); Row(86, L"Password", IDC_PASS, ES_PASSWORD);
-        Row(102, L"Auto-join", IDC_JOIN);
-        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 120, 150, 10, IDC_TLS, 0x0080, L"Use TLS (SSL) encryption");
-        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 134, 150, 10, IDC_LAX, 0x0080, L"Accept invalid certificates");
-        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 110, 160, 50, 14, IDOK, 0x0080, L"Connect");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 166, 160, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Row(54, L"Alt Nick", IDC_ANICK);
+        Row(70, L"User name", IDC_USER); Row(86, L"Real name", IDC_REAL); Row(102, L"Password", IDC_PASS, ES_PASSWORD);
+        Row(118, L"Auto-join", IDC_JOIN);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 136, 150, 10, IDC_TLS, 0x0080, L"Use TLS (SSL) encryption");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 150, 150, 10, IDC_LAX, 0x0080, L"Accept invalid certificates");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 110, 176, 50, 14, IDOK, 0x0080, L"Connect");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 166, 176, 50, 14, IDCANCEL, 0x0080, L"Cancel");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
     BOOL OnInitDialog() override {
         CDialog::OnInitDialog();
         SetDlgItemText(IDC_HOST, o.host); SetDlgItemInt(IDC_PORT, o.port); SetDlgItemText(IDC_NICK, o.nick);
+        SetDlgItemText(IDC_ANICK, o.anick);
         SetDlgItemText(IDC_USER, o.user); SetDlgItemText(IDC_REAL, o.real); SetDlgItemText(IDC_PASS, o.pass);
         SetDlgItemText(IDC_JOIN, o.autojoin); CheckDlgButton(IDC_TLS, o.tls); CheckDlgButton(IDC_LAX, o.lax);
         return TRUE;
@@ -839,7 +873,7 @@ public:
     DECLARE_MESSAGE_MAP()
     void OnOK() override {
         GetDlgItemText(IDC_HOST, o.host); o.host.Trim(); if (o.host.IsEmpty()) return;
-        o.port = GetDlgItemInt(IDC_PORT); GetDlgItemText(IDC_NICK, o.nick); GetDlgItemText(IDC_USER, o.user);
+        o.port = GetDlgItemInt(IDC_PORT); GetDlgItemText(IDC_NICK, o.nick); GetDlgItemText(IDC_ANICK, o.anick); o.anick.Trim(); GetDlgItemText(IDC_USER, o.user);
         GetDlgItemText(IDC_REAL, o.real); GetDlgItemText(IDC_PASS, o.pass); GetDlgItemText(IDC_JOIN, o.autojoin);
         o.tls = IsDlgButtonChecked(IDC_TLS); o.lax = IsDlgButtonChecked(IDC_LAX);
         if (o.port <= 0 || o.port > 65535) o.port = o.tls ? 6697 : 6667;
@@ -1686,16 +1720,35 @@ public:
     void OnClose(int) override { if (onClose) onClose(); }
 };
 // ---------------- /sockopen /sockread /sockwrite /sockclose /socklisten /sockaccept: mIRC's scriptable raw TCP
-// socket API ($sock(), $sockname, $sockerr, "on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN"). Plain TCP only -- no
-// UDP (-u) and no SSL (-e); both are real mIRC switches but neither is a small addition on top of this one, so
-// they're accepted-but-ignored the same way CmdWindow already treats its own unimplemented switches. ----
+// socket API ($sock(), $sockname, $sockerr, "on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN"). Plain TCP, or TLS via
+// -e -- same CTls (Windows SChannel) wrapper CIrcSock already uses for the main IRC connection, wired up the exact
+// same way: OnConnect starts the handshake instead of firing the script's own "on SOCKOPEN" straight away, and
+// OnReceive keeps feeding the handshake (or decrypting once it's ready) instead of handing raw bytes to the script.
+// No UDP (-u) -- that's a real mIRC switch too, but not a small addition on top of this one, so it's still just
+// accepted-but-ignored, the same way CmdWindow already treats its own unimplemented switches.
 class CMircSocket : public CAsyncSocket {
 public:
-    std::function<void(int)> onConnect;   // outbound connect finished (0 = success); unused for a listening socket
+    std::function<void(int)> onConnect;   // outbound connect finished (0 = success); unused for a listening socket. For a TLS (-e) socket, this fires only once the handshake itself has also finished -- a script's "on SOCKOPEN" means "ready to use", same as a plaintext socket
     std::function<void()> onReceive;      // data arrived -- read it out of recvBuf via /sockread, same as mIRC itself never hands the bytes directly to the event
     std::function<void()> onAccept;       // listening socket: a peer is ready to be accepted via /sockaccept
     std::function<void()> onClose;
-    std::string recvBuf;                  // raw bytes buffered since the last /sockread
+    std::string recvBuf;                  // raw (TLS: already-decrypted) bytes buffered since the last /sockread
+    CTls* tls = nullptr;                  // non-null only for a /sockopen -e socket; see CIrcSock's own copy of this exact pattern
+    std::string sendq;                    // TLS only -- plaintext writes still go straight out via CAsyncSocket::Send, same as before this existed
+    ~CMircSocket() { delete tls; }
+    void Queue(const std::string& x) { sendq += x; Flush(); }
+    void Write(const std::string& x) {   // the one entry point /sockwrite now goes through -- plaintext behaves exactly as it always did (one direct Send, no queueing), TLS encrypts first and queues (a single Send isn't guaranteed to take the whole encrypted record)
+        if (tls && tls->ready) Queue(tls->Enc(x));
+        else CAsyncSocket::Send(x.data(), (int)x.size());
+    }
+    void Flush() {
+        while (!sendq.empty()) {
+            int n = CAsyncSocket::Send(sendq.data(), (int)sendq.size());
+            if (n == SOCKET_ERROR) break;
+            sendq.erase(0, n);
+        }
+    }
+    void OnSend(int) override { Flush(); }
     // Same IPv6-aware resolve-then-connect as CIrcSock::ConnectSmart just above, minus the TLS handling that
     // function also carries -- plain CAsyncSocket::Connect() only resolves IPv4 (gethostbyname) and blocks the
     // whole app while it does, neither of which real mIRC's own /sockopen does to a script.
@@ -1716,14 +1769,50 @@ public:
         ::FreeAddrInfoW(result);
         return ok;
     }
-    void OnConnect(int e) override { if (onConnect) onConnect(e); }
+    void OnConnect(int e) override {
+        if (e || !tls) { if (onConnect) onConnect(e); return; }
+        if (!tls->Handshake()) { if (onConnect) onConnect((int)tls->lastStatus); return; }
+        Queue(tls->tosend); tls->tosend.clear();   // send ClientHello; onConnect fires once the handshake reaches SEC_E_OK, in OnReceive below
+    }
+    // Feeds n just-arrived raw bytes through the TLS handshake/decrypt (or straight into recvBuf for a plaintext
+    // socket), firing onReceive for whatever script-visible data that produced. Shared by OnReceive and OnClose's
+    // own drain loop below. Returns false only on an unrecoverable TLS decrypt error -- the caller closes in that
+    // case; it does NOT fire onClose itself, so a caller that's already mid-drain-loop (OnClose) can't end up
+    // calling onClose twice.
+    bool Ingest(const char* b, int n) {
+        if (!tls) { recvBuf.append(b, n); if (onReceive) onReceive(); return true; }
+        tls->in.append(b, n);
+        if (!tls->ready) {
+            if (!tls->Handshake()) { if (onConnect) onConnect((int)tls->lastStatus); return false; }
+            Queue(tls->tosend); tls->tosend.clear();
+            if (tls->ready && onConnect) onConnect(0);
+            if (!tls->ready) return true;   // still mid-handshake -- no script-visible data possible yet
+        }
+        if (!tls->Decrypt()) return false;
+        if (!tls->out.empty()) { recvBuf += tls->out; tls->out.clear(); if (onReceive) onReceive(); }
+        return true;
+    }
     void OnReceive(int) override {
         char b[16384]; int n = Receive(b, sizeof b);
-        if (n > 0) { recvBuf.append(b, n); if (onReceive) onReceive(); }
-        else if (n == 0 || n == SOCKET_ERROR) { if (onClose) onClose(); }
+        if (n <= 0) { if (onClose) onClose(); return; }
+        if (!Ingest(b, n)) { Close(); if (onClose) onClose(); }
     }
     void OnAccept(int) override { if (onAccept) onAccept(); }
-    void OnClose(int) override { if (onClose) onClose(); }
+    void OnClose(int) override {
+        // The remote can send its last data and close within the same instant, closely enough that Windows
+        // delivers FD_CLOSE without first (or ever) delivering the FD_READ for bytes that already fully arrived
+        // in the socket's kernel receive buffer -- a classic CAsyncSocket gotcha. Concretely: an HTTP response's
+        // body can be sitting there, completely received, and this override used to fire onClose() immediately
+        // without ever reading it, silently discarding it (seen in practice: a GitHub Pages response where only
+        // the headers came through OnReceive and the whole body vanished). Drain whatever Receive() still hands
+        // back, same as a normal OnReceive would, before treating the socket as actually empty.
+        for (;;) {
+            char b[16384]; int n = Receive(b, sizeof b);
+            if (n <= 0) break;
+            if (!Ingest(b, n)) break;   // decrypt failed -- stop draining, still fall through to the one onClose() below
+        }
+        if (onClose) onClose();
+    }
 };
 // One open/listening /sockopen or /socklisten socket, keyed by the script's own name for it (case-insensitive,
 // same convention as every other named lookup in this client -- see Key()/VKey()).
@@ -1946,6 +2035,7 @@ public:
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
     std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped, un-timestamped) text of each new line, for history logging
     int m_tsMode = -1;   // this window's /timestamp override: -1 = follow the global setting, 0 = off, 1 = on
+    ULONGLONG m_lastMsgTick = 0;   // GetTickCount64() of the last PRIVMSG/NOTICE/DCC-chat line shown OR sent in this window -- $query().idle / $chat().idle ("seconds since a message was sent or received")
     // ---- DCC Chat / Send windows reuse this class too, net stays null same as a custom @window; an opaque pointer
     // here (rather than a real DccSession*) avoids CChatWnd needing that type's full definition, which is declared
     // later in the file alongside CMainFrame -- only CMainFrame ever casts this back to what it actually is. ----
@@ -1993,6 +2083,9 @@ public:
     CString m_topicRaw; std::vector<CString> m_topicHist;   // the channel topic with its colour codes, and earlier topics (most recent first)
     bool LogHasSelection() { long s = 0, e = 0; m_out.GetSel(s, e); return s != e; }
     void LogCopy() { m_out.Copy(); }
+    // $editbox(window)[.selstart/.selend] -- m_in is protected, so CMainFrame (an unrelated class) needs this small
+    // public accessor rather than reaching in directly.
+    void GetEditBoxInfo(CString& text, int& selStart, int& selEnd) { m_in.GetWindowText(text); m_in.GetSel(selStart, selEnd); }
 
     void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
         m_out.SetSel(-1, -1);
@@ -2108,6 +2201,13 @@ public:
         return -1;
     }
     bool HasNick(const CString& n) { return FindNick(n) >= 0; }
+    CString NickAt(int i) { if (!m_chan || i < 0 || i >= m_nicks.GetCount()) return CString(); CString s; m_nicks.GetText(i, s); return s; }   // raw listbox text (prefix char included, if it has one) at a positional index -- $nick() and its derived identifiers (nhnick/nopnick/nvnick/rnick/snick) all enumerate the nicklist through this
+    void GetSelectedNicks(std::vector<CString>& out) {   // $snick/$snicks -- m_nicks is LBS_EXTENDEDSEL, so more than one can be selected at once
+        if (!m_chan) return;
+        int cnt = m_nicks.GetSelCount(); if (cnt <= 0) return;
+        std::vector<int> idx(cnt); m_nicks.GetSelItems(cnt, idx.data());
+        for (int i : idx) { CString s; m_nicks.GetText(i, s); out.push_back(Bare(s)); }
+    }
     wchar_t NickPrefixChar(const CString& n) {   // '@','+', etc. if the nick currently has that status in this channel, 0 if none/not found -- see Auto-Op/Auto-Voice/Protect
         int i = FindNick(n); if (i < 0) return 0;
         CString s; m_nicks.GetText(i, s);
@@ -2557,6 +2657,11 @@ END_MESSAGE_MAP()
 // ---------------- Net: one IRC connection (its own socket, nick, options and status text) ----------------
 struct Net {
     CString chanmodes = L"beI,k,l,imnpst";   // from 005 CHANMODES=: list modes, always-parameter modes, set-parameter modes, flags
+    CString prefixModes = L"ohv";   // from 005 PREFIX=(modes)symbols -- just the mode-letters half, for $nickmode
+    CString prefixSymbols = L"@%+";   // the parallel symbols half, same positional order as prefixModes (e.g. prefixModes="qaohv" <-> prefixSymbols="~&@%+") -- used by FireModeEvents/ParseModeString to find which mode LETTER corresponds to the owner ('~') and help ('%') prefix characters without hardcoding a server-specific letter (some ircds use 'q' for owner, others 'a' or something else entirely)
+    CString awayMsg;              // $awaymsg -- the message last sent with /away; empty when not away. Tracked optimistically the moment /away is sent, not waited for the server's 306 confirmation (same convention net->nick already uses for NICK)
+    ULONGLONG awayTick = 0;       // $awaytime -- GetTickCount64() when /away was last sent with a message; 0 = not currently away
+    CString usermode;             // $usermode -- this client's own accumulated user mode letters, built from each self-targeted MODE line the server sends (see the MODE raw handler)
     CIrcSock sock;
     bool conn = false;
     CString nick = L"User";
@@ -2569,6 +2674,7 @@ struct Net {
     std::vector<CString> notifyPending;   // the nicks most recently ISON-queried on this network, so the 303 reply can be matched back up -- see NotifyTick / the "303" handler
     CString debugTarget;   // /debug: a @window name (or empty) that this connection's state is noted in -- see Dispatch's "debug" command
     ULONGLONG connectTick = 0;   // GetTickCount64() at 001 (registration complete) -- $uptime(server)
+    bool triedAltNick = false;   // whether this connection has already fallen back to o.anick once during registration -- a second 433 after that just keeps appending "_", same as when no alt nick is configured at all
 };
 
 // ---------------- One DCC Chat (or, in a later pass, Send/Get) session. The CTCP negotiation happens over the
@@ -2974,6 +3080,57 @@ static bool HmacCompute(LPCWSTR algId, const std::vector<BYTE>& key, const BYTE*
     }
     ::BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
+}
+// Plain (non-HMAC) digest of a raw byte buffer -- same BCrypt plumbing as HmacCompute just above, minus the key/
+// HMAC flag. Used by $sslhash to fingerprint a certificate's raw DER bytes (SHA-1/256/512/MD5 chosen by algId).
+static bool BCryptHashBytes(LPCWSTR algId, const BYTE* data, int dataLen, std::vector<BYTE>& outHash) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    if (::BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, 0) != 0 || !hAlg) return false;
+    bool ok = false;
+    ULONG objLen = 0, cb = 0, hashLen = 0;
+    ::BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cb, 0);
+    ::BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cb, 0);
+    if (objLen > 0 && hashLen > 0) {
+        std::vector<BYTE> obj(objLen);
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        if (::BCryptCreateHash(hAlg, &hHash, obj.data(), objLen, nullptr, 0, 0) == 0 && hHash) {
+            outHash.resize(hashLen);
+            if (::BCryptHashData(hHash, (PUCHAR)data, dataLen, 0) == 0 && ::BCryptFinishHash(hHash, outHash.data(), hashLen, 0) == 0) ok = true;
+            ::BCryptDestroyHash(hHash);
+        }
+    }
+    ::BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+// Bubble Babble encoding (Antti Huima's algorithm, as used by OpenSSH et al. for pronounceable fingerprints) --
+// $sslhash(...).babble. Deterministic, no external table/library needed: 2-byte chunks of the input each become
+// a vowel-consonant-vowel triple (plus a trailing consonant pair carrying a rolling checksum), framed in 'x'.
+static CString BubbleBabble(const std::vector<BYTE>& data) {
+    static const wchar_t* vowels = L"aeiouy";
+    static const wchar_t* cons = L"bcdfghklmnprstvzx";
+    CString out = L"x";
+    int seed = 1;
+    size_t n = data.size(), rounds = n / 2 + 1;
+    for (size_t i = 0; i < rounds; i++) {
+        if (i + 1 < rounds || (n % 2) != 0) {
+            BYTE b0 = data[2 * i];
+            int idx0 = (((b0 >> 6) & 3) + seed) % 6;
+            int idx1 = (b0 >> 2) & 15;
+            int idx2 = ((b0 & 3) + (seed / 6)) % 6;
+            out += vowels[idx0]; out += cons[idx1]; out += vowels[idx2];
+            if (i + 1 < rounds) {
+                BYTE b1 = data[2 * i + 1];
+                int idx3 = (b1 >> 4) & 15, idx4 = b1 & 15;
+                out += cons[idx3]; out += L'-'; out += cons[idx4];
+                seed = (seed * 5 + b0 * 7 + b1) % 36;
+            }
+        } else {
+            int idx0 = seed % 6, idx2 = seed / 6;
+            out += vowels[idx0]; out += cons[16]; out += vowels[idx2];
+        }
+    }
+    out += L"x";
+    return out;
 }
 // Exactly "number op number" with op one of + - * / % ^  ->  1 and the result in out; 0 = not such an expression;
 // -1 = division by zero.
@@ -4534,10 +4691,12 @@ struct ParsedModeChange { wchar_t modeChar; bool adding; CString param; };
 // from 005), not a fixed guess at which letters matter. CHANMODES defines four comma-separated groups: A (list
 // type -- ban/except/invex, e.g. "beI") always takes a parameter both ways; B (e.g. "k", a key) always takes one;
 // C (e.g. "l", a limit) takes one only when being SET, not when being cleared; D (e.g. "imnpst") never takes one.
-// op/voice ('o'/'v') aren't part of CHANMODES at all (they're the separate PREFIX= token) but always take a
-// parameter regardless of +/-, so they're handled as their own fixed case -- matching how the rest of this
-// codebase already hardcodes '@'/'+' for op/voice rather than a general PREFIX= parse (see NickPrefixChar).
-static std::vector<ParsedModeChange> ParseModeString(const CString& chanmodes, const CString& modeStr, const std::vector<CString>& params, size_t paramStart) {
+// prefix-status modes (o/v, plus whatever else the server's own PREFIX= lists -- h/q/a/etc) aren't part of
+// CHANMODES at all (they're the separate PREFIX= token) but always take a parameter regardless of +/-, so
+// prefixModes (net->prefixModes, from 005 PREFIX=) is passed in and checked as its own fixed case, rather than
+// a hardcoded 'o'/'v' guess -- this lets halfop/owner/whatever-else-a-server-defines consume their nick param
+// correctly too, not just op/voice.
+static std::vector<ParsedModeChange> ParseModeString(const CString& chanmodes, const CString& prefixModes, const CString& modeStr, const std::vector<CString>& params, size_t paramStart) {
     std::vector<ParsedModeChange> out;
     CString groupA, groupB, groupC;
     { CString cm = chanmodes; int c1 = cm.Find(L','); if (c1 >= 0) { groupA = cm.Left(c1); cm = cm.Mid(c1 + 1);
@@ -4548,7 +4707,7 @@ static std::vector<ParsedModeChange> ParseModeString(const CString& chanmodes, c
         wchar_t c = modeStr[i];
         if (c == L'+') { adding = true; continue; }
         if (c == L'-') { adding = false; continue; }
-        bool consumesParam = (c == L'o' || c == L'v') || groupA.Find(c) >= 0 || groupB.Find(c) >= 0 || (groupC.Find(c) >= 0 && adding);
+        bool consumesParam = prefixModes.Find(c) >= 0 || groupA.Find(c) >= 0 || groupB.Find(c) >= 0 || (groupC.Find(c) >= 0 && adding);
         ParsedModeChange pmc; pmc.modeChar = c; pmc.adding = adding;
         if (consumesParam && paramIdx < params.size()) pmc.param = params[paramIdx++];
         out.push_back(pmc);
@@ -6167,6 +6326,7 @@ class CMainFrame : public CMDIFrameWnd {
     int m_flinen = 0;                     // $flinen: the line number matched by the last $fline(), same spirit as $readn above
     CString m_dccGetDir;                  // $getdir: stored for compatibility, since this client has no DCC to actually save anything there
     CString m_sfstate;                    // $sfstate: "cancel" after the last $sfile/$sdir/$msfile was dismissed without a selection
+    int m_finddirN = 0, m_findfileN = 0;  // $finddirn/$findfilen: the 1-based position of the match currently being processed inside a running $finddir/$findfile(...,command) loop; 0 outside one
     std::vector<CString> m_msfileResults; // $msfile(N): the file list from the most recent $msfile(dir,title,oktext) call
     // ---- Address Book Whois tab: captures structured WHOIS fields while a lookup is in progress for the dialog ----
     CString m_uwhoCapturingNick; WhoisCapture m_uwhoCapture;
@@ -6496,13 +6656,14 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void Say(Net* net, const CString& target, const CString& text, bool action = false) {
         CChatWnd* w = Find(net, target); if (!w) w = Open(net, target, IsChan(target));
+        w->m_lastMsgTick = ::GetTickCount64();
         if (action) { Send(net, L"PRIVMSG " + target + L" :" + CString(wchar_t(1)) + L"ACTION " + text + CString(wchar_t(1))); Show(w, L"* " + net->nick + L" " + text, cAction); }
         else        { Send(net, L"PRIVMSG " + target + L" :" + text); Show(w, L"<" + net->nick + L"> " + text, cOwn); }
     }
     void Connect(Net* net, const CString& host, UINT port) {
         if (m_identdEnabled && m_identdOnlyConnecting) StartIdentd(net);
         if (net->sock.m_hSocket != INVALID_SOCKET) net->sock.Close();
-        net->conn = false; net->network.Empty(); net->chanmodes = L"beI,k,l,imnpst"; net->sock.buf.Empty(); net->sock.sendq.clear();
+        net->conn = false; net->network.Empty(); net->chanmodes = L"beI,k,l,imnpst"; net->prefixModes = L"ohv"; net->prefixSymbols = L"@%+"; net->triedAltNick = false; net->awayMsg.Empty(); net->awayTick = 0; net->usermode.Empty(); net->sock.buf.Empty(); net->sock.sendq.clear();
         delete net->sock.tls; net->sock.tls = nullptr;
         if (net->o.tls) {
             net->sock.tls = new CTls;
@@ -6592,6 +6753,58 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"ferr") { val = m_lastFileErr ? L"1" : L"0"; return true; }
         if (name == L"isadmin") { val = IsUserAnAdmin() ? L"$true" : L"$false"; return true; }
         if (name == L"locked") { val = L"$false"; return true; }   // this client has no Options > Lock dialog equivalent, so there's nothing to ever be locked
+        if (name == L"wid") { val = w ? CString(std::to_wstring(w->m_cwId).c_str()) : CString(); return true; }   // "the window id for the current script" -- the window the running script line belongs to, same id $window().wid reports for it
+        if (name == L"cid") { val.Format(L"%d", net ? net->id : 0); return true; }   // the connection id for the current script's network
+        if (name == L"chanmodes") { val = net ? net->chanmodes : CString(L"bIe,k,l"); return true; }   // the doc's own documented fallback string for "not connected"
+        if (name == L"status") {   // connecting/connected/disconnecting/closing/disconnected -- this client doesn't model a separate transient "disconnecting"/"closing" state (no graceful-close delay exists, see Net::state's own plain-text status), so both of those always report as "disconnected" here too
+            if (!net || !net->conn) { val = L"disconnected"; return true; }
+            val = net->connectTick ? L"connected" : L"connecting"; return true;
+        }
+        if (name == L"menubar") { val = (GetMenu() != nullptr) ? L"$true" : L"$false"; return true; }
+        if (name == L"toolbar") { val = m_tb.IsWindowVisible() ? L"$true" : L"$false"; return true; }   // the (N/name) item-lookup form is handled in FuncValue instead, since it takes arguments
+        if (name == L"switchbar") { val = m_sw.IsWindowVisible() ? L"$true" : L"$false"; return true; }
+        if (name == L"treebar") { val = L"0"; return true; }   // this client has no treebar feature at all -- always reports off
+        if (name == L"cmdbox") { val = L"$false"; return true; }   // this client has no /editbox -q1 secondary command editbox feature, so a script can never actually be running from one -- always $false
+        if (name == L"nickmode") { val = net ? net->prefixModes : CString(L"ohv"); return true; }   // the server's own ISUPPORT PREFIX= status-mode letters, in rank order (highest first) -- falls back to the common ohv default pre-005/not connected
+        if (name == L"finddirn") { val.Format(L"%d", m_finddirN); return true; }   // only meaningful inside a running $finddir(...,command) loop's own command -- the 1-based position of the match currently being processed; 0 outside one
+        if (name == L"findfilen") { val.Format(L"%d", m_findfileN); return true; }   // same, for $findfile(...,command)
+        if (name == L"mp3dir") { val = m_soundDirMp3; return true; }   // deprecated by real mIRC in favor of $sound(mp3) -- same configured folder, read straight from the same field
+        if (name == L"wavedir") { val = m_soundDirWave; return true; }   // deprecated by real mIRC in favor of $sound(wave) -- same configured folder, read straight from the same field
+        if (name == L"filename") { val.Empty(); return true; }   // set only inside a matching on FILERCVD/FILESENT/PLAYEND event -- this client doesn't fire any of those three events yet (a gap in its event coverage, not this identifier specifically), so always empty (documented gap)
+        if (name == L"cd") { val.Empty(); return true; }   // the folder a user is browsing within a /fserve session, meaningful only inside a matching on SERV event -- this client's /fserve handles its built-in commands (cd/dir/get/etc) directly in C++ rather than through a scriptable on SERV hook, so there's no running event context for this to read; always empty (documented gap)
+        if (name == L"away") { val = (net && net->awayTick) ? L"$true" : L"$false"; return true; }
+        if (name == L"awaymsg") { val = net ? net->awayMsg : CString(); return true; }
+        if (name == L"awaytime") { val.Format(L"%d", (net && net->awayTick) ? (int)((::GetTickCount64() - net->awayTick) / 1000) : 0); return true; }   // seconds, same units $duration()/other elapsed-time identifiers in this file already use
+        if (name == L"host") {   // this machine's own local hostname -- real mIRC's documented name for what this client already exposes as $myhost; kept as a separate identifier rather than merging them since $myhost's own doc comment and any scripts already written against it stay valid either way
+            char hostname[256];
+            val = (::gethostname(hostname, sizeof(hostname)) == 0) ? CString(hostname) : CString();
+            return true;
+        }
+        if (name == L"usermode") { val = net ? net->usermode : CString(); return true; }
+        if (name == L"remote") { val.Format(L"%d", (m_remoteOn && m_ctcpsOn ? 1 : 0) | (m_remoteOn && m_eventsOn ? 2 : 0) | (m_remoteOn && m_rawEventsOn ? 4 : 0)); return true; }   // bitwise: 1=ctcps, 2=events, 4=raws -- each bit reflects whether that category is EFFECTIVELY enabled right now (both its own /events-or-/ctcps-or-raw-on-off toggle AND the /remote master switch), not just its own sub-toggle in isolation
+        if (name == L"no") { val = L"$false"; return true; }    // the literal value $input(...,yv)'s No button produces -- same as $false, usable as a standalone comparison constant even though this client's own simplified $input doesn't yet implement the y/v button variants that would actually return it (see $input's own comment)
+        if (name == L"ok") { val = L"$true"; return true; }     // the literal value $input(...,ov)'s OK button produces -- same as $true, same caveat as $no above
+        if (name == L"yes") { val = L"$true"; return true; }    // the literal value $input(...,yv)'s Yes button produces -- same as $true, same caveat as $no above
+        // ---- $ssl* : this client's TLS is Windows SChannel (CTls, see its own banner comment), not a bundled/loaded
+        // SSL library -- built into the OS, nothing to load or link beyond what's already in every Windows install.
+        // That maps cleanly onto mIRC's own modern (v7.31+) documented behavior for $ssldll/$ssllibdll: "SSL support
+        // is built in... returns $mircexe instead" of a separate DLL path -- exactly this client's situation too.
+        if (name == L"ssl") { val = (net && net->sock.tls && net->sock.tls->ready) ? L"$true" : L"$false"; return true; }   // connected to the CURRENT script's network over TLS right now
+        if (name == L"sslready") { val = L"$true"; return true; }   // SChannel is always available on Windows -- never "not capable" the way a missing external DLL could leave real mIRC
+        if (name == L"sslversion") { val = (net && net->sock.tls) ? net->sock.tls->ProtocolName() : CString(); return true; }   // the actual negotiated protocol (TLSv1.2/1.3/etc) for the current connection, not a static library-version string -- there's no separate "SSL library" here to version
+        if (name == L"ssldll" || name == L"ssllibdll") { val = ExePath(); return true; }   // see the banner comment above
+        if (name == L"sslcertsha1" || name == L"sslcertsha256") { val.Empty(); return true; }   // the fingerprint of the CLIENT certificate currently loaded -- this client has no client-certificate/mutual-TLS feature at all (CTls::Init never supplies one), so there's never one loaded; blank is the doc's own documented behavior for that case, not a cop-out
+        if (name == L"sslcertvalid") { val = (net && net->sock.tls && net->sock.tls->ready && !net->o.lax) ? L"$true" : L"$false"; return true; }   // $true only when SChannel actually validated the chain -- under "Accept invalid certificates" (lax), validation was deliberately skipped, so even a live connection honestly reports $false here rather than claiming a check that never happened
+        if (name == L"anick") { val = net ? net->o.anick : m_defOpts.anick; return true; }   // the alternate nickname to fall back to if the main one is taken at registration -- set via the Connect dialog's "Alt nick" field, same source the 433 handler itself reads
+        if (name == L"mnick") { val = net ? net->o.nick : m_defOpts.nick; return true; }   // the nickname set in this network's (or the default) connection options, same source $fullname's own nick half uses
+        if (name == L"hnick") { val = m_evHnick; return true; }   // on HELP/DEHELP only: the nick who was given/removed halfop ($nick is who made the change)
+        if (name == L"prefix") { val = net ? net->prefixSymbols : CString(L"@%+"); return true; }   // the server's own ISUPPORT PREFIX= status SYMBOLS, highest-ranked first (e.g. "~&@%+") -- $nickmode's own counterpart, which returns the matching LETTERS instead
+        if (name == L"snicks") {   // bare form: a comma-separated list of the currently-selected nicks in the ACTIVE channel window's nicklist; empty if the active window isn't a channel or nothing is selected
+            CChatWnd* aw = dynamic_cast<CChatWnd*>(MDIGetActive());
+            std::vector<CString> sel; if (aw) aw->GetSelectedNicks(sel);
+            val.Empty(); for (size_t i = 0; i < sel.size(); i++) { if (i) val += L","; val += sel[i]; }
+            return true;
+        }
         if (name == L"active" || name == L"activecid" || name == L"activewid") {
             CChatWnd* aw = dynamic_cast<CChatWnd*>(MDIGetActive());
             if (!aw) { val.Empty(); return true; }
@@ -6717,12 +6930,16 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"true") { val = L"1"; return true; }
         if (name == L"false") { val = L"0"; return true; }
         if (name == L"ticks") { val.Format(L"%I64u", (unsigned __int64)GetTickCount64()); return true; }
+        if (name == L"maxlenl") { val = L"10240"; return true; }   // the safe per-statement character limit this client enforces nowhere else yet -- these three are just the reported constants real mIRC v7.62+ uses
+        if (name == L"maxlenm") { val = L"2048"; return true; }
+        if (name == L"maxlens") { val = L"512"; return true; }
         if (name == L"chan") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
         if (name == L"signal") { val = m_evSignal; return true; }
         if (name == L"sockname") { val = m_evSockName; return true; }   // the socket name a currently-running on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN event fired for
         if (name == L"sockerr") { val = m_sockErr; return true; }       // non-empty only right after a failed /sockopen connect or /sockread; see m_sockErr's own comment
+        if (name == L"sockbr") { val.Format(L"%d", m_sockBr); return true; }   // bytes read by the last /sockread call; see m_sockBr's own comment -- this is what a script's "if ($sockbr != 0) goto nextline" drain loop checks
         if (name == L"ulevel") { val.Format(L"%d", m_defaultLevel); return true; }   // the current default level for unlisted users, as set by /dlevel
         if (name == L"clevel") { val = m_evLevel; return true; }
         if (name == L"rawmsg") { val = m_evRawMsg; return true; }   // the exact, unparsed server line, only set within a matching on RAW event
@@ -7026,6 +7243,67 @@ class CMainFrame : public CMDIFrameWnd {
         StoreVar(name, v, sw, false); FlushVars();
     }
 
+    // Shared engine behind $nick and its four deprecated, narrower variants ($nhnick/$nopnick/$nvnick/$rnick --
+    // each one real mIRC's own docs say "has essentially been replaced by $nick"). Status-letter semantics, per
+    // $nick's own doc page: a=all, o=op, h=halfop/helper, v=voice, r=regular (no status at all); the literal
+    // prefix characters @/%/+/~/& are also usable directly, interchangeably with their letters. include/exclude
+    // are each a SET of these -- a nick matches the filter if it matches something in include (or include is
+    // empty, meaning "everyone") AND matches nothing in exclude.
+    //
+    // defInc/defExc are what $nhnick/$nopnick/$nvnick/$rnick fall back to when their own 3rd/4th arguments are
+    // omitted (their doc pages each give a default -- e.g. $nvnick(#,N) with no 3rd/4th arg is documented as
+    // exactly $nick(#,N,r)); $nick itself has no such default, so it always passes hasDefaults=false, where an
+    // omitted include/exclude simply means no filtering at all, not "fall back to something".
+    bool NickLookupCommon(CChatWnd* w, Net* net, const CString& rawArgs, const CString& params, const CString& prop,
+                           bool hasDefaults, const CString& defInc, const CString& defExc, CString& val) {
+        std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+        if (p.size() < 2) return false;
+        CString chan = p[0]; chan.Trim();
+        CString sel = p[1]; sel.Trim();
+        CString inc = p.size() > 2 ? p[2] : (hasDefaults ? defInc : CString());
+        CString exc = p.size() > 3 ? p[3] : (hasDefaults ? defExc : CString());
+        inc.MakeLower(); exc.MakeLower();
+        CChatWnd* cw = Find(net, chan);
+        auto matchesSet = [](wchar_t pfx, const CString& set) -> bool {
+            for (int i = 0; i < set.GetLength(); i++) {
+                wchar_t c = set[i];
+                if (c == L'a') return true;
+                if (c == L'r') { if (pfx == 0) return true; continue; }
+                wchar_t want = (c == L'o') ? L'@' : (c == L'h') ? L'%' : (c == L'v') ? L'+' : (c == L'q') ? L'~' : c;   // a letter maps to its prefix char; a literal prefix char (@/%/+/~/&) matches itself
+                if (pfx != 0 && pfx == want) return true;
+            }
+            return false;
+        };
+        std::vector<int> idxs;   // positions into cw's own nicklist order, filtered
+        if (cw) {
+            int n = cw->NickCount();
+            for (int i = 0; i < n; i++) {
+                CString raw = cw->NickAt(i); wchar_t pfx = (!raw.IsEmpty() && wcschr(L"@+%&~", raw[0])) ? raw[0] : 0;
+                bool isIn = inc.IsEmpty() ? true : matchesSet(pfx, inc);
+                bool isEx = exc.IsEmpty() ? false : matchesSet(pfx, exc);
+                if (isIn && !isEx) idxs.push_back(i);
+            }
+        }
+        double nD;
+        if (ParseNum(sel, nD)) {
+            int N = (int)nD;
+            if (N == 0) { val.Format(L"%d", (int)idxs.size()); return true; }
+            if (!cw || N < 1 || N > (int)idxs.size()) { val.Empty(); return true; }
+            CString raw = cw->NickAt(idxs[N - 1]); CString bare = Bare(raw);
+            if (prop == L"pnick") val = raw.Left(raw.GetLength() - bare.GetLength());   // the elevation symbol, or empty for a regular user
+            else if (prop == L"idle") val.Empty();   // this client doesn't track per-nick, per-channel idle time -- not modeled
+            else if (prop == L"color") {
+                CNickEntry* cne = MatchCnick(cw, bare, CString(), net);
+                val.Format(L"%d", (int)(cne ? ResolveNickColor(*cne, bare) : cText));
+            }
+            else val = bare;
+            return true;
+        }
+        if (!cw) { val.Empty(); return true; }
+        for (size_t j = 0; j < idxs.size(); j++) if (Bare(cw->NickAt(idxs[j])).CompareNoCase(sel) == 0) { val.Format(L"%d", (int)j + 1); return true; }
+        val.Empty(); return true;
+    }
+
     // ---- $functions(...) : $calc $round $int $chr $var ----
     // Returns false if 'name' isn't one (or its arguments are unusable), so the text is left exactly as typed.
     bool FuncValue(CChatWnd* w, const CString& name, const CString& rawArgs, const CString& prop, const CString& params, CString& val) {
@@ -7037,6 +7315,40 @@ class CMainFrame : public CMDIFrameWnd {
             SIZE sz = MeasureTextSizePixels(text, font, (int)ptD, bold);
             val.Format(L"%d", name == L"width" ? (int)sz.cx : (int)sz.cy);
             return true;
+        }
+        if (name == L"wrap") {   // $wrap(text,font,size,width[,b[N]i[N]p[N]t[N]w[N]],N) -- wraps text to fit within 'width' pixels in the given font; returns the Nth wrapped line, or (N=0) the total line count. Only the 'w' switch (chop mid-word vs. move the whole word down) is honored -- b/i/p/t (bold/italic-width matching, zero-width control codes/tabs) aren't, since this client's own text measurement (MeasureTextSizePixels) doesn't distinguish them.
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 5) return false;
+            CString text = p[0], font = p[1]; double szD, widD;
+            if (!ParseNum(p[2], szD) || !ParseNum(p[3], widD)) return false;
+            int width = (int)widD; if (width <= 0) return false;
+            CString swArg = p[p.size() - 2];   // the optional switch bundle right before the final N -- may also just be the old bare 0/1 word-wrap flag
+            double nD; if (!ParseNum(p.back(), nD)) return false; int N = (int)nD;
+            bool chopWords = false;   // default: move the whole word down rather than splitting it mid-word
+            { int wpos = swArg.Find(L'w');
+              if (wpos >= 0) { int d = wpos + 1; CString digs; while (d < swArg.GetLength() && iswdigit(swArg[d])) digs += swArg[d++]; chopWords = !digs.IsEmpty() && digs != L"1"; }
+              else { double oldFlag; if (ParseNum(swArg, oldFlag)) chopWords = (oldFlag == 0); } }   // the old backward-compatible bare flag: 0 meant "don't word-wrap" (chop instead)
+            std::vector<CString> words; { int start = 0, tn = text.GetLength(); while (start < tn) { while (start < tn && text[start] == L' ') start++; int st = start; while (start < tn && text[start] != L' ') start++; if (start > st) words.push_back(text.Mid(st, start - st)); } }
+            std::vector<CString> lines; CString cur;
+            auto widthOf = [&](const CString& s) { return (int)MeasureTextSizePixels(s, font, (int)szD, false).cx; };
+            auto chopIfNeeded = [&]() {
+                if (!chopWords) return;
+                while (widthOf(cur) > width && cur.GetLength() > 1) {
+                    int lo = 1, hi = cur.GetLength();   // binary-search the longest prefix of 'cur' that still fits
+                    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (widthOf(cur.Left(mid)) <= width) lo = mid; else hi = mid - 1; }
+                    lines.push_back(cur.Left(lo)); cur = cur.Mid(lo);
+                }
+            };
+            for (auto& word : words) {
+                if (cur.IsEmpty()) { cur = word; chopIfNeeded(); continue; }
+                CString candidate = cur + L" " + word;
+                if (widthOf(candidate) <= width) { cur = candidate; continue; }
+                lines.push_back(cur); cur = word; chopIfNeeded();
+            }
+            if (!cur.IsEmpty() || lines.empty()) lines.push_back(cur);
+            if (N == 0) { val.Format(L"%d", (int)lines.size()); return true; }
+            if (N < 1 || N > (int)lines.size()) { val.Empty(); return true; }
+            val = lines[N - 1]; return true;
         }
         if (name == L"inrect") {   // $inrect(x1,y1,x2,y2) -- whether the current window's last known mouse position (see $mouse.x/$mouse.y) falls within the given rectangle
             std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
@@ -7095,6 +7407,76 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = EvalIds(w, rawArgs, params); int c = a.ReverseFind(L','); if (c < 0) return false;
             double x, y; if (!ParseNum(a.Left(c), x) || !ParseNum(a.Mid(c + 1), y)) return false;
             val = FmtNum(name == L"atan2" ? atan2(x, y) : hypot(x, y)); return true;
+        }
+        if (name == L"cbrt") {   // $cbrt(N) -- cube root; std::cbrt (unlike pow(x,1.0/3)) handles negative N correctly
+            double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false;
+            val = FmtNum(cbrt(x)); return true;
+        }
+        if (name == L"log2") {   // $log2(N) -- base-2 logarithm
+            double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x <= 0) return false;
+            val = FmtNum(log2(x)); return true;
+        }
+        if (name == L"tanh") {   // $tanh(N)[.deg] -- hyperbolic tangent of an angle of N radians (or degrees, with .deg)
+            double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false;
+            if (prop.CompareNoCase(L"deg") == 0) x = x * (3.14159265358979323846 / 180.0);
+            val = FmtNum(tanh(x)); return true;
+        }
+        if (name == L"gcd" || name == L"lcm") {   // $gcd(N1,N2[,N3]...) / $lcm(N1,N2[,N3]...) -- two or more integers; $gcd(0,0) is 0, every other $gcd result is a positive integer
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 2) return false;
+            std::vector<__int64> ns; for (auto& s : p) { double d; if (!ParseNum(s, d)) return false; ns.push_back((__int64)(d < 0 ? -d : d)); }   // both operate on magnitudes, like $powmod's own sign note below
+            auto gcd2 = [](__int64 a, __int64 b) -> __int64 { while (b) { __int64 t = b; b = a % b; a = t; } return a; };
+            if (name == L"gcd") {
+                __int64 g = ns[0]; for (size_t i = 1; i < ns.size(); ++i) g = gcd2(g, ns[i]);
+                val.Format(L"%I64d", g); return true;
+            }
+            __int64 l = ns[0];
+            for (size_t i = 1; i < ns.size(); ++i) {
+                __int64 b = ns[i]; __int64 g = gcd2(l, b);
+                l = (g == 0) ? 0 : (l / g) * b;   // divide before multiplying -- avoids overflowing (l*b) early, and keeps a zero anywhere in the list correctly producing an lcm of 0
+            }
+            val.Format(L"%I64d", l); return true;
+        }
+        if (name == L"powmod") {   // $powmod(B,E,M) -- (B^E) mod M as a non-negative integer less than M, via fast modular exponentiation; a negative E (which real mIRC routes through $modinv) isn't supported, since $modinv isn't implemented here
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() != 3) return false;
+            double bD, eD, mD; if (!ParseNum(p[0], bD) || !ParseNum(p[1], eD) || !ParseNum(p[2], mD)) return false;
+            __int64 M = (__int64)mD; if (M <= 0) return false;
+            __int64 E = (__int64)eD; if (E < 0) return false;
+            __int64 B = ((__int64)bD) % M; if (B < 0) B += M;
+            __int64 result = 1 % M;
+            while (E > 0) {
+                if (E & 1) result = (__int64)(((unsigned __int64)result * (unsigned __int64)B) % (unsigned __int64)M);
+                B = (__int64)(((unsigned __int64)B * (unsigned __int64)B) % (unsigned __int64)M);
+                E >>= 1;
+            }
+            val.Format(L"%I64d", result); return true;
+        }
+        if (name == L"factorial") {   // $factorial(N) -- N! ; real mIRC's limits are N<=170 (normal mode) / N<=3336 (/bigfloat mode) -- this client has no bigfloat mode, and plain double math can't represent much past 170! faithfully anyway, so that's the cap used here too
+            double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false;
+            int N = (int)x; if (N < 0 || N > 170) return false;
+            double r = 1; for (int i = 2; i <= N; ++i) r *= i;
+            val = FmtNum(r); return true;
+        }
+        if (name == L"intersect") {   // $intersect(x1,y1,x2,y2,x3,y3,x4,y4[,method]) -- where line/ray (x1,y1)-(x2,y2) crosses line/ray (x3,y3)-(x4,y4); method's two letters pick, in order, how each one is treated: 'l' (default) = a segment bounded at both given points, 'r' = a ray that starts at the first point and extends infinitely past the second. No intersection (parallel, or out of either bound) returns $null, same as a point on an overlapping line/ray per the doc's own note.
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 8) return false;
+            double x1, y1, x2, y2, x3, y3, x4, y4;
+            if (!ParseNum(p[0], x1) || !ParseNum(p[1], y1) || !ParseNum(p[2], x2) || !ParseNum(p[3], y2) ||
+                !ParseNum(p[4], x3) || !ParseNum(p[5], y3) || !ParseNum(p[6], x4) || !ParseNum(p[7], y4)) return false;
+            CString method = p.size() > 8 ? p[8] : CString(); method.MakeLower(); method.Trim();
+            bool ray1 = (method == L"lr" || method == L"rr"), ray2 = (method == L"rl" || method == L"rr");
+            double dx1 = x2 - x1, dy1 = y2 - y1, dx2 = x4 - x3, dy2 = y4 - y3;
+            double denom = dx1 * dy2 - dy1 * dx2;
+            if (denom == 0) return false;
+            double t = ((x3 - x1) * dy2 - (y3 - y1) * dx2) / denom;
+            double u = ((x3 - x1) * dy1 - (y3 - y1) * dx1) / denom;
+            if (!ray1 && (t < 0 || t > 1)) return false;
+            if (ray1 && t < 0) return false;
+            if (!ray2 && (u < 0 || u > 1)) return false;
+            if (ray2 && u < 0) return false;
+            double ix = x1 + t * dx1, iy = y1 + t * dy1;
+            val.Format(L"%s,%s", (LPCWSTR)FmtNum(ix), (LPCWSTR)FmtNum(iy)); return true;
         }
         if (name == L"left" || name == L"right") {   // $left(text,N) / $right(text,N) -- N<0 means "all but the last/first |N| characters" from that side
             CString a = EvalIds(w, rawArgs, params);
@@ -7174,6 +7556,23 @@ class CMainFrame : public CMDIFrameWnd {
             else std::sort(toks.begin(), toks.end(), [](const CString& x, const CString& y) { return x.CompareNoCase(y) < 0; });
             if (reverse) std::reverse(toks.begin(), toks.end());
             val = JoinTok(toks, delim); return true;
+        }
+        if (name == L"max" || name == L"min") {   // $max(<space delimited tokens>) / $max(<comma,delimited,tokens>) -- (and $min, same syntax). Unlike $sorttok, these default to NUMERIC comparison (the doc says "the same rules as the $sorttok 'n' switch"); .text/.textcs switch to $sorttok's own 'a' switch (case-insensitive / case-sensitive text) instead. .nick (channel-prefix rank, $sorttok's 'c' switch) isn't implemented, same gap $sorttok itself already has -- falls back to plain case-insensitive text.
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.empty()) return false;
+            std::vector<CString> toks = (p.size() == 1) ? SplitTok(p[0], L' ') : p;
+            if (toks.empty()) return false;
+            bool isMax = (name == L"max");
+            CString best = toks[0];
+            for (size_t i = 1; i < toks.size(); ++i) {
+                const CString& t = toks[i];
+                bool better;
+                if (prop == L"textcs") better = isMax ? (wcscmp(t, best) > 0) : (wcscmp(t, best) < 0);
+                else if (prop == L"text" || prop == L"nick") better = isMax ? (t.CompareNoCase(best) > 0) : (t.CompareNoCase(best) < 0);
+                else { double db = 0, dt = 0; ParseNum(best, db); ParseNum(t, dt); better = isMax ? (dt > db) : (dt < db); }
+                if (better) best = t;
+            }
+            val = best; return true;
         }
         if (name == L"matchtok" || name == L"matchtokcs") {   // $matchtok(list,substring,N,C) -- a PARTIAL (substring) match, unlike $findtok's exact match; N=0 returns the match count, N>0 returns the Nth matching TOKEN itself (not its position)
             bool cs = (name == L"matchtokcs");
@@ -7267,6 +7666,46 @@ class CMainFrame : public CMDIFrameWnd {
                 }
             }
             val.Format(L"%d", total); return true;
+        }
+        if (name == L"countcs") {   // $countcs(string,substring[,substring2,...]) -- same as $count but case-sensitive
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() < 2) return false;
+            const CString& text = p[0]; int total = 0;
+            for (size_t i = 1; i < p.size(); ++i) {
+                const CString& sub = p[i]; if (sub.IsEmpty()) continue;
+                int pos = 0;
+                while (pos <= text.GetLength()) {
+                    int f = text.Find(sub, pos); if (f < 0) break;
+                    ++total; pos = f + sub.GetLength();
+                }
+            }
+            val.Format(L"%d", total); return true;
+        }
+        if (name == L"isnum" || name == L"isnumber") {   // $isnum(text,[sd],[I,J]) -- $true if text is a number; s=allow a leading +/- sign, d=allow a decimal point; optional [I,J] range check against text's numeric value, which itself requires the 'd' switch too if either bound has a decimal point. $isnumber is just a longer alias for the same identifier.
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.empty()) return false;
+            CString text = p[0]; CString sw = p.size() > 1 ? p[1] : CString(); sw.MakeLower();
+            bool allowSign = sw.Find(L's') >= 0, allowDec = sw.Find(L'd') >= 0;
+            auto isValid = [&](const CString& s) -> bool {
+                CString t = s; t.Trim(); if (t.IsEmpty()) return false;
+                int i = 0, n = t.GetLength(); bool sawDigit = false, sawDot = false;
+                if (i < n && (t[i] == L'+' || t[i] == L'-')) { if (!allowSign) return false; i++; }
+                for (; i < n; ++i) {
+                    if (iswdigit(t[i])) { sawDigit = true; continue; }
+                    if (t[i] == L'.' && allowDec && !sawDot) { sawDot = true; continue; }
+                    return false;
+                }
+                return sawDigit;
+            };
+            if (!isValid(text)) { val = L"$false"; return true; }
+            if (p.size() >= 4) {   // optional [I,J] range
+                if (!allowDec && (p[2].Find(L'.') >= 0 || p[3].Find(L'.') >= 0)) return false;   // matches the doc's own example: a decimal bound needs the 'd' switch, same as the input would
+                double x, lo, hi; if (!ParseNum(text, x) || !ParseNum(p[2], lo) || !ParseNum(p[3], hi)) return false;
+                if (lo > hi) { double t = lo; lo = hi; hi = t; }
+                val = (x >= lo && x <= hi) ? L"$true" : L"$false"; return true;
+            }
+            val = L"$true"; return true;
         }
         if (name == L"regex") {   // $regex([name],text,/pattern/flags) -- returns the number of matches; capture groups are stashed for $regml(name,N) to retrieve afterward. Supports the i (case-insensitive) and g (global -- all matches, not just the first) flags; the mIRC-specific F modifier (capture-group indexing mode) isn't implemented, groups are always indexed by their position in the pattern.
             CString a = EvalIds(w, rawArgs, params);
@@ -7571,6 +8010,25 @@ class CMainFrame : public CMDIFrameWnd {
             m_lastFileEof = false; m_lastFileErr = false;
             val = CString((wchar_t)(unsigned char)ch); return true;
         }
+        if (name == L"freadex") {   // $freadex(name/N) -- the rest of the file's content from the handle's current read position through EOF (CRLF-joined line by line, same as repeated $fread calls), leaving the handle positioned at EOF afterward
+            CString a = EvalIds(w, rawArgs, params);
+            FileHandleEntry* h = nullptr; double nD;
+            if (ParseNum(a, nD)) { int N = (int)nD; if (N >= 1 && N <= (int)m_fileHandles.size()) h = &m_fileHandles[N - 1]; }
+            else h = FindFileHandle(a);
+            if (!h || !h->file) { m_lastFileErr = true; val.Empty(); return true; }
+            CString all, line; bool any = false;
+            while (h->file->ReadString(line)) { if (any) all += L"\r\n"; all += line; any = true; }
+            m_lastFileEof = true; m_lastFileErr = false;
+            val = all; return true;
+        }
+        if (name == L"lof") {   // $lof(filename) -- the file's size in bytes, same data as $file().size; $null (empty) if it doesn't exist
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            if (!::GetFileAttributesExW(a, GetFileExInfoStandard, &fad)) { val.Empty(); return true; }
+            ULARGE_INTEGER sz; sz.HighPart = fad.nFileSizeHigh; sz.LowPart = fad.nFileSizeLow;
+            val.Format(L"%llu", sz.QuadPart);
+            return true;
+        }
         if (name == L"level") {   // $level(address) -- the comma-separated levels list of every m_levelEntries entry matching that address, "=N" for an exact-only grant, plain "N" for a cumulative one
             CString addr = EvalIds(w, rawArgs, params);
             CString out;
@@ -7796,6 +8254,128 @@ class CMainFrame : public CMDIFrameWnd {
             else val = m.first + L"!" + m.second;
             return true;
         }
+        if (name == L"nick") return NickLookupCommon(w, (w && w->net) ? w->net : nullptr, rawArgs, params, prop, false, CString(), CString(), val);   // $nick(#,N/nick[,inc[,exc]])[.pnick/.idle/.color] -- no default include/exclude when omitted: that means "everyone"
+        if (name == L"nhnick") return NickLookupCommon(w, (w && w->net) ? w->net : nullptr, rawArgs, params, prop, true, L"a", L"oh", val);   // deprecated, doc says "replaced by $nick" -- default (no 3rd/4th arg) is all-nicks excluding op/halfop
+        if (name == L"nopnick") return NickLookupCommon(w, (w && w->net) ? w->net : nullptr, rawArgs, params, prop, true, L"a", L"o", val);   // deprecated -- default is all-nicks excluding op
+        if (name == L"nvnick") return NickLookupCommon(w, (w && w->net) ? w->net : nullptr, rawArgs, params, prop, true, L"r", L"", val);   // deprecated -- doc: two-param form is exactly $nick(#,N,r)
+        if (name == L"rnick") return NickLookupCommon(w, (w && w->net) ? w->net : nullptr, rawArgs, params, prop, true, L"r", L"", val);   // deprecated -- same "regular/no status" default tier as $nvnick in this engine's model
+        if (name == L"snick") {   // $snick(#chan,N) -- the Nth currently-selected nick in that channel window's nicklist; N=0 is the selected count
+            Net* net = (w && w->net) ? w->net : nullptr;
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 2) return false;
+            CChatWnd* cw = Find(net, p[0]); double nD; if (!ParseNum(p[1], nD)) return false; int N = (int)nD;
+            std::vector<CString> sel; if (cw) cw->GetSelectedNicks(sel);
+            if (N == 0) { val.Format(L"%d", (int)sel.size()); return true; }
+            val = (N >= 1 && N <= (int)sel.size()) ? sel[N - 1] : CString();
+            return true;
+        }
+        if (name == L"comchan") {   // $comchan(nick,N)[.op/.help/.voice/.owner] -- the Nth channel window (on the current script's network) the given nick shares with us; N=0 is the count. .op/.help/.voice/.owner check OUR OWN status on that matched channel, per the doc ("whether you are...")
+            Net* net = (w && w->net) ? w->net : nullptr;
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 2) return false;
+            CString nick = p[0]; double nD; if (!ParseNum(p[1], nD)) return false; int N = (int)nD;
+            std::vector<CChatWnd*> matches;
+            for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && cw->m_chan && cw->HasNick(nick)) matches.push_back(cw); }
+            if (N == 0) { val.Format(L"%d", (int)matches.size()); return true; }
+            if (N < 1 || N > (int)matches.size()) { val.Empty(); return true; }
+            CChatWnd* cw = matches[N - 1];
+            wchar_t my = net ? cw->NickPrefixChar(net->nick) : 0;
+            if (prop == L"op") val = (my == L'@') ? L"$true" : L"$false";
+            else if (prop == L"help") val = (my == L'%') ? L"$true" : L"$false";
+            else if (prop == L"voice") val = (my == L'+') ? L"$true" : L"$false";
+            else if (prop == L"owner") val = (my == L'~') ? L"$true" : L"$false";
+            else val = cw->m_name;
+            return true;
+        }
+        if (name == L"ialchan") {   // $ialchan(nick/mask,#chan,N)[.nick/.user/.host/.addr] -- the Nth IAL entry matching the mask that's ALSO currently in that channel's live nicklist; N=0 is the count. .mark/.account/.away/.gecos/.id aren't tracked -- same documented gap as plain $ial
+            Net* net = (w && w->net) ? w->net : nullptr;
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 3) return false;
+            CString mask = p[0], chan = p[1]; double nD; if (!ParseNum(p[2], nD)) return false; int N = (int)nD;
+            CChatWnd* cw = Find(net, chan);
+            std::vector<std::pair<CString, CString>> matches;
+            if (cw) for (auto& kv : m_ial) { CString full = kv.first + L"!" + kv.second; if ((GlobMatch(mask, full) || GlobMatch(mask, kv.first)) && cw->HasNick(kv.first)) matches.push_back(kv); }
+            if (N == 0) { val.Format(L"%d", (int)matches.size()); return true; }
+            if (N < 1 || N > (int)matches.size()) { val.Empty(); return true; }
+            auto& m = matches[N - 1];
+            CString user, host; int at = m.second.Find(L'@'); if (at >= 0) { user = m.second.Left(at); host = m.second.Mid(at + 1); } else host = m.second;
+            if (prop == L"nick") val = m.first;
+            else if (prop == L"user") val = user;
+            else if (prop == L"host") val = host;
+            else if (prop == L"addr") val = m.second;
+            else if (prop == L"mark" || prop == L"account" || prop == L"away" || prop == L"gecos" || prop == L"id") val.Empty();
+            else val = m.first + L"!" + m.second;
+            return true;
+        }
+        if (name == L"ialmark") {   // $ialmark(nick,N/name)[.name/.mark] -- the Nth (or named) IAL mark set via /ialmark for that nick; per the doc's own example, $ialmark($me) with no 2nd arg defaults to N=1
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.empty()) return false;
+            auto it = m_ialMarks.find(VKey(p[0]));
+            if (it == m_ialMarks.end() || it->second.empty()) { val.Empty(); return true; }
+            CString sel = p.size() > 1 ? p[1] : CString(L"1");
+            double nD; int idx = -1;
+            if (ParseNum(sel, nD)) { int N = (int)nD; if (N >= 1 && N <= (int)it->second.size()) idx = N - 1; }
+            else { for (size_t i = 0; i < it->second.size(); i++) if (it->second[i].name.CompareNoCase(sel) == 0) { idx = (int)i; break; } }
+            if (idx < 0) { val.Empty(); return true; }
+            if (prop == L"name") val = it->second[idx].name;
+            else if (prop == L"mark") val = it->second[idx].mark;
+            else val = it->second[idx].mark;
+            return true;
+        }
+        if (name == L"ibl") {   // $ibl(#chan,N)[.by/.date/.ctime] -- the Nth tracked ban-list entry for that channel (via /channel's internal ban list, numeric 367/368 and live +b/-b MODE changes); N=0 is the count
+            Net* net = (w && w->net) ? w->net : nullptr;
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 2) return false;
+            CString chan = p[0]; double nD; if (!ParseNum(p[1], nD)) return false; int N = (int)nD;
+            auto it = m_ibl.find(Key(net, chan));
+            if (it == m_ibl.end()) { val.Empty(); if (N == 0) val = L"0"; return true; }
+            if (N == 0) { val.Format(L"%d", (int)it->second.size()); return true; }
+            if (N < 1 || N > (int)it->second.size()) { val.Empty(); return true; }
+            auto& b = it->second[N - 1];
+            if (prop == L"by") val = b.by;
+            else if (prop == L"date") { ULONGLONG t = _wtoi64(b.date); val = t ? CTime((time_t)t).Format(L"%c") : CString(); }
+            else if (prop == L"ctime") val = b.date;
+            else val = b.mask;
+            return true;
+        }
+        if (name == L"trust") {   // $trust(N)[.nick/.host] -- the Nth entry in the DCC trust list; N=0 is the count. This client has no DCC trust-list feature at all, so there are never any entries -- N=0 always reports "0", any N>=1 is empty (documented gap)
+            CString a = EvalIds(w, rawArgs, params); double nD;
+            val = (ParseNum(a, nD) && (int)nD == 0) ? CString(L"0") : CString();
+            return true;
+        }
+        if (name == L"unsafe") { val = rawArgs; return true; }   // $unsafe(text) -- delays evaluation of text by one level: returns the raw, NOT-yet-evaluated argument exactly as typed (every other identifier here evaluates rawArgs via EvalIds before using it; this one deliberately skips that), so whatever later re-evaluates the returned string -- a /timer body firing, say -- is the first and only pass over it, per the doc's own external/untrusted-input-in-a-timer example
+        if (name == L"scid" || name == L"scon") {   // $scid(N)[.property]: N is a CONNECTION ID (net->id) -- $scon(N)[.property]: N is a POSITION in the connection list (1-based). Both: N=0 is the connection count; a .property (e.g. .server/.network) is evaluated as that bare identifier in the target connection's own Status window context, reusing the whole rest of this identifier system rather than duplicating per-property logic here
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            double nD; if (!ParseNum(a, nD)) return false; int N = (int)nD;
+            if (N == 0) { val.Format(L"%d", (int)m_nets.size()); return true; }
+            Net* target = nullptr;
+            if (name == L"scid") { for (auto& np : m_nets) if (np->id == N) { target = np.get(); break; } }
+            else if (N >= 1 && N <= (int)m_nets.size()) target = m_nets[N - 1].get();
+            if (!target) { val.Empty(); return true; }
+            if (prop.IsEmpty()) { val.Format(L"%d", target->id); return true; }
+            val = EvalIds(Status(target), L"$" + prop, params);
+            return true;
+        }
+        if (name == L"sslhash") {   // $sslhash(md5|sha1|sha256|sha512,p|s)[.babble/.colons] -- fingerprint of the current connection's certificate. p (client cert): always $null, this client has no client-certificate/mutual-TLS feature (see $sslcertsha1's own comment). s (server cert): hashes the server leaf cert's actual raw DER bytes, fetched fresh from SChannel each call (not cached -- matches the doc's own "changes immediately" expectation, and this is a cheap, already-in-memory lookup)
+            Net* net = (w && w->net) ? w->net : nullptr;
+            CString a = EvalIds(w, rawArgs, params);
+            int c = a.Find(L','); if (c < 0) return false;
+            CString method = a.Left(c); method.Trim(); method.MakeLower();
+            CString type = a.Mid(c + 1); type.Trim(); type.MakeLower();
+            if (type != L"p" && type != L"s") return false;   // "* Invalid parameters: $sslhash" territory -- malformed call, not just "no cert"
+            LPCWSTR algId = method == L"md5" ? BCRYPT_MD5_ALGORITHM : method == L"sha1" ? BCRYPT_SHA1_ALGORITHM :
+                             method == L"sha256" ? BCRYPT_SHA256_ALGORITHM : method == L"sha512" ? BCRYPT_SHA512_ALGORITHM : nullptr;
+            if (!algId) return false;
+            if (type == L"p") { val.Empty(); return true; }   // no client certificate ever loaded by this client
+            std::vector<BYTE> der;
+            if (!net || !net->sock.tls || !net->sock.tls->GetServerCertDer(der)) { val.Empty(); return true; }
+            std::vector<BYTE> hash;
+            if (!BCryptHashBytes(algId, der.data(), (int)der.size(), hash) || hash.empty()) { val.Empty(); return true; }
+            if (prop == L"babble") { val = BubbleBabble(hash); return true; }
+            CString hex; for (BYTE b : hash) { wchar_t buf[4]; swprintf_s(buf, L"%02x", b); hex += buf; }
+            if (prop == L"colons") { CString out; for (int i = 0; i < hex.GetLength(); i += 2) { if (!out.IsEmpty()) out += L":"; out += hex.Mid(i, 2); } val = out; return true; }
+            val = hex; return true;
+        }
         if (name == L"hmac") {   // $hmac(text|filename,key,hash,N) -- N=0 (default): text is plain text; N=2: text is a filename to read. N=1 (&binvar) isn't implemented, same as this client's other &binvar-accepting identifiers, since there's no binary-variable system here at all.
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
@@ -7885,6 +8465,44 @@ class CMainFrame : public CMDIFrameWnd {
             __int64 result = lo + r;
             if (asChar) val = CString((wchar_t)result); else val.Format(L"%I64d", result);
             return true;
+        }
+        if (name == L"rands") {   // $rands(N,M) / $rands(char1,char2) -- same range syntax as $rand, but drawn from a cryptographically-secure source (BCryptGenRandom) rather than the C runtime's rand()
+            CString a = EvalIds(w, rawArgs, params); int c = a.Find(L','); if (c < 0) return false;
+            CString p1 = a.Left(c); p1.Trim(); CString p2 = a.Mid(c + 1); p2.Trim();
+            double n1, n2;
+            bool ok1 = ParseNum(p1, n1), ok2 = ParseNum(p2, n2);
+            bool asChar = (p1.GetLength() == 1 && iswalpha(p1[0])) || (p2.GetLength() == 1 && iswalpha(p2[0]));
+            if (!ok1 && p1.GetLength() == 1) { n1 = (double)(wchar_t)p1[0]; ok1 = true; }
+            if (!ok2 && p2.GetLength() == 1) { n2 = (double)(wchar_t)p2[0]; ok2 = true; }
+            if (!ok1 || !ok2) return false;
+            __int64 lo = (__int64)(n1 < n2 ? n1 : n2), hi = (__int64)(n1 < n2 ? n2 : n1);
+            __int64 span = hi - lo + 1;
+            if (span <= 0) { val = asChar ? CString((wchar_t)lo) : CString(); if (!asChar) val.Format(L"%I64d", lo); return true; }
+            unsigned __int64 rnd = 0;
+            bool secure = BCryptGenRandom(nullptr, (PUCHAR)&rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+            if (!secure) rnd = ((unsigned __int64)rand() << 32) | (unsigned)rand();   // fallback if the crypto RNG is ever unavailable -- the same source $rand itself already uses
+            __int64 r = (__int64)(rnd % (unsigned __int64)span);
+            __int64 result = lo + r;
+            if (asChar) val = CString((wchar_t)result); else val.Format(L"%I64d", result);
+            return true;
+        }
+        if (name == L"replacex" || name == L"replacexcs") {   // $replacex(text,substring,replace,stringN,replaceN...) -- like $replace, but scans the input once, left to right; at each position, whichever pair (checked in the order given) matches wins, and the scan jumps past the matched SUBSTRING's own length (not the replacement text's), so already-replaced text is never rescanned
+            bool cs = (name == L"replacexcs");
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));   // raw-split first, see $replace's own comment just below for why
+            if (p.size() < 3 || (p.size() - 1) % 2 != 0) return false;
+            const CString& text = p[0];
+            int n = text.GetLength(); CString out; int pos = 0;
+            while (pos < n) {
+                bool matched = false;
+                for (size_t i = 1; i + 1 < p.size(); i += 2) {
+                    const CString& sub = p[i]; if (sub.IsEmpty()) continue;
+                    int sl = sub.GetLength(); if (pos + sl > n) continue;
+                    bool eq = cs ? (text.Mid(pos, sl) == sub) : (text.Mid(pos, sl).CompareNoCase(sub) == 0);
+                    if (eq) { out += p[i + 1]; pos += sl; matched = true; break; }
+                }
+                if (!matched) { out += text[pos]; pos++; }
+            }
+            val = out; return true;
         }
         if (name == L"replace" || name == L"replacecs") {   // $replace(text,old1,new1[,old2,new2,...]) -- pairs applied in sequence, each seeing the previous pair's result
             bool cs = (name == L"replacecs");
@@ -8025,6 +8643,22 @@ class CMainFrame : public CMDIFrameWnd {
             double nD; if (!ParseNum(nStr, nD)) return false; int idx = TokIndex((int)nD, toks.size());
             if (idx < 0) { val = JoinTok(toks, delim); return true; }
             toks[idx] = data; val = JoinTok(toks, delim); return true;
+        }
+        if (name == L"instok") {   // $instok(list,token,N,C) -- inserts token at the Nth position (negative counts from the end), even if it already exists there -- unlike $puttok, it doesn't overwrite
+            CString a = EvalIds(w, rawArgs, params);
+            int c3 = a.ReverseFind(L','); if (c3 < 0) return false;
+            CString rest = a.Left(c3); double cD; if (!ParseNum(a.Mid(c3 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
+            int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
+            CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
+            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
+            int cnt = (int)toks.size(); int insertAt;
+            if (N > 0) insertAt = (std::min)(N - 1, cnt);
+            else if (N < 0) insertAt = (std::max)(cnt + N + 1, 0);
+            else insertAt = cnt;   // N==0 has no documented meaning for an insert -- append, same as an out-of-range positive N would
+            toks.insert(toks.begin() + insertAt, tok);
+            val = JoinTok(toks, delim); return true;
         }
         if (name == L"remtok" || name == L"remtokcs") {   // $remtok(list,token,N,C) -- removes the Nth MATCHING token (N=0: all matches)
             bool cs = (name == L"remtokcs");
@@ -8307,16 +8941,33 @@ class CMainFrame : public CMDIFrameWnd {
             for (size_t i = 0; i < itemNames.size(); i++) if (itemNames[i].CompareNoCase(itemSel) == 0) { val.Format(L"%d", (int)i + 1); return true; }
             val = L"0"; return true;
         }
-        if (name == L"finddir" || name == L"findfile") {   // $finddir/$findfile(dir,wildcard,N,depth[,@window|command]) -- only the N-th-match lookup form is implemented; the @window-fill and per-match-command forms are not
-            CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
-            if (parts.size() < 2) { val.Empty(); return true; }
-            CString dir = parts[0]; dir.Trim(); CString wildcard = parts[1]; wildcard.Trim();
-            int targetN = 1; if (parts.size() > 2) { double nD; if (ParseNum(parts[2], nD)) targetN = (int)nD; }
-            int maxDepth = -1; if (parts.size() > 3) { double dD; if (ParseNum(parts[3], dD)) maxDepth = (int)dD; }
-            int counter = 0; CString result;
-            bool found = FindInDirRecursive(dir, wildcard, name == L"finddir", counter, targetN, 0, maxDepth, result);
-            val = found ? result : CString();
+        if (name == L"finddir" || name == L"findfile") {   // $finddir/$findfile(dir,wildcard,N,depth[,@window|command]) -- a 5th argument starting with '@' fills that listbox window with every match (one per line); any other 5th argument is run as a command once per match, with $1- set to the matched path and $finddirn/$findfilen giving that match's 1-based position -- matching the doc's own $finddir($mircdir,*,0,0,echo -a $finddirn : $1-) example. Without a 5th argument, it's the plain Nth-match lookup instead.
+            bool isDir = (name == L"finddir");
+            std::vector<CString> rawParts = SplitTopLevelCommasParen(rawArgs);
+            if (rawParts.size() < 2) return false;
+            CString dir = EvalIds(w, rawParts[0], params); dir.Trim();
+            CString wildcard = EvalIds(w, rawParts[1], params); wildcard.Trim();
+            int targetN = 1; if (rawParts.size() > 2) { double nD; if (ParseNum(EvalIds(w, rawParts[2], params), nD)) targetN = (int)nD; }
+            int maxDepth = -1; if (rawParts.size() > 3) { double dD; if (ParseNum(EvalIds(w, rawParts[3], params), dD)) maxDepth = (int)dD; }
+            if (rawParts.size() <= 4) {   // plain Nth-match lookup form
+                int counter = 0; CString result;
+                bool found = FindInDirRecursive(dir, wildcard, isDir, counter, targetN, 0, maxDepth, result);
+                val = found ? result : CString();
+                return true;
+            }
+            CString target = EvalIds(w, rawParts[4], params); target.Trim();   // @window, or a command to run per match
+            int counter = 0; CString unused; std::vector<CString> matches;
+            FindInDirRecursive(dir, wildcard, isDir, counter, targetN, 0, maxDepth, unused, &matches);
+            int& n = isDir ? m_finddirN : m_findfileN;
+            int savedN = n;
+            if (!target.IsEmpty() && target[0] == L'@') {
+                CChatWnd* lb = nullptr; for (auto& kv : m_w) if (kv.second->m_custom && kv.second->m_name.CompareNoCase(target) == 0) { lb = kv.second; break; }   // the @window must already exist (e.g. via /window -- this doesn't create one)
+                if (lb) for (auto& m : matches) lb->AddLine(m, cText, 0);
+            } else {
+                for (size_t i = 0; i < matches.size(); i++) { n = (int)i + 1; RunScript(w, { target }, matches[i]); }
+            }
+            n = savedN;
+            val.Format(L"%d", (int)matches.size());
             return true;
         }
         if (name == L"sfile") {   // $sfile(dir,title,oktext): the standard file-open dialog
@@ -8339,6 +8990,17 @@ class CMainFrame : public CMDIFrameWnd {
             BROWSEINFOW bi = {}; bi.hwndOwner = m_hWnd; bi.pszDisplayName = path; bi.lpszTitle = title; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
             LPITEMIDLIST pidl = ::SHBrowseForFolderW(&bi);
             if (pidl) { ::SHGetPathFromIDListW(pidl, path); ::CoTaskMemFree(pidl); val = path; } else { m_sfstate = L"cancel"; val.Empty(); }
+            return true;
+        }
+        if (name == L"dir") {   // $dir(dir,title): the same standard folder-browse dialog as $sdir -- deprecated by real mIRC in favor of $sdir, which this client already implements; real mIRC's own $dir doesn't actually take parens at all (its legacy syntax is the bare identifier followed by =\"title\" <dir> as raw trailing text), but this engine -- like the rest of this codebase -- only ever parses $identifier(args) or a bare $identifier, never that exotic form, so it's given $sdir's own (dir,title) argument order instead
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            CString title = parts.size() > 1 ? parts[1] : CString(L"Select Folder");   // parts[0] (the initial directory) isn't used -- same gap $sdir itself already has, since BROWSEINFOW needs a callback to preset the starting folder
+            m_sfstate.Empty();
+            wchar_t path[MAX_PATH] = {};
+            BROWSEINFOW bi = {}; bi.hwndOwner = m_hWnd; bi.pszDisplayName = path; bi.lpszTitle = title; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl2 = ::SHBrowseForFolderW(&bi);
+            if (pidl2) { ::SHGetPathFromIDListW(pidl2, path); ::CoTaskMemFree(pidl2); val = path; } else { m_sfstate = L"cancel"; val.Empty(); }
             return true;
         }
         if (name == L"msfile") {   // $msfile(dir,title,oktext) triggers the dialog and returns the count; $msfile(N) (a single numeric arg) returns the Nth file from that last run
@@ -8465,7 +9127,7 @@ class CMainFrame : public CMDIFrameWnd {
             parts.TrimRight(); val = parts;
             return true;
         }
-        if (name == L"uptime") {   // $uptime(mirc|server|system, N) -- N is $duration()'s own N (1=default text, 2=without seconds, 3=seconds instead of ms)
+        if (name == L"uptime") {   // $uptime(mirc|server|system, N) -- N: 0 (default) = plain ms, 1 = $duration's own default text (with seconds), 2 = without seconds, 3 = whole seconds
             CString a = EvalIds(w, rawArgs, params);
             int comma = a.Find(L',');
             CString which = comma >= 0 ? a.Left(comma) : a; which.Trim(); which.MakeLower();
@@ -8479,6 +9141,12 @@ class CMainFrame : public CMDIFrameWnd {
                 if (!net) for (auto& np : m_nets) if (np->conn) { net = np.get(); break; }
                 ms = (net && net->connectTick) ? ::GetTickCount64() - net->connectTick : 0;
             }
+            // N==0 is the default and real mIRC's documented default return -- a plain millisecond count, same as
+            // $ticks itself ("$uptime(system,0) is the same as $ticks" is literally the doc's own first example).
+            // This used to fall through to the $duration text formatter for EVERY N other than 3, which silently
+            // turned the default, no-N-given call -- by far the most common form scripts actually use -- into a
+            // verbose "2d 3h 15m 42s"-style string instead of the raw number scripts expect to do arithmetic on.
+            if (N == 0) { val.Format(L"%I64u", ms); return true; }
             if (N == 3) { val.Format(L"%I64d", ms / 1000); return true; }
             CString secStr; secStr.Format(L"%I64d", ms / 1000);
             return FuncValue(w, L"duration", secStr + (N == 2 ? L",2" : CString()), CString(), params, val);
@@ -8835,6 +9503,137 @@ class CMainFrame : public CMDIFrameWnd {
             else val = cw->m_name;   // default: the name itself
             return true;
         }
+        if (name == L"toolbar") {   // $toolbar(name|N)[.name/.type/.tip/.alias/.popup/.width/.height/.wide/.enabled/.visible/.checked/.alpha] -- an item lookup; the bare, parens-less $toolbar (on/off) is handled in IdentValue instead. This client's toolbar is a fixed, non-customizable set of buttons (not mIRC's own scriptable one), so .type/.alias/.popup/.wide/.alpha have nothing real to report and always come back empty -- same spirit as $chat's documented-but-unmodeled properties elsewhere.
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            if (a.IsEmpty()) { val = m_tb.IsWindowVisible() ? L"$true" : L"$false"; return true; }
+            CToolBarCtrl& tbc = m_tb.GetToolBarCtrl();
+            int total = tbc.GetButtonCount();
+            // This MFC version's CToolBarCtrl wrapper has no GetButtonText at all (TB_GETBUTTONTEXT itself is the
+            // old ANSI-only message, unreliable/unsupported under modern comctl32), so text is read directly via
+            // TB_GETBUTTONINFO with TBIF_BYINDEX, which works straight off the button INDEX, no command id needed.
+            auto textOf = [&](int i) -> CString {
+                wchar_t buf[256] = {};
+                TBBUTTONINFOW info = {}; info.cbSize = sizeof(info); info.dwMask = TBIF_BYINDEX | TBIF_TEXT; info.pszText = buf; info.cchText = 256;
+                tbc.SendMessage(TB_GETBUTTONINFOW, (WPARAM)i, (LPARAM)&info);
+                return CString(buf);
+            };
+            int idx = -1; double nD;
+            if (ParseNum(a, nD)) { int n = (int)nD; if (n == 0) { val.Format(L"%d", total); return true; } if (n >= 1 && n <= total) idx = n - 1; }
+            else { for (int i = 0; i < total; i++) if (textOf(i).CompareNoCase(a) == 0) { idx = i; break; } }
+            if (idx < 0) { val.Empty(); return true; }
+            TBBUTTON tbb = {}; tbc.GetButton(idx, &tbb);
+            CString text = textOf(idx);
+            CRect r; tbc.GetItemRect(idx, &r);
+            UINT state = tbc.GetState(tbb.idCommand);
+            if (prop == L"name") val = text;
+            else if (prop == L"width") val.Format(L"%d", r.Width());
+            else if (prop == L"height") val.Format(L"%d", r.Height());
+            else if (prop == L"enabled") val = (state & TBSTATE_ENABLED) ? L"$true" : L"$false";
+            else if (prop == L"visible") val = !(state & TBSTATE_HIDDEN) ? L"$true" : L"$false";
+            else if (prop == L"checked") val = (state & TBSTATE_CHECKED) ? L"$true" : L"$false";
+            else if (prop == L"type" || prop == L"tip" || prop == L"alias" || prop == L"popup" || prop == L"wide" || prop == L"alpha") val.Empty();   // not modeled -- see the comment above
+            else val = text;
+            return true;
+        }
+        if (name == L"query") {   // $query(N/nick)[.addr/.logfile/.stamp/.wid/.cid/.hwnd/.idle] -- the Nth query window opened (creation order), or the one open with a given nick; N=0 is the total count
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            std::vector<CChatWnd*> qs; for (auto& kv : m_w) { CChatWnd* x = kv.second; if (x->net && !x->m_chan && !x->m_custom && x->m_name != L"*status*") qs.push_back(x); }
+            std::sort(qs.begin(), qs.end(), [](CChatWnd* a1, CChatWnd* b1) { return a1->m_cwId < b1->m_cwId; });
+            CChatWnd* found = nullptr; double nD;
+            if (ParseNum(a, nD)) { int idx = (int)nD; if (idx == 0) { val.Format(L"%d", (int)qs.size()); return true; } if (idx >= 1 && idx <= (int)qs.size()) found = qs[idx - 1]; }
+            else for (auto* x : qs) if (x->m_name.CompareNoCase(a) == 0) { found = x; break; }
+            if (!found) { val.Empty(); return true; }
+            if (prop == L"addr") { auto it = m_ial.find(VKey(found->m_name)); val = it != m_ial.end() ? it->second : CString(); }   // may not be correct/filled in yet, same caveat the doc itself gives -- it's only ever learned from a message actually received from them (see IalLearn)
+            else if (prop == L"logfile") val = m_logFolder + L"\\" + MakeValidFn(found->m_name) + L".log";   // best-effort filename this window WOULD log to -- this client has no per-window logging-enabled toggle to check against
+            else if (prop == L"stamp") { bool on = found->m_tsMode >= 0 ? (found->m_tsMode != 0) : (found->tsEnabled ? found->tsEnabled() : true); val = on ? L"$true" : L"$false"; }
+            else if (prop == L"wid") val.Format(L"%d", found->m_cwId);
+            else if (prop == L"cid") val.Format(L"%d", found->net ? found->net->id : 0);
+            else if (prop == L"hwnd") val.Format(L"%zu", (size_t)found->GetSafeHwnd());
+            else if (prop == L"idle") val.Format(L"%I64u", found->m_lastMsgTick ? (::GetTickCount64() - found->m_lastMsgTick) / 1000 : 0);
+            else val = found->m_name;
+            return true;
+        }
+        if (name == L"chat") {   // $chat(N/nick[,N])[.cid/.hwnd/.idle/.ip/.status/.stamp/.wid] -- an open DCC Chat window/session
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.empty()) return false;
+            CString sel = p[0]; sel.Trim();
+            double nn = 1; if (p.size() > 1 && !ParseNum(p[1], nn)) return false;
+            std::vector<DccSession*> chats; for (auto& s : m_dcc) if (s->kind == DccSession::CHAT) chats.push_back(s.get());
+            DccSession* found = nullptr; double idxD;
+            if (ParseNum(sel, idxD)) {
+                int idx = (int)idxD;
+                if (idx == 0) { val.Format(L"%d", (int)chats.size()); return true; }
+                if (idx >= 1 && idx <= (int)chats.size()) found = chats[idx - 1];
+            } else { int matchCount = 0, want = (int)nn; for (auto* s : chats) if (s->nick.CompareNoCase(sel) == 0) { ++matchCount; if (matchCount == want) { found = s; break; } } }
+            if (!found) { val.Empty(); return true; }
+            if (prop == L"cid") val.Format(L"%d", found->net ? found->net->id : 0);
+            else if (prop == L"hwnd") val.Format(L"%zu", (size_t)(found->win ? found->win->GetSafeHwnd() : 0));
+            else if (prop == L"idle") val.Format(L"%I64u", (found->win && found->win->m_lastMsgTick) ? (::GetTickCount64() - found->win->m_lastMsgTick) / 1000 : 0);
+            else if (prop == L"ip") val = found->address;
+            else if (prop == L"status") val = (found->state == DccSession::ACTIVE) ? L"active" : (found->state == DccSession::FAILED || found->state == DccSession::DONE) ? L"inactive" : L"waiting";
+            else if (prop == L"stamp") { bool on = found->win ? (found->win->m_tsMode >= 0 ? (found->win->m_tsMode != 0) : (found->win->tsEnabled ? found->win->tsEnabled() : true)) : true; val = on ? L"$true" : L"$false"; }
+            else if (prop == L"wid") val.Format(L"%d", found->win ? found->win->m_cwId : 0);
+            else val = found->nick;
+            return true;
+        }
+        if (name == L"topic") {   // $topic(channel) -- deprecated by real mIRC in favor of $chan().topic, but still a documented identifier
+            Net* net = (w && w->net) ? w->net : nullptr;
+            CString chan = EvalIds(w, rawArgs, params); chan.Trim();
+            CChatWnd* cw = Find(net, chan);
+            val = cw ? cw->m_topicRaw : CString();
+            return true;
+        }
+        if (name == L"mode") {   // $mode(N)[.op/.deop/.voice/.devoice/.help/.dehelp/.owner/.deowner/.ban/.unban] -- the Nth nick/mask affected by the most recently-processed channel mode line (N=0: total count). The plain (no-property) list is every target across that WHOLE line; a per-property list is only that mode's own targets -- see FireModeEvents' own comment on m_modeAll/etc for why these can differ.
+            double nD; if (!ParseNum(EvalIds(w, rawArgs, params), nD)) return false; int N = (int)nD;
+            const std::vector<CString>* list =
+                prop == L"op" ? &m_modeOp : prop == L"deop" ? &m_modeDeop :
+                prop == L"voice" ? &m_modeVoice : prop == L"devoice" ? &m_modeDevoice :
+                prop == L"help" ? &m_modeHelp : prop == L"dehelp" ? &m_modeDehelp :
+                prop == L"owner" ? &m_modeOwner : prop == L"deowner" ? &m_modeDeowner :
+                prop == L"ban" ? &m_modeBan : prop == L"unban" ? &m_modeUnban : &m_modeAll;
+            if (N == 0) { val.Format(L"%d", (int)list->size()); return true; }
+            if (N < 1 || N > (int)list->size()) { val.Empty(); return true; }
+            val = (*list)[N - 1]; return true;
+        }
+        if (name == L"editbox") {   // $editbox(window[,N])[.selstart/.selend] -- a window's own input box contents, or the selection/cursor position within it; N can only be 1 in real mIRC (a second, "command" editbox) -- this client has no such secondary editbox (see $cmdbox), so N is accepted but otherwise ignored
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.empty()) return false;
+            CString wn = p[0]; wn.Trim();
+            CChatWnd* target = nullptr;
+            if (wn.CompareNoCase(L"Status Window") == 0) target = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : nullptr);
+            else for (auto& kv : m_w) if (kv.second->m_name.CompareNoCase(wn) == 0) { target = kv.second; break; }
+            if (!target) { val.Empty(); return true; }
+            CString text; int s = 0, e = 0; target->GetEditBoxInfo(text, s, e);
+            if (prop == L"selstart") { val.Format(L"%d", s); return true; }
+            if (prop == L"selend") { val.Format(L"%d", e); return true; }
+            val = text; return true;
+        }
+        if (name == L"font") {   // $font(N)[.size/.pitch/.type] -- the Nth font installed on the system (N=0: total count)
+            double nD; if (!ParseNum(EvalIds(w, rawArgs, params), nD)) return false; int N = (int)nD;
+            static std::vector<CString> allFonts; static std::vector<BYTE> fontFlags;   // the installed-fonts list doesn't change at runtime, so this is gathered once per process rather than re-enumerated on every call
+            if (allFonts.empty()) {
+                HDC dc = ::GetDC(nullptr);
+                LOGFONTW lf = {}; lf.lfCharSet = DEFAULT_CHARSET;
+                struct Ctx { std::vector<CString>* names; std::vector<BYTE>* flags; };
+                Ctx ctx{ &allFonts, &fontFlags };
+                ::EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW* lf2, const TEXTMETRICW* tm, DWORD, LPARAM lp) -> int {
+                    Ctx* c = (Ctx*)lp;
+                    CString nm = lf2->lfFaceName;
+                    for (auto& e : *c->names) if (e.CompareNoCase(nm) == 0) return 1;   // de-dupe -- one callback per style/charset otherwise
+                    c->names->push_back(nm); c->flags->push_back(tm ? (BYTE)tm->tmPitchAndFamily : 0);
+                    return 1;
+                }, (LPARAM)&ctx, 0);
+                if (dc) ::ReleaseDC(nullptr, dc);
+            }
+            if (N == 0) { val.Format(L"%d", (int)allFonts.size()); return true; }
+            if (N < 1 || N > (int)allFonts.size()) { val.Empty(); return true; }
+            BYTE pf = fontFlags[N - 1];
+            if (prop == L"pitch") val = (pf & TMPF_FIXED_PITCH) ? L"variable" : L"fixed";   // TMPF_FIXED_PITCH is documented backwards from LOGFONT's own FIXED_PITCH: set means variable-pitch here
+            else if (prop == L"type") val = (pf & TMPF_TRUETYPE) ? L"truetype" : (pf & TMPF_VECTOR) ? L"vector" : (pf & TMPF_DEVICE) ? L"device" : L"raster";
+            else if (prop == L"size") val.Empty();   // a comma-separated list of supported sizes -- only meaningful for fixed-size raster fonts, which this one-pass-per-face enumeration doesn't separately collect; not implemented
+            else val = allFonts[N - 1];
+            return true;
+        }
         if (name == L"sock") {   // $sock(name) or $sock(N): a reduced property set, same spirit as $window() above -- no .sq/.rq send/receive-queue sizes or .data (mIRC's own $sock() has no obvious use for those here, since /sockwrite and /sockread aren't queued/chunked the way real mIRC's socket I/O is)
             CString a = EvalIds(w, rawArgs, params); a.Trim();
             // A pendingClose entry is a socket whose OS handle is already gone, just waiting out the rest of this
@@ -8854,6 +9653,7 @@ class CMainFrame : public CMDIFrameWnd {
             else if (prop == L"addr") val = s->addr;
             else if (prop == L"mark") val = s->mark;
             else if (prop == L"type") val = s->listening ? L"listen" : L"tcp";
+            else if (prop == L"ssl") val = (s->sock && s->sock->tls) ? L"1" : L"0";   // was this socket opened with /sockopen -e?
             else val = s->name;   // default: the name itself, i.e. $sock(name) is truthy/non-empty exactly when that socket exists
             return true;
         }
@@ -9133,6 +9933,11 @@ class CMainFrame : public CMDIFrameWnd {
                 }
                 CString name = in.Mid(j, k - j); name.MakeLower();
                 bool done = false;
+                if (name == L"parms" || name == L"parmn") {   // $parms: documented as "the non-tokenize version of $1-, preserving spaces" -- which is already exactly what slice(1,-1) gives here, since it reads verbatim from the original params text instead of rejoining tokens with a single space. $parmn: the token count behind it (same count $0 reports). Both need THIS call's own params tokenization (ts/slice, just above), which IdentValue has no way to see, so they're handled right here instead of there.
+                    val = (name == L"parms") ? slice(1, -1) : CString();
+                    if (name == L"parmn") val.Format(L"%d", (int)ts.size());
+                    done = true; endIdx = k;
+                }
                 // $func(args) -- any identifier can have one, not just $var/aliases (that used to be the only case
                 // handled, which silently broke .property access on $window/$line/$sline/$tip and anything else
                 // added afterward: a call like $window(1).wid would run $window(1) and then print ".wid" literally,
@@ -9930,9 +10735,12 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_evSignal;   // what $signal returns -- the name passed to /signal that triggered the current on SIGNAL event
     CString m_evSockName; // what $sockname returns -- the socket name a currently-running on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN event fired for
     CString m_sockErr;    // what $sockerr returns -- non-empty inside on SOCKOPEN/SOCKREAD/SOCKCLOSE only when that socket's last operation failed, same as real mIRC; empty the rest of the time
+    int m_sockBr = 0;     // what $sockbr returns -- bytes read by the last /sockread call, set fresh by every /sockread; 0 is how a script's own "sockread %x | if ($sockbr != 0) { ... goto nextline }" drain loop (the standard mIRC SOCKREAD idiom) knows the buffer is empty and stops, instead of looping forever on an unrecognized identifier that never compares equal to 0
     CString m_evLevel;    // what $clevel returns -- the <level> number from the specific "on <level>:EVENT:..." declaration that actually matched and is currently running; empty outside an event
     CString m_evRawMsg;   // what $rawmsg returns -- the exact, full, unparsed line as received from the server, only set within a matching on RAW event
-    CString m_evOpnick, m_evVnick, m_evBnick;   // $opnick/$vnick/$bnick -- the nick (op/voice) or ban mask that a specific on OP/DEOP/VOICE/DEVOICE/BAN/UNBAN event fired for; $nick in these events is still who MADE the change
+    CString m_evOpnick, m_evVnick, m_evBnick, m_evHnick;   // $opnick/$vnick/$bnick/$hnick -- the nick (op/voice/help) or ban mask that a specific on OP/DEOP/VOICE/DEVOICE/HELP/DEHELP/BAN/UNBAN event fired for; $nick in these events is still who MADE the change
+    // $mode(N)[.op/.deop/.voice/.devoice/.help/.dehelp/.owner/.deowner/.ban/.unban] -- rebuilt fresh at the top of every FireModeEvents call (one whole MODE line), in the order each target appeared. m_modeAll is every targeted nick/mask across the WHOLE line (what plain $mode(N)/$mode(0) reads), even though a given on OP/VOICE/BAN event only fires for its own kind -- matches the doc's own "+ob nick test" example, where $mode(0) is 2 even though only one event (on op) actually ran. Owner's mode LETTER is looked up dynamically from the server's own 005 PREFIX= (net->prefixSymbols/prefixModes), not hardcoded, since different ircds use different letters for the '~' tier; real mIRC has no on OWNER/DEOWNER event or $ownick identifier, so owner/deowner are tracked here ONLY for $mode(N)'s own two properties.
+    std::vector<CString> m_modeAll, m_modeOp, m_modeDeop, m_modeVoice, m_modeDevoice, m_modeBan, m_modeUnban, m_modeHelp, m_modeDehelp, m_modeOwner, m_modeDeowner;
     CString m_regErrStr;   // what $regerrstr returns -- the last $regex/$regsub/$regsubex compile error, if any. std::regex_error's own what() text, not literally PCRE's wording (this client uses std::regex, not PCRE), but the same role: a human-readable reason the pattern failed to compile.
     CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName, m_evNumeric;   // what $nick, $chan, $address, $knick,
     bool m_evHaltDef = false;   // $newnick, $event, $numeric resolve to while an event's commands are running
@@ -9944,6 +10752,26 @@ class CMainFrame : public CMDIFrameWnd {
     void IalRename(const CString& oldNick, const CString& newNick) {
         auto it = m_ial.find(VKey(oldNick));
         if (it != m_ial.end()) { m_ial[VKey(newNick)] = it->second; m_ial.erase(it); }
+    }
+    // $ialmark: named marks a script attached to a nick via /ialmark. Keyed by the nick's own VKey, same convention as m_ial.
+    struct IalMarkEntry { CString name, mark; };
+    std::map<CString, std::vector<IalMarkEntry>> m_ialMarks;
+    // $ibl: a per-channel "internal ban list", the same way real mIRC keeps one -- filled in by live +b/-b mode
+    // changes (FireModeEvents) and by any ban-list query this client happens to see (367, e.g. from opening Channel
+    // Central), but never proactively fetched on its own. That matches real mIRC's own behavior (it doesn't
+    // auto-fetch a channel's ban list either), though it does mean a ban set by someone else before this client
+    // ever saw a +b for it, or before a list was queried, won't appear until one of those two things happens.
+    struct BanEntry { CString mask, by, date; };   // date: a raw unix-timestamp string, same format RPL_BANLIST's own field and $ctime use
+    std::map<CString, std::vector<BanEntry>> m_ibl;
+    void IblAdd(Net* net, const CString& chan, const CString& mask, const CString& by, const CString& dateStr) {
+        auto& v = m_ibl[Key(net, chan)];
+        for (auto& e : v) if (e.mask.CompareNoCase(mask) == 0) { e.by = by; e.date = dateStr; return; }   // refresh rather than duplicate
+        v.push_back({ mask, by, dateStr });
+    }
+    void IblRemove(Net* net, const CString& chan, const CString& mask) {
+        auto it = m_ibl.find(Key(net, chan)); if (it == m_ibl.end()) return;
+        auto& v = it->second;
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const BanEntry& e) { return e.mask.CompareNoCase(mask) == 0; }), v.end());
     }
     std::vector<CString> m_remoteMerged;   // the concatenated lines of every script-kind file in m_rfiles -- what m_events/m_rawEvents/m_ctcpEvents/m_remoteAliases/group declarations actually parse from, as opposed to m_remoteRaw, which stays just m_rfiles[0]'s own lines for the editor
     CString m_cachedVarsPath, m_cachedUsersPath;   // set by RebuildFromRFiles' own scan, so SaveVars()/SaveUsers() -- which can run very often (every /set, every /auser) -- don't re-sniff every m_rfiles entry's content with fresh file I/O on every single call
@@ -10378,12 +11206,25 @@ class CMainFrame : public CMDIFrameWnd {
             CString full = modeStr; for (size_t i = paramStart; i < params.size(); i++) full += L" " + params[i];
             FireChannelEvent(w, L"MODE", chan, nick, address, full);
         }
-        auto changes = ParseModeString(net->chanmodes, modeStr, params, paramStart);
+        auto changes = ParseModeString(net->chanmodes, net->prefixModes, modeStr, params, paramStart);
+        // Which mode LETTER means "owner" on this server -- found by position: wherever '~' sits in prefixSymbols,
+        // the letter at that same position in prefixModes is the owner mode (e.g. prefixModes="qaohv"/prefixSymbols="~&@%+"
+        // means 'q' is owner here). 0 if this server's PREFIX= doesn't define an owner tier at all. 'h' (help/halfop,
+        // symbol '%') is common enough across ircds that it's just checked directly rather than looked up the same way.
+        int ownerPos = net->prefixSymbols.Find(L'~');
+        wchar_t ownerLetter = (ownerPos >= 0 && ownerPos < net->prefixModes.GetLength()) ? net->prefixModes[ownerPos] : 0;
+        m_modeAll.clear(); m_modeOp.clear(); m_modeDeop.clear(); m_modeVoice.clear(); m_modeDevoice.clear(); m_modeBan.clear(); m_modeUnban.clear(); m_modeHelp.clear(); m_modeDehelp.clear(); m_modeOwner.clear(); m_modeDeowner.clear();   // $mode(N) and friends -- this whole MODE line's own targets, rebuilt fresh each time (see their own comment)
         for (auto& ch : changes) {
-            if (ch.param.IsEmpty() && (ch.modeChar == L'o' || ch.modeChar == L'v' || ch.modeChar == L'b')) continue;   // no target parameter actually available -- nothing meaningful to fire for
-            if (ch.modeChar == L'o') FireModeSubEvent(w, ch.adding ? L"OP" : L"DEOP", chan, nick, address, ch.param, m_evOpnick);
-            else if (ch.modeChar == L'v') FireModeSubEvent(w, ch.adding ? L"VOICE" : L"DEVOICE", chan, nick, address, ch.param, m_evVnick);
-            else if (ch.modeChar == L'b') FireModeSubEvent(w, ch.adding ? L"BAN" : L"UNBAN", chan, nick, address, ch.param, m_evBnick);
+            if (ch.param.IsEmpty() && (ch.modeChar == L'o' || ch.modeChar == L'v' || ch.modeChar == L'b' || ch.modeChar == L'h' || (ownerLetter && ch.modeChar == ownerLetter))) continue;   // no target parameter actually available -- nothing meaningful to fire for
+            if (ch.modeChar == L'o') { m_modeAll.push_back(ch.param); (ch.adding ? m_modeOp : m_modeDeop).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"OP" : L"DEOP", chan, nick, address, ch.param, m_evOpnick); }
+            else if (ch.modeChar == L'v') { m_modeAll.push_back(ch.param); (ch.adding ? m_modeVoice : m_modeDevoice).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"VOICE" : L"DEVOICE", chan, nick, address, ch.param, m_evVnick); }
+            else if (ch.modeChar == L'h') { m_modeAll.push_back(ch.param); (ch.adding ? m_modeHelp : m_modeDehelp).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"HELP" : L"DEHELP", chan, nick, address, ch.param, m_evHnick); }
+            else if (ownerLetter && ch.modeChar == ownerLetter) { m_modeAll.push_back(ch.param); (ch.adding ? m_modeOwner : m_modeDeowner).push_back(ch.param); }   // real mIRC has no on OWNER/DEOWNER event or $ownick identifier -- $mode(N).owner/.deowner are the only documented way to read this
+            else if (ch.modeChar == L'b') {
+                m_modeAll.push_back(ch.param); (ch.adding ? m_modeBan : m_modeUnban).push_back(ch.param);
+                if (ch.adding) { CString ts; ts.Format(L"%I64d", (__int64)CTime::GetCurrentTime().GetTime()); IblAdd(net, chan, ch.param, nick, ts); } else IblRemove(net, chan, ch.param);   // $ibl
+                FireModeSubEvent(w, ch.adding ? L"BAN" : L"UNBAN", chan, nick, address, ch.param, m_evBnick);
+            }
         }
     }
     // Shared by the six mode-derived events above: same shape as FireChannelEvent, but also sets whichever single
@@ -10648,6 +11489,7 @@ class CMainFrame : public CMDIFrameWnd {
         dlg.net = net; dlg.chanModes = net->chanmodes;
         if (CChatWnd* cw = Find(net, chan)) { dlg.curTopic = cw->m_topicRaw; dlg.topicHist = cw->m_topicHist; }
         dlg.sendRaw = [this, net](const CString& l) { Send(net, l); };
+        m_ibl.erase(Key(net, chan));   // about to re-query the server's own authoritative ban list, so drop whatever this client had guessed/accumulated before -- see IblAdd's own comment
         m_cc = &dlg;
         dlg.DoModal();   // its constructor-side setup asks the server for the modes and ban list; the replies arrive through HandleCCNumeric
         m_cc = nullptr;
@@ -10658,7 +11500,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (P(1).CompareNoCase(m_cc->chan) != 0) return false;   // every reply we care about names the channel as its first parameter after our nick
         if (cmd == L"324") { std::vector<CString> args; for (size_t i = 3; i < p.size(); i++) args.push_back(p[i]); m_cc->SetModes(P(2), args); return true; }   // RPL_CHANNELMODEIS
         if (cmd == L"329") return true;                                                                                                  // channel creation time: not shown
-        if (cmd == L"367") { m_cc->AddEntry(0, P(2), P(3), P(4)); return true; }   if (cmd == L"368") { m_cc->EndList(0); return true; }   // bans
+        if (cmd == L"367") { m_cc->AddEntry(0, P(2), P(3), P(4)); IblAdd(net, m_cc->chan, P(2), P(3), P(4)); return true; }   if (cmd == L"368") { m_cc->EndList(0); return true; }   // bans -- also persisted into $ibl's own store, see IblAdd's comment
         if (cmd == L"348") { m_cc->AddEntry(1, P(2), P(3), P(4)); return true; }   if (cmd == L"349") { m_cc->EndList(1); return true; }   // excepts
         if (cmd == L"346") { m_cc->AddEntry(2, P(2), P(3), P(4)); return true; }   if (cmd == L"347") { m_cc->EndList(2); return true; }   // invites
         if (cmd == L"728") { m_cc->AddEntry(3, P(3), P(4), P(5)); return true; }   if (cmd == L"729") { m_cc->EndList(3); return true; }   // quiets (charybdis-style servers)
@@ -10978,7 +11820,10 @@ class CMainFrame : public CMDIFrameWnd {
                 Show(w, L"* /run: couldn't start '" + file + L"' (" + e + L")", cPart);
             }
         }
-        else if (cmd == L"away") Send(net, arg.IsEmpty() ? CString(L"AWAY") : L"AWAY :" + arg);
+        else if (cmd == L"away") {   // tracked optimistically here, the moment it's sent -- corrected below by 305/306 if the server ever disagrees
+            if (arg.IsEmpty()) { net->awayMsg.Empty(); net->awayTick = 0; Send(net, L"AWAY"); }
+            else { net->awayMsg = arg; net->awayTick = ::GetTickCount64(); Send(net, L"AWAY :" + arg); }
+        }
         else { DispatchPart2(w, net, cmd, arg, inChat); return; }
     }
     // Dispatch()'s own "else if (cmd == ...)" chain had grown, over this whole session, to 119 entries -- each one
@@ -11053,6 +11898,15 @@ class CMainFrame : public CMDIFrameWnd {
             CChatWnd* qw = Find(net, t);
             if (!qw || qw->m_chan) Show(w, L"* /queryrn: no such query window: " + t, cPart);
             else { qw->m_name = nn; qw->SetWindowText(nn); RefreshBars(); Show(qw, L"* Window renamed to " + nn, cInfo); }
+        }
+        else if (cmd == L"ialmark") {   // /ialmark <nick> <name> [mark] -- attaches a named mark to a nick's IAL entry, read back via $ialmark(); an omitted mark removes that named entry instead of setting it
+            CString nk = Word(arg); CString markName = Word(arg); CString markVal = arg; markVal.Trim();
+            if (nk.IsEmpty() || markName.IsEmpty()) { Show(w, L"* Usage: /ialmark <nick> <name> [mark]", cPart); return; }
+            auto& v = m_ialMarks[VKey(nk)];
+            auto it = std::find_if(v.begin(), v.end(), [&](const IalMarkEntry& e) { return e.name.CompareNoCase(markName) == 0; });
+            if (markVal.IsEmpty()) { if (it != v.end()) v.erase(it); }
+            else if (it != v.end()) it->mark = markVal;
+            else v.push_back({ markName, markVal });
         }
         else if (cmd == L"ban") {   // /ban [-k] [#channel] <nick|address> [type] [kick message] -- the -aurbeIq switches aren't implemented (no IAL account tracking, ban-list-type targeting, or timed-unban queue)
             CString a = arg; bool kickToo = false;
@@ -11840,6 +12694,10 @@ class CMainFrame : public CMDIFrameWnd {
             for (size_t i = 1; i < last; i++) {
                 if (p[i].Left(8).CompareNoCase(L"NETWORK=") == 0) net->network = p[i].Mid(8);
                 if (p[i].Left(10).CompareNoCase(L"CHANMODES=") == 0) net->chanmodes = p[i].Mid(10);   // e.g. beI,k,l,imnpst  (a comma-separated four groups)
+                if (p[i].Left(7).CompareNoCase(L"PREFIX=") == 0) {   // e.g. PREFIX=(qaohv)~&@%+ -- the parenthesized half is the mode letters ($nickmode), the rest is their matching symbols, same positional order -- used to find the owner/help letters dynamically in FireModeEvents
+                    CString pf = p[i].Mid(7);
+                    if (pf.GetLength() >= 2 && pf[0] == L'(') { int close = pf.Find(L')'); if (close > 1) { net->prefixModes = pf.Mid(1, close - 1); net->prefixSymbols = pf.Mid(close + 1); } }
+                }
             }
         }
         if (m_cc && HandleCCNumeric(net, cmd, p)) return;   // 324 mode reply, 367/348/346/728 list entries and their end markers
@@ -11892,6 +12750,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (!(ignType == L'p' && queryOpen) && IsIgnored(net, nick, prefix, ignType)) return;   // fully suppressed: not shown, no tip, nothing
             if (IsIgnored(net, nick, prefix, L'k') || m_stripCodes) txt = Strip(txt);   // "strip control codes" -- the message still shows, just without mIRC color/style codes; m_stripCodes is the global /strip setting
             CChatWnd* w = (notice && (priv || !Find(net, tgt))) ? Status(net) : (priv ? OpenBg(net, nick) : Open(net, tgt, IsChan(tgt)));
+            w->m_lastMsgTick = ::GetTickCount64();
             HighlightEntry* hle = notice ? nullptr : MatchHighlight(nick, txt, priv ? nick : tgt);   // Highlight takes precedence over Nick Colors when both match
             CNickEntry* cne = (notice || hle) ? nullptr : MatchCnick(w, nick, prefix, net);   // Nick Colors: "messages that this user sends to channel or query windows" -- notices aren't included
             bool colorMsg = cne && cne->method != 1;   // method 1 = nicklist only, not messages
@@ -12018,6 +12877,15 @@ class CMainFrame : public CMDIFrameWnd {
                 w->m_refresh = true; Send(net, L"NAMES " + P(0));
                 FireModeEvents(w, net, P(0), nick, host, P(1), p, 2);
             }
+            else if (!w && p.size() > 1 && P(0).CompareNoCase(net->nick) == 0) {   // no channel window matched P(0) and it's our own nick -- this is a self usermode line (e.g. "MODE Mouse :+i"), not a channel mode; accumulate it into $usermode
+                CString modeStr = P(1); bool adding = true;
+                for (int mi = 0; mi < modeStr.GetLength(); mi++) {
+                    wchar_t mc = modeStr[mi];
+                    if (mc == L'+') adding = true; else if (mc == L'-') adding = false;
+                    else if (adding) { if (net->usermode.Find(mc) < 0) net->usermode += mc; }
+                    else net->usermode.Remove(mc);
+                }
+            }
         }
         else if (cmd == L"001") { net->nick = P(0); Note(net, P(1), cText); SetState(net, L"Connected: " + (prefix.IsEmpty() ? net->o.host : prefix) + (net->o.tls ? L" (TLS)" : L""));
             net->connectTick = ::GetTickCount64();   // $uptime(server)
@@ -12065,7 +12933,11 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         else if (cmd == L"366") {}
-        else if (cmd == L"433") { net->nick += L"_"; Note(net, L"Nickname in use, trying " + net->nick, cText); Send(net, L"NICK " + net->nick); }
+        else if (cmd == L"433") {   // ERR_NICKNAMEINUSE -- try the configured alt nick (/connect's "Alt Nick" field) once, before falling back to just appending "_" repeatedly
+            if (!net->connectTick && !net->triedAltNick && !net->o.anick.IsEmpty() && net->o.anick.CompareNoCase(net->nick) != 0) { net->triedAltNick = true; net->nick = net->o.anick; }
+            else net->nick += L"_";
+            Note(net, L"Nickname in use, trying " + net->nick, cText); Send(net, L"NICK " + net->nick);
+        }
         //whois stuff
         else if (cmd == L"311") {   // RPL_WHOISUSER: nick user host * :realname
             CString s = P(1) + L" is " + P(2) + L"@" + P(3) + (P(5).IsEmpty() ? CString() : L" * " + P(5)); Note(net, s, cWhois);
@@ -12092,6 +12964,9 @@ class CMainFrame : public CMDIFrameWnd {
             Note(net, P(1) + L" is away: " + P(2), cWhois);
             if (WhoisCapturing(P(1))) m_uwhoCapture.away = P(2);
         }
+        else if (cmd == L"305") { net->awayMsg.Empty(); net->awayTick = 0; Note(net, P(1), cText); }   // RPL_UNAWAY: server confirms we're no longer marked away
+        else if (cmd == L"306") { if (!net->awayTick) net->awayTick = ::GetTickCount64(); Note(net, P(1), cText); }   // RPL_NOWAWAY: server confirms we're now marked away -- awayMsg/awayTick are normally already set from /away itself; this just backstops the case where something else (e.g. auto-away) triggered it
+        else if (cmd == L"221") { CString m = P(1); if (m.Left(1) == L"+") m = m.Mid(1); net->usermode = m; }   // RPL_UMODEIS: the server's own full, authoritative snapshot of our usermode (sent in reply to a bare "MODE $me" query, and by some servers unsolicited at registration) -- overwrites rather than accumulates, since this is the real complete state, not a delta
         else if (cmd == L"313") {   // RPL_WHOISOPERATOR: nick :is an IRC operator (exact wording varies by server, but this numeric always means that)
             Note(net, P(1) + L" " + P(2), cWhois);
             if (WhoisCapturing(P(1))) m_uwhoCapture.status = L"IRC Operator";
@@ -13867,6 +14742,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (!sess || sess->state != DccSession::ACTIVE || !sess->live) { Show(w, L"* Not connected.", cPart); return; }
         std::string utf8 = Utf8FromCString(s) + "\n";
         sess->live->Send(utf8.data(), (int)utf8.size());
+        w->m_lastMsgTick = ::GetTickCount64();
         Show(w, L"<" + (sess->net ? sess->net->nick : CString(L"Me")) + L"> " + s, cOwn);
     }
     void DccSessionForgetWindow(CChatWnd* w) {   // the window is closing: drop its session (this closes the socket too, via DccSession's unique_ptr destructors)
@@ -14033,7 +14909,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (!lineA.empty() && lineA.back() == '\r') lineA.pop_back();
             CString line = CString(CA2W(lineA.c_str(), CP_UTF8));
             if (sess->isFileServer) FsHandleCommand(sess, line);
-            else if (sess->win) Show(sess->win, L"<" + sess->nick + L"> " + line, cText);
+            else if (sess->win) { sess->win->m_lastMsgTick = ::GetTickCount64(); Show(sess->win, L"<" + sess->nick + L"> " + line, cText); }
         }
     }
     // Resolves a user-supplied relative path (from a fileserver "cd" or "get") against the session's current
@@ -14381,7 +15257,8 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void OnSockConnect(MircSock* s, int err) {
 #if DEBUGGING
-        { CString d; d.Format(L"* [sock:OnConnect] name=\"%s\" err=%d", (LPCWSTR)s->name, err); Show(ActiveOrStatus(), d, cInfo); }
+        { CString d; d.Format(L"* [sock:OnConnect] name=\"%s\" err=%d tls=%d ready=%d", (LPCWSTR)s->name, err,
+            (s->sock && s->sock->tls) ? 1 : 0, (s->sock && s->sock->tls && s->sock->tls->ready) ? 1 : 0); Show(ActiveOrStatus(), d, cInfo); }
 #endif
         m_sockErr = err ? L"Unable to connect to host" : CString();
         if (!err) { CString ip; UINT pt = 0; s->sock->GetPeerName(ip, pt); s->raddr = ip; s->rport = (int)pt; }
@@ -14448,7 +15325,7 @@ class CMainFrame : public CMDIFrameWnd {
         bool swE = false, swU = false, swN = false;
         while (!a.IsEmpty() && a[0] == L'-') {
             CString t = Word(a);
-            for (int i = 1; i < t.GetLength(); i++) { wchar_t c = t[i]; if (c == L'e') swE = true; else if (c == L'u') swU = true; else if (c == L'n') swN = true; }   // -e (SSL) / -u (UDP): accepted, not implemented. -n (sockwrite: raw bytes, no appended CRLF): honored below.
+            for (int i = 1; i < t.GetLength(); i++) { wchar_t c = t[i]; if (c == L'e') swE = true; else if (c == L'u') swU = true; else if (c == L'n') swN = true; }   // -e (SSL, via the same CTls/SChannel wrapper CIrcSock uses): honored in sockopen below. -u (UDP): accepted, not implemented. -n (sockwrite: raw bytes, no appended CRLF): honored below.
             a.TrimLeft();
         }
         if (cmd == L"sockopen") {
@@ -14457,6 +15334,18 @@ class CMainFrame : public CMDIFrameWnd {
             RemoveSock(name, L"sockopen-reuse");   // re-opening under an already-used name replaces it, same as real mIRC
             auto ms = std::make_unique<MircSock>(); ms->name = name; ms->addr = addr; ms->port = port;
             ms->sock = std::make_unique<CMircSocket>();
+            if (swE) {
+                // Strict validation always, for this socket -- unlike the main IRC connection (whose own -l/lax
+                // flag is the user's own, already-configured server), a script's /sockopen -e can point at any
+                // host it likes, so silently accepting an invalid cert here would be a real downgrade, not a
+                // convenience; real mIRC's own /sockopen -e has no separate "accept invalid certs" switch either.
+                ms->sock->tls = new CTls();
+                if (!ms->sock->tls->Init(addr, false)) {
+                    Show(w, L"* /sockopen: unable to initialize TLS", cPart);
+                    return;
+                }
+                Show(w, L"* /sockopen: opening a TLS connection to " + addr, cInfo);
+            }
             MircSock* msp = ms.get();
             ms->sock->onConnect = [this, msp](int e) { OnSockConnect(msp, e); };
             ms->sock->onReceive = [this, msp]() { OnSockReceive(msp); };
@@ -14513,7 +15402,7 @@ class CMainFrame : public CMDIFrameWnd {
                 Show(ActiveOrStatus(), d, cInfo);
             }
 #endif
-            s->sock->Send(out.data(), (int)out.size());
+            s->sock->Write(out);   // TLS-aware: encrypts first when this socket was opened with -e, otherwise identical to the old direct Send()
         }
         else if (cmd == L"sockread") {
             // Real mIRC's /sockread takes only the ONE var argument -- it has no socket-name parameter at all,
@@ -14531,17 +15420,25 @@ class CMainFrame : public CMDIFrameWnd {
             // over everything that's arrived in one shot, which matters for a peer that writes multiple lines
             // inside a single TCP packet.
             CString line;
+            size_t bytesRead = 0;
             size_t nl = s->sock->recvBuf.find('\n');
             if (nl != std::string::npos) {
                 std::string l = s->sock->recvBuf.substr(0, nl); s->sock->recvBuf.erase(0, nl + 1);
+                bytesRead = nl + 1;   // the line itself plus the LF this call consumed, matching what real mIRC's $sockbr counts
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 line = CString(CA2W(l.c_str(), CP_UTF8));
             } else if (!s->sock->recvBuf.empty()) {
+                bytesRead = s->sock->recvBuf.size();
                 line = CString(CA2W(s->sock->recvBuf.c_str(), CP_UTF8));
                 s->sock->recvBuf.clear();
             }
+            // $sockbr: 0 means "nothing left buffered" -- this is the one thing a script's own drain loop
+            // ("sockread %x | if ($sockbr != 0) { ... goto nextline }", the standard mIRC SOCKREAD idiom) checks
+            // to know when to stop. Without this identifier existing at all, that comparison was never false and
+            // scripts spun forever re-reading empty lines once the real data ran out.
+            m_sockBr = (int)bytesRead;
 #if DEBUGGING
-            { CString d; d.Format(L"* [sock:sockread] name=\"%s\" line=\"%s\"", (LPCWSTR)s->name, (LPCWSTR)line); Show(ActiveOrStatus(), d, cInfo); }
+            { CString d; d.Format(L"* [sock:sockread] name=\"%s\" line=\"%s\" br=%d", (LPCWSTR)s->name, (LPCWSTR)line, (int)bytesRead); Show(ActiveOrStatus(), d, cInfo); }
 #endif
             if (!varName.IsEmpty()) StoreVar(varName, line, VarSw(), false);
         }
@@ -15386,7 +16283,7 @@ class CMainFrame : public CMDIFrameWnd {
     void LoadOpts() {
         CWinApp* a = AfxGetApp();
         m_defOpts.host = a->GetProfileString(L"Conn", L"Host", m_defOpts.host); m_defOpts.port = a->GetProfileInt(L"Conn", L"Port", m_defOpts.port);
-        m_defOpts.nick = a->GetProfileString(L"Conn", L"Nick", m_defOpts.nick); m_defOpts.user = a->GetProfileString(L"Conn", L"User", m_defOpts.user);
+        m_defOpts.nick = a->GetProfileString(L"Conn", L"Nick", m_defOpts.nick); m_defOpts.anick = a->GetProfileString(L"Conn", L"AltNick", m_defOpts.anick); m_defOpts.user = a->GetProfileString(L"Conn", L"User", m_defOpts.user);
         m_defOpts.real = a->GetProfileString(L"Conn", L"Real", m_defOpts.real); m_defOpts.autojoin = a->GetProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         m_defOpts.tls = a->GetProfileInt(L"Conn", L"TLS", 0); m_defOpts.lax = a->GetProfileInt(L"Conn", L"Lax", 0);
         m_swPos = a->GetProfileInt(L"Conn", L"SwPos", a->GetProfileInt(L"Conn", L"SwTop", 1) != 0 ? 0 : 1);   // falls back to the old SwTop bool if SwPos was never saved, so existing ini files upgrade smoothly
@@ -15396,7 +16293,7 @@ class CMainFrame : public CMDIFrameWnd {
     void SaveOpts() {   // password is deliberately not saved; this is just the template that pre-fills the next Connect dialog
         CWinApp* a = AfxGetApp();
         a->WriteProfileString(L"Conn", L"Host", m_defOpts.host); a->WriteProfileInt(L"Conn", L"Port", m_defOpts.port);
-        a->WriteProfileString(L"Conn", L"Nick", m_defOpts.nick); a->WriteProfileString(L"Conn", L"User", m_defOpts.user);
+        a->WriteProfileString(L"Conn", L"Nick", m_defOpts.nick); a->WriteProfileString(L"Conn", L"AltNick", m_defOpts.anick); a->WriteProfileString(L"Conn", L"User", m_defOpts.user);
         a->WriteProfileString(L"Conn", L"Real", m_defOpts.real); a->WriteProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         a->WriteProfileInt(L"Conn", L"TLS", m_defOpts.tls); a->WriteProfileInt(L"Conn", L"Lax", m_defOpts.lax);
     }
@@ -15412,6 +16309,7 @@ class CMainFrame : public CMDIFrameWnd {
             GetPrivateProfileStringW(sec, L"Host", L"", buf, 256, path); e.o.host = buf;
             e.o.port = GetPrivateProfileIntW(sec, L"Port", 6667, path);
             GetPrivateProfileStringW(sec, L"Nick", L"YourNickname", buf, 256, path); e.o.nick = buf;
+            GetPrivateProfileStringW(sec, L"AltNick", L"", buf, 256, path); e.o.anick = buf;
             GetPrivateProfileStringW(sec, L"User", L"irc", buf, 256, path); e.o.user = buf;
             GetPrivateProfileStringW(sec, L"Real", L"IRC user", buf, 256, path); e.o.real = buf;
             GetPrivateProfileStringW(sec, L"Join", L"", buf, 256, path); e.o.autojoin = buf;
@@ -15428,7 +16326,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString sec; sec.Format(L"Server%d", (int)i); auto& e = m_bookmarks[i];
             WritePrivateProfileStringW(sec, L"Name", e.name, path); WritePrivateProfileStringW(sec, L"Host", e.o.host, path);
             CString ps; ps.Format(L"%d", e.o.port); WritePrivateProfileStringW(sec, L"Port", ps, path);
-            WritePrivateProfileStringW(sec, L"Nick", e.o.nick, path); WritePrivateProfileStringW(sec, L"User", e.o.user, path);
+            WritePrivateProfileStringW(sec, L"Nick", e.o.nick, path); WritePrivateProfileStringW(sec, L"AltNick", e.o.anick, path); WritePrivateProfileStringW(sec, L"User", e.o.user, path);
             WritePrivateProfileStringW(sec, L"Real", e.o.real, path); WritePrivateProfileStringW(sec, L"Join", e.o.autojoin, path);
             WritePrivateProfileStringW(sec, L"TLS", e.o.tls ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Lax", e.o.lax ? L"1" : L"0", path);
         }
