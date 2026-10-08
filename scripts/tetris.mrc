@@ -13,10 +13,12 @@ alias Tetris {
 
 ; ---- Debug toggle -------------------------------------------------------------------------------------------
 ; Set %Tetris:Debug to 1 (e.g. "//set -e %Tetris:Debug 1" from the status window) to turn on diagnostic output;
-; leave at 0 (the default) for normal play. Call Tetris:Dbg exactly like /echo -s -- it no-ops when debug is off,
-; so diagnostic lines can be added/left in place anywhere in this script without ever spamming a normal game.
+; an unset %Tetris:Debug (the default -- nothing above ever sets it) is already falsy in "if (%Tetris:Debug)",
+; same as 0, so there's nothing to initialize here. Call Tetris:Dbg exactly like /echo -s -- it no-ops when
+; debug is off, so diagnostic lines can be added/left in place anywhere in this script without ever spamming a
+; normal game. Only an "alias" definition belongs at the top level of a script file like this one -- a bare
+; command (e.g. a stray "set ...") sitting outside any alias/on/menu block isn't valid script structure here.
 ;   Tetris:Dbg DIAG4 x=%x sL=%sL sP=%sP nL=%nL
-set -e %Tetris:Debug 0
 alias -l Tetris:Dbg { if (%Tetris:Debug) echo -s $1- }
 ; --------------------------------------------------------------------------------------------------------------
 

@@ -1685,6 +1685,59 @@ public:
     void OnSend(int) override { if (onSend) onSend(); }
     void OnClose(int) override { if (onClose) onClose(); }
 };
+// ---------------- /sockopen /sockread /sockwrite /sockclose /socklisten /sockaccept: mIRC's scriptable raw TCP
+// socket API ($sock(), $sockname, $sockerr, "on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN"). Plain TCP only -- no
+// UDP (-u) and no SSL (-e); both are real mIRC switches but neither is a small addition on top of this one, so
+// they're accepted-but-ignored the same way CmdWindow already treats its own unimplemented switches. ----
+class CMircSocket : public CAsyncSocket {
+public:
+    std::function<void(int)> onConnect;   // outbound connect finished (0 = success); unused for a listening socket
+    std::function<void()> onReceive;      // data arrived -- read it out of recvBuf via /sockread, same as mIRC itself never hands the bytes directly to the event
+    std::function<void()> onAccept;       // listening socket: a peer is ready to be accepted via /sockaccept
+    std::function<void()> onClose;
+    std::string recvBuf;                  // raw bytes buffered since the last /sockread
+    // Same IPv6-aware resolve-then-connect as CIrcSock::ConnectSmart just above, minus the TLS handling that
+    // function also carries -- plain CAsyncSocket::Connect() only resolves IPv4 (gethostbyname) and blocks the
+    // whole app while it does, neither of which real mIRC's own /sockopen does to a script.
+    bool ConnectSmart(const CString& host, UINT port) {
+        ADDRINFOW hints = {}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP;
+        CString portStr; portStr.Format(L"%u", port);
+        PADDRINFOW result = nullptr;
+        if (::GetAddrInfoW(host, portStr, &hints, &result) != 0 || !result) return false;
+        if (m_hSocket != INVALID_SOCKET) Close();
+        bool ok = false;
+        SOCKET s = ::socket(result->ai_family, SOCK_STREAM, IPPROTO_TCP);
+        if (s != INVALID_SOCKET) {
+            if (Attach(s, FD_READ | FD_WRITE | FD_CONNECT | FD_CLOSE)) {
+                int rc = ::connect(m_hSocket, result->ai_addr, (int)result->ai_addrlen);
+                ok = (rc == 0) || (::WSAGetLastError() == WSAEWOULDBLOCK);
+            } else ::closesocket(s);
+        }
+        ::FreeAddrInfoW(result);
+        return ok;
+    }
+    void OnConnect(int e) override { if (onConnect) onConnect(e); }
+    void OnReceive(int) override {
+        char b[16384]; int n = Receive(b, sizeof b);
+        if (n > 0) { recvBuf.append(b, n); if (onReceive) onReceive(); }
+        else if (n == 0 || n == SOCKET_ERROR) { if (onClose) onClose(); }
+    }
+    void OnAccept(int) override { if (onAccept) onAccept(); }
+    void OnClose(int) override { if (onClose) onClose(); }
+};
+// One open/listening /sockopen or /socklisten socket, keyed by the script's own name for it (case-insensitive,
+// same convention as every other named lookup in this client -- see Key()/VKey()).
+struct MircSock {
+    CString name;
+    std::unique_ptr<CMircSocket> sock;
+    bool listening = false;                  // true: created by /socklisten, waiting for OnAccept, never itself readable/writable
+    bool pendingAccept = false;               // listening socket: OnAccept fired and hasn't been consumed by /sockaccept yet
+    CString addr; int port = 0;               // /sockopen's target, or /socklisten's bound port
+    CString raddr; int rport = 0;             // the remote peer's address/port, once connected or accepted
+    CString mark;                             // $sock(name).mark / /sockmark -- an arbitrary script-set tag, never touched by this client itself
+    bool pendingClose = false;                // deferred-removal guard -- see CMainFrame::OnDeferredCloseSock
+    bool remoteClosed = false;                // the connection itself has closed, but see OnSockClose's own comment -- the MircSock entry (and its still-unread recvBuf) is kept alive until OnSockReceive's drain loop actually empties it
+};
 // DCC's wire format for an IP address is a decimal string of the 4 octets packed big-endian into a 32-bit integer
 // (e.g. 192.168.1.1 -> 3232235777), not dotted-decimal -- this is what real mIRC and most other clients still send
 // for maximum compatibility, even though some newer clients send dotted-decimal instead. Parsing accepts either.
@@ -2000,7 +2053,20 @@ public:
         m_out.SetSel(-1, -1);
         m_out.SendMessage(WM_VSCROLL, SB_BOTTOM, 0);
     }
-    void Clear() { m_out.SetWindowText(L""); }
+    void Clear() {   // real mIRC's /clear on a custom @window with a picture canvas wipes the picture back to blank
+        // (same as a freshly /window-opened one -- see ResizeCanvasImpl's own black fill), not just the text log.
+        // Without this, a script that does the standard "clear @win | draw this frame's picture | wait" animation
+        // loop (drawclock.mrc's time.r, called once a second forever) never actually erases the previous frame --
+        // every draw* command only ever adds pixels, never removes them -- so each new frame's lines/shapes just
+        // pile up on top of all the previous ones forever, e.g. a clock's second hand sweeping round leaves every
+        // prior second's hand still drawn, turning into a solid radiating sunburst within a couple of minutes.
+        m_out.SetWindowText(L"");
+        if (m_cwDC) {
+            RECT full = { 0, 0, m_cwBmpW, m_cwBmpH };
+            ::FillRect(m_cwDC, &full, (HBRUSH)::GetStockObject(BLACK_BRUSH));
+            RepaintCanvas();
+        }
+    }
     void SetTopic(const CString& t) {
         if (!m_chan) return;
         m_topic.SetWindowText(Strip(t));
@@ -3332,13 +3398,39 @@ static CString ParseIfBodyAndElse(const std::vector<CString>& t, size_t& pos, CS
     if (afterPipe.Left(1) == L"|") { afterPipe = afterPipe.Mid(1); afterPipe.TrimLeft(); }
     if (!afterPipe.IsEmpty()) {   // inline: "{ body } else { ... }" (or "| else") all on the same line
         if (IsKw(afterPipe, L"elseif")) { auto r = ParseCtrl(t, pos, CString(L"elseif"), afterPipe.Mid(6), 1); elseOut.push_back(r.first); return r.second; }
-        if (IsKw(afterPipe, L"else")) { CString ea = afterPipe.Mid(4); ea.Trim(); return ParseIfBodyAndElse(t, pos, ea, elseOut, elseOut, false); }   // elseOut passed as both outputs is safe here: allowElse=false means the (unused) second one is never written, only the body (the else's own) ever is
+        if (IsKw(afterPipe, L"else")) {
+            CString ea = afterPipe.Mid(4); ea.Trim();
+            // "else if (...)" -- real mIRC scripts write this just as often as the one-word "elseif", and it has
+            // to be routed through ParseCtrl exactly like that case, NOT treated as an ordinary else body: ea here
+            // is only the bare "if (condition)" HEAD, with no body of its own attached (its real "{ ... }" is
+            // still a separate token/text yet to come, same as any other if). Recursing into
+            // ParseIfBodyAndElse(..., allowElse=false) as this used to -- same as a genuine "else { ... }" -- hands
+            // that bare head to ParseBody's own generic fallback, which has no idea "if" is a keyword needing its
+            // OWN condition+body parse: it just wraps the bare text "if (condition)" into a single inert command
+            // node with an empty body, while the REAL "{ ... }" that was supposed to belong to it gets left
+            // completely unconsumed for whoever parses next to pick up as an unrelated, unconditionally-running
+            // bare block. That's exactly what was silently turning testurl.mrc's "else if (Content-Type: * iswm
+            // %sockread) { echo -a %sockread | sockclose * }" into dead, never-taken code PLUS a bare "{ sockclose
+            // * }" sibling that ran unconditionally after every single buffered line -- closing the socket (and
+            // discarding whatever response was still unread) the instant the very first line came in, regardless
+            // of its content.
+            if (IsKw(ea, L"if")) { auto r = ParseCtrl(t, pos, CString(L"elseif"), ea.Mid(2), 1); elseOut.push_back(r.first); return r.second; }
+            return ParseIfBodyAndElse(t, pos, ea, elseOut, elseOut, false);   // elseOut passed as both outputs is safe here: allowElse=false means the (unused) second one is never written, only the body (the else's own) ever is
+        }
         return trailing;   // trailing text that isn't elseif/else -- not consumed, left for the caller to turn into sibling statements
     }
     if (pos < t.size()) {   // multi-line: the if-body ended (inline or not), and the next token/line may continue with elseif/else
         CString nx = t[pos];
         if (IsKw(nx, L"elseif")) { pos++; auto r = ParseCtrl(t, pos, CString(L"elseif"), nx.Mid(6), 1); elseOut.push_back(r.first); return r.second; }
-        if (IsKw(nx, L"else")) { pos++; CString ea = nx.Mid(4); ea.Trim(); elseOut = ParseBody(t, pos, ea); }
+        if (IsKw(nx, L"else")) {
+            pos++; CString ea = nx.Mid(4); ea.Trim();
+            // Same "else if (...)" case as the inline branch above, just reached via the multi-line path (this
+            // token is JUST "else if (condition)" -- ScriptTokens already split the trailing "{" off into its own
+            // separate token, still sitting ahead in `t` at `pos`). See that branch's own comment for the full
+            // story of what this silently broke.
+            if (IsKw(ea, L"if")) { auto r = ParseCtrl(t, pos, CString(L"elseif"), ea.Mid(2), 1); elseOut.push_back(r.first); return r.second; }
+            elseOut = ParseBody(t, pos, ea);
+        }
     }
     return CString();
 }
@@ -4200,7 +4292,15 @@ static SIZE MeasureTextSizePixels(const CString& text, const wchar_t* fontName, 
     SIZE sz = {};
     HDC dc = ::GetDC(nullptr);
     if (!dc) return sz;
-    int logHeight = -MulDiv(pointSize, GetDeviceCaps(dc, LOGPIXELSY), 72);
+    // Fixed 96 DPI, not GetDeviceCaps(dc, LOGPIXELSY) -- a /drawtext point size addresses the picture canvas's own
+    // literal pixel grid (the same x/y space as every other draw* coordinate, and what $width()/$height() report
+    // back to a script positioning text by it), not the host OS's current display-scaling setting. Scaling the
+    // font with the live screen DPI meant the exact same script drew noticeably bigger text -- enough to push
+    // "AM"/"PM" a few pixels past drawclock.mrc's own 800px-wide capture region, cropping it -- on any machine
+    // running above 100% display scaling (125%/150% is the common default on most modern laptops) than it would
+    // on a 96 DPI one, even though the script never changed. Must match the font creation a few lines below in
+    // CmdDraw's "drawtext" handler, which this measurement has to agree with pixel-for-pixel.
+    int logHeight = -MulDiv(pointSize, 96, 72);
     HFONT font = ::CreateFontW(logHeight, 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fontName);
     if (font) {
         HFONT old = (HFONT)::SelectObject(dc, font);
@@ -4337,7 +4437,7 @@ public:
 // otherwise ignored: this client has no numeric access-level system (Auto-Op/Auto-Voice/Protect/Ignore are their own
 // separate lists, not a unified /level), so every event matches regardless of what level was written.
 struct RemoteEvent {
-    CString eventName;              // JOIN, PART, TEXT, ACTION, NOTICE, KICK, QUIT, NICK, TOPIC, CONNECT, WALLOPS (always uppercase)
+    CString eventName;              // JOIN, PART, TEXT, ACTION, NOTICE, KICK, QUIT, NICK, TOPIC, CONNECT, WALLOPS, SOCKOPEN, SOCKREAD, SOCKCLOSE, SOCKLISTEN, ... (always uppercase)
     int level = 0;                  // the <level> number as written, purely for $clevel to report -- NOT an enforced access gate the way real mIRC's is; this client has no per-user level check wired into the general event system (see the comment above), so an event fires regardless of what level it declares
     bool haltDefaultPrefix = false; // a ^ anywhere in the level field: on ^1:JOIN:... -- lets /halt in this event's
                                      // body suppress the built-in join/part/text/etc. line, same as real mIRC
@@ -4350,7 +4450,7 @@ struct RemoteEvent {
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
     static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal
-    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN" };   // CLOSE/KEYDOWN: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"SOCKOPEN", L"SOCKREAD", L"SOCKCLOSE", L"SOCKLISTEN" };   // CLOSE/KEYDOWN: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal, but matched against the /sockopen-given socket name instead of a window name.
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
     CString curGroup;
@@ -4370,7 +4470,7 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
-        if (inList(ev.eventName, kNeedsWhere, 16)) {
+        if (inList(ev.eventName, kNeedsWhere, 20)) {
             // The where-spec is a single ":"-delimited field (a window name/wildcard, or a comma list of them for
             // CLOSE) immediately before the command body, so the naive first-colon search is correct UNLESS that
             // field is itself followed by another field before the body -- which is exactly KEYDOWN's real mIRC
@@ -6285,7 +6385,7 @@ class CMainFrame : public CMDIFrameWnd {
         return w;
     }
     int m_cwSeq = 0;
-    CChatWnd* OpenCustomWindow(const CString& name, bool hidden = false) {   // /window: a separate factory from Open() so status/channel/query windows are never at risk from this
+    CChatWnd* OpenCustomWindow(const CString& name, bool hidden = false, bool fixedSize = false) {   // /window: a separate factory from Open() so status/channel/query windows are never at risk from this
         if (auto* e = Find(nullptr, name)) return e;
         BOOL wasMax = FALSE; MDIGetActive(&wasMax);
         auto* w = new CChatWnd(name, false);
@@ -6315,8 +6415,17 @@ class CMainFrame : public CMDIFrameWnd {
         w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
         w->tsFormat = [this]() { return m_tsEventFmt; };
         w->m_seq = ++m_seqn;
-        w->Create(nullptr, name, WS_CHILD | (hidden ? 0 : WS_VISIBLE) | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
-        if (wasMax && !hidden) w->ShowWindow(SW_SHOWMAXIMIZED);
+        // mIRC's /window -z means "no sizing border" -- a fixed-size window with no thick resizable frame and no
+        // maximize box (drawclock.mrc asks for exactly this). Every custom window used to get the same
+        // WS_OVERLAPPEDWINDOW style regardless of -z, which left it both resizable and maximizable -- dragging a
+        // corner, or just double-clicking the title bar, stretched the window's client area past the picture
+        // canvas's actual bitmap size, and CCanvasWnd::OnPaint correctly (but confusingly) black-fills whatever
+        // of the client area falls outside the bitmap, which is exactly the solid black block that appeared down
+        // the right side after the window got bigger than its drawn content.
+        DWORD style = WS_CHILD | (hidden ? 0 : WS_VISIBLE) | WS_CLIPCHILDREN | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        style |= fixedSize ? 0 : (WS_THICKFRAME | WS_MAXIMIZEBOX);
+        w->Create(nullptr, name, style, rectDefault, this);
+        if (wasMax && !hidden && !fixedSize) w->ShowWindow(SW_SHOWMAXIMIZED);
         w->ApplyFont(m_chatFont);
         { const ColorScheme& s = CurScheme(); w->ApplyColors(s.chatBg, s.editBg, s.nickBg); }
         m_w[Key(nullptr, name)] = w;
@@ -6590,6 +6699,16 @@ class CMainFrame : public CMDIFrameWnd {
             return true;
         }
         if (name == L"null") { val.Empty(); return true; }
+        // $crlf/$cr/$lf were entirely missing -- the standard mIRC way to splice a literal CR/LF into a string
+        // being built up with $+ (e.g. a raw socket write: "Host: " $+ host $+ $crlf $+ $crlf to terminate an
+        // HTTP header block). An unrecognized $identifier elsewhere in this engine just evaluates to empty text,
+        // so every script relying on $crlf for this was silently sending a request with no CRLF at all where it
+        // asked for one -- in checkurl.mrc's case, the missing blank line that's supposed to end the HTTP
+        // headers, which left strict servers (google.com) waiting indefinitely for a complete, valid request
+        // that never arrived, while a more lenient one (httpforever.com) answered anyway.
+        if (name == L"crlf") { val = L"\r\n"; return true; }
+        if (name == L"cr") { val = L"\r"; return true; }
+        if (name == L"lf") { val = L"\n"; return true; }
         if (name == L"server") { val = (net && net->conn) ? net->o.host : CString(); return true; }   // empty ($null) when not connected
         if (name == L"menu" || name == L"menutype" || name == L"menucontext") { val = m_menuType; return true; }   // which popup is being built: status channel query nicklist menubar
         if (name == L"prop") { val = m_prop; return true; }         // the .property used to call a custom identifier: $add(1,2).negative
@@ -6602,6 +6721,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
         if (name == L"signal") { val = m_evSignal; return true; }
+        if (name == L"sockname") { val = m_evSockName; return true; }   // the socket name a currently-running on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN event fired for
+        if (name == L"sockerr") { val = m_sockErr; return true; }       // non-empty only right after a failed /sockopen connect or /sockread; see m_sockErr's own comment
         if (name == L"ulevel") { val.Format(L"%d", m_defaultLevel); return true; }   // the current default level for unlisted users, as set by /dlevel
         if (name == L"clevel") { val = m_evLevel; return true; }
         if (name == L"rawmsg") { val = m_evRawMsg; return true; }   // the exact, unparsed server line, only set within a matching on RAW event
@@ -6727,8 +6848,21 @@ class CMainFrame : public CMDIFrameWnd {
     }
     VarEntry* FindVar(const CString& name, bool loc = true, bool glob = true) {
         CString k = VKey(name);
-        if (loc && !m_scopes.empty()) { auto it = m_scopes.back().locals.find(k); if (it != m_scopes.back().locals.end()) return &it->second; }
-        if (glob) { auto it = m_vars.find(k); if (it != m_vars.end()) return &it->second; }
+        if (loc && !m_scopes.empty()) { auto it = m_scopes.back().locals.find(k); if (it != m_scopes.back().locals.end()) {
+#if DEBUGGING
+            if (k == L"%sockread") { CString d; d.Format(L"* [var:Find] k=\"%s\" FOUND-LOCAL scopes=%d value=\"%s\"", (LPCWSTR)k, (int)m_scopes.size(), (LPCWSTR)it->second.value); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+            return &it->second;
+        } }
+        if (glob) { auto it = m_vars.find(k); if (it != m_vars.end()) {
+#if DEBUGGING
+            if (k == L"%sockread") { CString d; d.Format(L"* [var:Find] k=\"%s\" FOUND-GLOBAL scopes=%d value=\"%s\"", (LPCWSTR)k, (int)m_scopes.size(), (LPCWSTR)it->second.value); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+            return &it->second;
+        } }
+#if DEBUGGING
+        if (k == L"%sockread") { CString d; d.Format(L"* [var:Find] k=\"%s\" NOT-FOUND scopes=%d localsInTop=%d", (LPCWSTR)k, (int)m_scopes.size(), m_scopes.empty() ? -1 : (int)m_scopes.back().locals.size()); Show(ActiveOrStatus(), d, cInfo); }
+#endif
         return nullptr;
     }
     CString GetVar(const CString& name) { VarEntry* v = FindVar(name); return v ? v->value : CString(); }   // a variable that isn't set is $null (empty)
@@ -6769,6 +6903,9 @@ class CMainFrame : public CMDIFrameWnd {
         else if (sw.u == 0 && !isLocal && !m_scopes.empty()) m_scopes.back().unsetAtEnd.push_back(k);   // -u0: when the script finishes
         if (sw.z) { e.step = -1; e.zeroUnset = true; e.nextStep = now + 1000; }
         if (!isLocal) m_varsDirty = true;
+#if DEBUGGING
+        if (k == L"%sockread") { CString d; d.Format(L"* [var:Store] k=\"%s\" isLocal=%d forceLocal=%d scopes=%d value=\"%s\"", (LPCWSTR)k, isLocal ? 1 : 0, forceLocal ? 1 : 0, (int)m_scopes.size(), (LPCWSTR)value); Show(ActiveOrStatus(), d, cInfo); }
+#endif
         return &e;
     }
     int UnsetMatching(const CString& pat, bool g, bool l) {   // an exact %name or a wildcard pattern; returns how many were removed
@@ -6923,6 +7060,16 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
         if (name == L"abs" || name == L"sqrt" || name == L"ceil" || name == L"floor" || name == L"log" || name == L"log10" || name == L"sin" || name == L"cos" || name == L"tan" || name == L"asin" || name == L"acos" || name == L"atan" || name == L"sinh" || name == L"cosh") {
             double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false;
+            // $sin/$cos/$tan take their angle in radians by default, same as real mIRC -- but real mIRC also
+            // lets a script append ".deg" right after the call (e.g. "$cos(90).deg") to say the argument is in
+            // degrees instead, which is how virtually every real script actually calls these (nobody hand-converts
+            // to radians inline). That property was never read here at all, so e.g. drawclock.mrc's hand-angle
+            // math -- "$cos($calc(90+...)).deg" -- was computing the cosine of (90+...) RADIANS, not degrees: a
+            // value that jumps by a huge, wrapped-around amount for every 6-degree-equivalent step the script
+            // intended, rather than a clean 6 degrees. That's what was making the second hand visibly sweep
+            // backwards (and far faster than once a minute) instead of advancing normally.
+            bool isDeg = prop.CompareNoCase(L"deg") == 0;
+            if (isDeg && (name == L"sin" || name == L"cos" || name == L"tan")) x = x * (3.14159265358979323846 / 180.0);
             double r;
             if (name == L"abs") r = fabs(x);
             else if (name == L"sqrt") { if (x < 0) return false; r = sqrt(x); }
@@ -6938,6 +7085,10 @@ class CMainFrame : public CMDIFrameWnd {
             else if (name == L"atan") r = atan(x);
             else if (name == L"sinh") r = sinh(x);
             else r = cosh(x);
+            // The inverse trig functions (asin/acos/atan) return radians by default too -- ".deg" on one of THOSE
+            // means convert the RESULT to degrees, the opposite direction from sin/cos/tan's input conversion
+            // above. Not used by this script, but worth getting right now that .deg is actually recognized.
+            if (isDeg && (name == L"asin" || name == L"acos" || name == L"atan")) r = r * (180.0 / 3.14159265358979323846);
             val = FmtNum(r); return true;
         }
         if (name == L"atan2" || name == L"hypot") {   // two-argument math functions
@@ -8684,6 +8835,28 @@ class CMainFrame : public CMDIFrameWnd {
             else val = cw->m_name;   // default: the name itself
             return true;
         }
+        if (name == L"sock") {   // $sock(name) or $sock(N): a reduced property set, same spirit as $window() above -- no .sq/.rq send/receive-queue sizes or .data (mIRC's own $sock() has no obvious use for those here, since /sockwrite and /sockread aren't queued/chunked the way real mIRC's socket I/O is)
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            // A pendingClose entry is a socket whose OS handle is already gone, just waiting out the rest of this
+            // script tick for its deferred delete (see RemoveSock) -- it's not a real open socket as far as a
+            // script can tell, so $sock(0)'s count and $sock(N)'s enumeration both skip it the same way FindSock does.
+            std::vector<MircSock*> live; for (auto& s : m_socks) if (!s->pendingClose) live.push_back(s.get());
+            MircSock* s = nullptr; double nD;
+            if (ParseNum(a, nD)) {
+                int idx = (int)nD;
+                if (idx == 0) { val.Format(L"%d", (int)live.size()); return true; }   // $sock(0): how many sockets are open, same "0 = count" convention every other enumerable identifier here uses
+                if (idx >= 1 && idx <= (int)live.size()) s = live[idx - 1];
+            } else s = FindSock(a);
+            if (!s) { val.Empty(); return true; }
+            if (prop == L"ip") val = s->raddr;                              // remote peer's address, once connected/accepted
+            else if (prop == L"port") val.Format(L"%d", s->port);           // /sockopen's target port, or /socklisten's bound port
+            else if (prop == L"rport") val.Format(L"%d", s->rport);
+            else if (prop == L"addr") val = s->addr;
+            else if (prop == L"mark") val = s->mark;
+            else if (prop == L"type") val = s->listening ? L"listen" : L"tcp";
+            else val = s->name;   // default: the name itself, i.e. $sock(name) is truthy/non-empty exactly when that socket exists
+            return true;
+        }
         if (name == L"fline") {   // $fline(win,expr,N,T,S)[.text] -- the Nth line matching expr (wildcard by default); T: 1=search the side-listbox instead of the main lines, 2=expr is a regex, 3=both; S=an optional starting line number. N=0 returns the match count. Same scope as $line/$sline: only works on a custom @window, since that's the only window type this client keeps as a plain line array rather than RTF content.
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
@@ -9024,6 +9197,19 @@ class CMainFrame : public CMDIFrameWnd {
             return head + (name.IsEmpty() ? CString() : L" " + name) + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params));
         }
         if (lc == L"unset") return cmd + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params, false));
+        // /sockread's one and only argument is the %var it's about to WRITE the next buffered line into -- same
+        // class of bug as /set, /inc, /dec and /unset above, which is exactly why those already get a special
+        // case here instead of falling through to the generic EvalIds(w, line, params) at the very bottom of this
+        // function: that generic path evaluates EVERY %variable it finds, including this one, which means
+        // "sockread %sockread" was being rewritten into "sockread " (the name replaced by its own CURRENT --
+        // still empty, the very first time -- value) before CmdSock's "sockread" branch ever ran. CmdSock then
+        // saw an empty varName and silently skipped the StoreVar call entirely, so %sockread was never actually
+        // being written at all -- every "if (... iswm %sockread)" check right after it was comparing against
+        // whatever %sockread held from BEFORE this call (empty, every single time, since it's freshly /var-
+        // declared at the top of the handler on every firing), never the line /sockread had just read. /sockread
+        // simply never got added to this list when the socket feature itself was added, unlike every other
+        // %var-writing command here.
+        if (lc == L"sockread") return cmd + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params, false));
         if (lc == L"var") {
             // /var's own declarations are evaluated AND STORED here directly, one at a time, in order -- not
             // pre-evaluated into text for a later, separate /var dispatch to actually store. That two-phase
@@ -9351,9 +9537,22 @@ class CMainFrame : public CMDIFrameWnd {
         for (int k = 8; k > 0; k--) m_vhist[k] = m_vhist[k - 1]; m_vhist[0] = lv;   // $v1.. : real mIRC caches each atomic comparison's already-evaluated left side here, so a chain of separate if-statements can keep testing the SAME expensive/random left-hand value against different right-hand values without re-evaluating (and, for something like $rand, re-rolling) it each time -- e.g. Tetris's "if ($r(1,7)==1) {..} / if ($v1==2) {..} / if ($v1==3) {..}..." is all testing one single dice roll
         bool neg = false; if (op.Left(1) == L"!" && op != L"!=") { neg = true; op = op.Mid(1); }
         bool r = false;
-        if (op == L"==") r = lv.CompareNoCase(rv) == 0;
+        if (op == L"==" || op == L"!=") {
+            // Real mIRC's == / != compare NUMERICALLY whenever both sides actually look like numbers -- including
+            // an empty string, which mIRC treats as 0 in exactly this context (an unset variable, or an identifier
+            // like $sockerr that returns "" for "no error", reads as equal to 0). A plain case-insensitive string
+            // compare instead made "" != 0 evaluate true unconditionally, which is exactly why a freshly-added
+            // "if ($sockerr != 0)" check (the standard mIRC idiom every socket script uses to tell success from
+            // failure) reported an error on every connection, successful or not: "" and "0" are different strings
+            // even though they're the same number. Falls back to the old case-insensitive string compare only when
+            // at least one side genuinely isn't numeric (e.g. comparing against $true/$false, or two nicknames).
+            double a = 0, b = 0;
+            bool an = lv.IsEmpty() || ParseNum(lv, a); if (lv.IsEmpty()) a = 0;
+            bool bn = rv.IsEmpty() || ParseNum(rv, b); if (rv.IsEmpty()) b = 0;
+            bool eq = (an && bn) ? (a == b) : (lv.CompareNoCase(rv) == 0);
+            r = (op == L"==") ? eq : !eq;
+        }
         else if (op == L"===") r = lv.Compare(rv) == 0;
-        else if (op == L"!=") r = lv.CompareNoCase(rv) != 0;
         else if (op == L"<" || op == L">" || op == L"<=" || op == L">=") {
             double a = 0, b = 0;
             if (ParseNum(lv, a) && ParseNum(rv, b)) { if (op == L"<") r = a < b; else if (op == L">") r = a > b; else if (op == L"<=") r = a <= b; else r = a >= b; }
@@ -9364,7 +9563,12 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (op == L"isin") { CString a = lv, b = rv; a.MakeLower(); b.MakeLower(); r = b.Find(a) >= 0; }
         else if (op == L"isincs") r = rv.Find(lv) >= 0;
-        else if (op == L"iswm") r = GlobMatch(lv, rv);      // the wildcard pattern is on the left
+        else if (op == L"iswm") {
+            r = GlobMatch(lv, rv);      // the wildcard pattern is on the left
+#if DEBUGGING
+            { CString d; d.Format(L"* [cond:iswm] lv=\"%s\" rv=\"%s\" r=%d", (LPCWSTR)lv, (LPCWSTR)rv, r ? 1 : 0); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+        }
         else if (op == L"iswmcs") r = GlobMatch(lv, rv, true);
         else if (op == L"ischan") r = !lv.IsEmpty() && wcschr(L"#&+!", lv[0]) != nullptr;
         return neg ? !r : r;
@@ -9378,7 +9582,15 @@ class CMainFrame : public CMDIFrameWnd {
         text = ExpandBrackets(ctx.w, text, *ctx.params);
         text = EvalCmdLine(ctx.w, text, *ctx.params);
         if (m_halt) return C_HALT;
-        text.TrimRight();
+        // Space/tab only -- NOT a bare TrimRight(), which also eats \r and \n. Script-file lines themselves never
+        // carry a stray trailing \r/\n here (SplitLinesRobust already strips every line-ending convention cleanly
+        // when the file is read), so this was only ever doing useful work for trailing spaces/tabs -- but a bare
+        // TrimRight() also silently deletes a literal CR/LF a script deliberately builds via $+ $crlf at the very
+        // end of a line (the standard mIRC idiom for terminating a raw socket write, e.g. "sockwrite -n $sockname
+        // ... HTTP/1.1 $+ $crlf"). That line's $crlf was evaluating to "\r\n" just fine inside EvalCmdLine above --
+        // this trim was deleting it microseconds later, before /sockwrite ever got to see it, which is why adding
+        // $crlf to checkurl.mrc's GET line never actually changed a single byte on the wire.
+        text.TrimRight(L" \t");
         CString rest = text, first = Word(rest); first.MakeLower(); rest.Trim();
         if (first == L"return") { m_result = rest; return C_RETURN; }
         if (first == L"halt") { m_halt = true; return C_HALT; }
@@ -9716,6 +9928,8 @@ class CMainFrame : public CMDIFrameWnd {
         return true;
     }
     CString m_evSignal;   // what $signal returns -- the name passed to /signal that triggered the current on SIGNAL event
+    CString m_evSockName; // what $sockname returns -- the socket name a currently-running on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN event fired for
+    CString m_sockErr;    // what $sockerr returns -- non-empty inside on SOCKOPEN/SOCKREAD/SOCKCLOSE only when that socket's last operation failed, same as real mIRC; empty the rest of the time
     CString m_evLevel;    // what $clevel returns -- the <level> number from the specific "on <level>:EVENT:..." declaration that actually matched and is currently running; empty outside an event
     CString m_evRawMsg;   // what $rawmsg returns -- the exact, full, unparsed line as received from the server, only set within a matching on RAW event
     CString m_evOpnick, m_evVnick, m_evBnick;   // $opnick/$vnick/$bnick -- the nick (op/voice) or ban mask that a specific on OP/DEOP/VOICE/DEVOICE/BAN/UNBAN event fired for; $nick in these events is still who MADE the change
@@ -9914,6 +10128,30 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
+        return suppress;
+    }
+    // SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: matched by the socket's own script-given name against the where-spec,
+    // same comma-list/wildcard rule CLOSE/KEYDOWN use for a window name (see MatchesWhereSpec) -- a socket has no
+    // channel/nick concept at all, just the name the script opened it under. $sockname is this socket's name for
+    // the duration of the event; $sockerr is whatever CmdSock set right before calling this (non-empty only for a
+    // failed /sockopen connect or a failed /sockread), and is NOT saved/restored here the way the others are --
+    // real mIRC leaves $sockerr set until the next socket operation touches it, not scoped to one event's body.
+    bool FireSockEvent(CChatWnd* w, const CString& eventName, const CString& sockName, const CString& params) {
+        if (!m_remoteOn || !m_eventsOn) return false;
+        m_evHaltDef = false;
+        CString savedName = m_evName, savedLevel = m_evLevel, savedSock = m_evSockName;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
+                if (!MatchesWhereSpec(ev.whereSpec, sockName)) continue;
+                m_evSockName = sockName; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
+                RunScript(w, ev.lines, params);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evName = savedName; m_evLevel = savedLevel; m_evSockName = savedSock;
         return suppress;
     }
     // raw events: fires for literally any incoming line, checked once at the very top of dispatch before any
@@ -10571,7 +10809,20 @@ class CMainFrame : public CMDIFrameWnd {
             Send(net, topicText.IsEmpty() ? L"TOPIC " + chan : L"TOPIC " + chan + L" :" + topicText);
         }
         else if (cmd == L"quit") { Send(net, L"QUIT :" + (arg.IsEmpty() ? CString(VERSION) : arg)); net->conn = false; net->sock.Close(); SetState(net, L"Disconnected"); }
-        else if (cmd == L"clear") w->Clear();
+        else if (cmd == L"clear") {
+            // Real mIRC's /clear takes an optional target (#channel, =nick, @window, status, ...) and clears THAT
+            // window, defaulting to the active one only when no target is given -- this was ignoring `arg`
+            // entirely and always clearing `w`, the window the command happens to be RUNNING in. That's harmless
+            // when a script clears its own window, but drawclock.mrc's timer fires with `w` = whatever channel/
+            // status window the user right-clicked to start the clock from, and calls "clear @buffer" to wipe its
+            // off-screen drawing buffer before redrawing each frame -- @buffer itself was never actually the
+            // window being cleared, so every frame's clock hands piled up on the last one forever (the canvas-wipe
+            // fix in Clear() itself was correct, but was being applied to the wrong object the whole time).
+            CString t = arg; t.Trim();
+            CChatWnd* tw = w;
+            if (!t.IsEmpty()) { CChatWnd* f = Find(net, t); if (!f) f = Find(nullptr, t); if (f) tw = f; }
+            tw->Clear();
+        }
         else if (cmd == L"echo") {   // /echo [color] [-switches] [-c color name] [#channel|nick] <text>  (local only: never sent to the server)
             CString a = arg; a.Trim();
             int colorNum = -1;
@@ -10672,6 +10923,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"playctrl") CmdPlayCtrl(w);
         else if (cmd == L"dns") CmdDns(w, arg);
         else if (cmd == L"window") CmdWindow(w, arg);
+        else if (cmd == L"sockopen" || cmd == L"socklisten" || cmd == L"sockaccept" || cmd == L"sockwrite" || cmd == L"sockread" || cmd == L"sockmark" || cmd == L"sockclose") CmdSock(w, cmd, arg);
         else if (cmd == L"aline") CmdCwLine(w, arg, L'a');
         else if (cmd == L"cline") CmdCwLine(w, arg, L'c');
         else if (cmd == L"dline") CmdCwLine(w, arg, L'd');
@@ -13266,6 +13518,13 @@ class CMainFrame : public CMDIFrameWnd {
     }
     // ---------------- DCC Chat / Send ----------------
     std::vector<std::unique_ptr<DccSession>> m_dcc;
+    // ---------------- /sockopen /sockread /sockwrite /sockclose /socklisten /sockaccept ----------------
+    std::vector<std::unique_ptr<MircSock>> m_socks;
+    // Skips a pendingClose entry -- RemoveSock leaves the old MircSock sitting in m_socks (OS socket already torn
+    // down, just awaiting its deferred delete) for as long as the rest of the current script tick runs, so a
+    // same-tick "/sockclose x | /sockopen x ..." or a plain re-"/sockopen x ..." under a name already in use must
+    // still resolve to the FRESH entry, not the dead one still waiting to be cleaned up.
+    MircSock* FindSock(const CString& name) { for (auto& s : m_socks) if (!s->pendingClose && s->name.CompareNoCase(name) == 0) return s.get(); return nullptr; }
     bool m_dccShowFileWarning = true;   // the general "someone is trying to send you a file" safety dialog
     CString m_dccDownloadFolder;        // empty = defaults to the exe's folder, under a downloads subfolder
     // 0/0 = let Windows assign a random free port for each DCC listen, same as before this setting existed -- which
@@ -14093,6 +14352,212 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_playQueue.empty()) StopPlayTimer();
     }
 
+    // ---- /sockopen /sockread /sockwrite /sockclose /socklisten /sockaccept /sockmark: see CMircSocket/MircSock's
+    // own comments above for what's implemented (plain TCP) and what isn't (UDP, SSL). ----
+    // A script can /sockopen (or /sockclose) a socket under the same name from right inside that very socket's own
+    // "on SOCKREAD"/"on SOCKCLOSE" handler -- still on CAsyncSocket's own OnReceive/OnClose call stack at that
+    // point. Erasing the MircSock there (destroying its CMircSocket/CAsyncSocket mid-callback) is the same
+    // use-after-free shape CChatWnd::PostNcDestroy was fixed for (see its comment), so this never erases directly:
+    // CAsyncSocket::Close() is safe to call from inside the socket's own callback (it just tears down the OS
+    // handle and cancels any further notifications -- it doesn't touch `this`), so that part happens immediately,
+    // and only the actual C++ object destruction is deferred to a posted message, once the stack that might still
+    // be using it has unwound.
+    void RemoveSock(const CString& name, const wchar_t* reason = L"?") {   // reason: which call site -- see each call's own literal, this is purely a diagnostic breadcrumb
+        for (auto& s : m_socks) {
+            if (s->name.CompareNoCase(name) != 0 || s->pendingClose) continue;
+#if DEBUGGING
+            { CString d; d.Format(L"* [sock:RemoveSock] name=\"%s\" unreadBytes=%d reason=%s execLine=\"%s\"", (LPCWSTR)s->name, (int)(s->sock ? s->sock->recvBuf.size() : 0), reason, (LPCWSTR)m_lastExecLine); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+            s->pendingClose = true;
+            if (s->sock) s->sock->Close();
+            PostMessage(WM_APP + 55, (WPARAM)s.get(), 0);
+            return;
+        }
+    }
+    afx_msg LRESULT OnDeferredRemoveSock(WPARAM wp, LPARAM) {
+        MircSock* target = (MircSock*)wp;
+        for (size_t i = 0; i < m_socks.size(); i++) if (m_socks[i].get() == target) { m_socks.erase(m_socks.begin() + i); break; }
+        return 0;
+    }
+    void OnSockConnect(MircSock* s, int err) {
+#if DEBUGGING
+        { CString d; d.Format(L"* [sock:OnConnect] name=\"%s\" err=%d", (LPCWSTR)s->name, err); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+        m_sockErr = err ? L"Unable to connect to host" : CString();
+        if (!err) { CString ip; UINT pt = 0; s->sock->GetPeerName(ip, pt); s->raddr = ip; s->rport = (int)pt; }
+        FireSockEvent(ActiveOrStatus(), L"SOCKOPEN", s->name, CString());
+    }
+    void OnSockReceive(MircSock* s) {
+#if DEBUGGING
+        { CString d; d.Format(L"* [sock:OnReceive] name=\"%s\" bufBytes=%d", (LPCWSTR)s->name, (int)s->sock->recvBuf.size()); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+        m_sockErr.Empty();
+        // Winsock only signals FD_READ (which is what gets us into this function at all) when NEW bytes arrive
+        // from the network -- it has no idea a script's "on SOCKREAD" handler only pulled ONE line out of
+        // recvBuf via /sockread and left the rest sitting there unprocessed. A multi-line HTTP response that
+        // arrives in a single TCP read (an HTTP status line plus headers, say) was only ever handed to the
+        // script one line at a time if the script kept re-entering on its own, but these scripts call
+        // /sockread once per event, same as real mIRC's own documented usage -- and real mIRC re-fires
+        // "on SOCKREAD" itself, synchronously, for as long as unread data remains, rather than waiting for the
+        // network to deliver more. Without this loop, everything past the first buffered line (every HTTP
+        // header here, including the Content-Type line checkurl.mrc is actually watching for) was silently
+        // stranded in recvBuf forever -- the socket just sat there looking like it was still "Connecting...".
+        for (;;) {
+            if (!s->sock || s->sock->recvBuf.empty()) break;
+            size_t before = s->sock->recvBuf.size();
+#if DEBUGGING
+            { CString d; d.Format(L"* [sock:loop] name=\"%s\" beforeBytes=%d", (LPCWSTR)s->name, (int)before); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+            FireSockEvent(ActiveOrStatus(), L"SOCKREAD", s->name, CString());
+            if (FindSock(s->name) != s) {
+#if DEBUGGING
+                Show(ActiveOrStatus(), L"* [sock:loop] socket gone after event -- stopping", cInfo);
+#endif
+                break;   // this socket was /sockclose'd (or replaced under the same name) from inside that very event body
+            }
+            if (s->sock->recvBuf.empty() || s->sock->recvBuf.size() == before) break;   // fully drained, or the handler didn't consume anything this round -- don't spin forever
+        }
+        // The remote may have closed the connection WHILE this very loop was still working through what it had
+        // already buffered -- OnSockClose (below) deliberately leaves this entry in place when that happens,
+        // rather than tearing it down out from under this loop, so that whatever's left gets drained here exactly
+        // as if the connection were still open. Once that draining has actually finished (buffer empty), finish
+        // the close it deferred.
+        if (s->remoteClosed && FindSock(s->name) == s && (!s->sock || s->sock->recvBuf.empty())) RemoveSock(s->name, L"drain-loop-finished");
+    }
+    void OnSockAccept(MircSock* s) { s->pendingAccept = true; FireSockEvent(ActiveOrStatus(), L"SOCKLISTEN", s->name, CString()); }
+    void OnSockClose(MircSock* s) {
+#if DEBUGGING
+        { CString d; d.Format(L"* [sock:OnClose] name=\"%s\" unreadBytes=%d", (LPCWSTR)s->name, (int)(s->sock ? s->sock->recvBuf.size() : 0)); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+        s->remoteClosed = true;
+        FireSockEvent(ActiveOrStatus(), L"SOCKCLOSE", s->name, CString());
+        // Only actually tear the bookkeeping down here if nothing's left buffered for a script to /sockread --
+        // this used to call RemoveSock unconditionally, which is exactly right once the response has genuinely
+        // been fully drained, but a simple non-keepalive HTTP server sends its whole response and closes the
+        // connection right away, and this close notification can get processed WHILE OnSockReceive's own drain
+        // loop (above) is still partway through working through that very response -- that loop would find its
+        // own socket already gone (pendingClose, set by the unconditional RemoveSock this used to call no matter
+        // what) and give up after just the first already-buffered line, silently discarding everything past it
+        // (every HTTP header, including the Content-Type line a script might be watching for, and the entire
+        // body). If there's still unread data sitting here, leave the entry alone (now flagged remoteClosed) --
+        // OnSockReceive's loop finishes the deferred close itself once it actually empties the buffer.
+        if (!s->sock || s->sock->recvBuf.empty()) RemoveSock(s->name, L"OnSockClose-buffer-empty");
+    }
+    void CmdSock(CChatWnd* w, CString cmd, CString arg) {
+        CString a = arg; a.TrimLeft();
+        bool swE = false, swU = false, swN = false;
+        while (!a.IsEmpty() && a[0] == L'-') {
+            CString t = Word(a);
+            for (int i = 1; i < t.GetLength(); i++) { wchar_t c = t[i]; if (c == L'e') swE = true; else if (c == L'u') swU = true; else if (c == L'n') swN = true; }   // -e (SSL) / -u (UDP): accepted, not implemented. -n (sockwrite: raw bytes, no appended CRLF): honored below.
+            a.TrimLeft();
+        }
+        if (cmd == L"sockopen") {
+            CString name = RunWord(a), addr = RunWord(a); int port = _wtoi(RunWord(a));
+            if (name.IsEmpty() || addr.IsEmpty() || port <= 0) { Show(w, L"* /sockopen: invalid parameters", cPart); return; }
+            RemoveSock(name, L"sockopen-reuse");   // re-opening under an already-used name replaces it, same as real mIRC
+            auto ms = std::make_unique<MircSock>(); ms->name = name; ms->addr = addr; ms->port = port;
+            ms->sock = std::make_unique<CMircSocket>();
+            MircSock* msp = ms.get();
+            ms->sock->onConnect = [this, msp](int e) { OnSockConnect(msp, e); };
+            ms->sock->onReceive = [this, msp]() { OnSockReceive(msp); };
+            ms->sock->onClose = [this, msp]() { OnSockClose(msp); };
+            m_socks.push_back(std::move(ms));
+            if (!m_socks.back()->sock->ConnectSmart(addr, (UINT)port)) {
+                Show(w, L"* /sockopen: unable to resolve or connect to " + addr, cPart);
+                m_socks.pop_back();
+            }
+        }
+        else if (cmd == L"socklisten") {
+            CString name = RunWord(a); int port = _wtoi(RunWord(a));
+            if (name.IsEmpty() || port <= 0) { Show(w, L"* /socklisten: invalid parameters", cPart); return; }
+            RemoveSock(name, L"socklisten-reuse");
+            auto ms = std::make_unique<MircSock>(); ms->name = name; ms->port = port; ms->listening = true;
+            ms->sock = std::make_unique<CMircSocket>();
+            MircSock* msp = ms.get();
+            ms->sock->onAccept = [this, msp]() { OnSockAccept(msp); };
+            if (!ms->sock->Create((UINT)port) || !ms->sock->Listen()) { Show(w, L"* /socklisten: unable to listen on port " + CString(std::to_wstring(port).c_str()), cPart); return; }
+            m_socks.push_back(std::move(ms));
+        }
+        else if (cmd == L"sockaccept") {
+            CString newName = RunWord(a);
+            if (newName.IsEmpty()) { Show(w, L"* /sockaccept: no name given", cPart); return; }
+            // $sockname inside the just-fired "on SOCKLISTEN" event is the listening socket itself -- that's the
+            // one with a connection actually waiting to be pulled off it via CAsyncSocket::Accept.
+            MircSock* listener = FindSock(m_evSockName);
+            if (!listener || !listener->listening || !listener->pendingAccept) { Show(w, L"* /sockaccept: no pending connection", cPart); return; }
+            listener->pendingAccept = false;
+            auto peer = std::make_unique<CMircSocket>();
+            if (!listener->sock->Accept(*peer)) { Show(w, L"* /sockaccept: accept failed", cPart); return; }
+            RemoveSock(newName, L"sockaccept-reuse");
+            auto ms = std::make_unique<MircSock>(); ms->name = newName; ms->sock = std::move(peer);
+            CString peerIp; UINT peerPort = 0; ms->sock->GetPeerName(peerIp, peerPort); ms->raddr = peerIp; ms->rport = (int)peerPort;
+            MircSock* msp = ms.get();
+            ms->sock->onReceive = [this, msp]() { OnSockReceive(msp); };
+            ms->sock->onClose = [this, msp]() { OnSockClose(msp); };
+            m_socks.push_back(std::move(ms));
+        }
+        else if (cmd == L"sockwrite") {
+            CString name = RunWord(a);
+            MircSock* s = FindSock(name);
+            if (!s || !s->sock) { Show(w, L"* /sockwrite: no such socket: " + name, cPart); return; }
+            CString text = a;   // the rest of the line, verbatim -- same convention as /drawtext's own text argument
+            CStringA utf8 = CW2A(text, CP_UTF8);
+            std::string out(utf8.GetString(), utf8.GetLength());
+            if (!swN) out += "\r\n";
+#if DEBUGGING
+            {   // show exactly what's going on the wire, with CR/LF made visible, since the HTTP response alone
+                // can't tell us whether $crlf/$+ actually produced a terminator or a malformed request just
+                // landed on the same generic error page as a different malformed request would
+                CString esc; for (char ch : out) { if (ch == '\r') esc += L"\\r"; else if (ch == '\n') esc += L"\\n\n    "; else esc += (wchar_t)(unsigned char)ch; }
+                CString d; d.Format(L"* [sock:sockwrite] name=\"%s\" bytes=%d swN=%d\n    %s", (LPCWSTR)s->name, (int)out.size(), swN ? 1 : 0, (LPCWSTR)esc);
+                Show(ActiveOrStatus(), d, cInfo);
+            }
+#endif
+            s->sock->Send(out.data(), (int)out.size());
+        }
+        else if (cmd == L"sockread") {
+            // Real mIRC's /sockread takes only the ONE var argument -- it has no socket-name parameter at all,
+            // and always operates on whichever socket's "on SOCKREAD" event is currently running (i.e. $sockname),
+            // the same implicit-context convention $sockerr uses. Requiring an explicit name here, as this used
+            // to, meant a script's own correct "sockread %var" call (every real mIRC socket script's exact
+            // syntax, drawclock-style scripts included) had its %var -- empty, freshly $var-declared -- parsed AS
+            // the socket name instead, which is exactly the "/sockread: no such socket: " (nothing after the
+            // colon) error a plain, correctly-written socket script was hitting.
+            CString varName = RunWord(a);
+            MircSock* s = FindSock(m_evSockName);
+            if (!s || !s->sock) { Show(w, L"* /sockread: not inside a SOCKREAD event", cPart); return; }
+            // mIRC's /sockread pulls ONE line (up to the next CRLF/LF) per call out of whatever's been buffered
+            // since the last read, leaving the rest queued for the next "on SOCKREAD" firing -- it does not hand
+            // over everything that's arrived in one shot, which matters for a peer that writes multiple lines
+            // inside a single TCP packet.
+            CString line;
+            size_t nl = s->sock->recvBuf.find('\n');
+            if (nl != std::string::npos) {
+                std::string l = s->sock->recvBuf.substr(0, nl); s->sock->recvBuf.erase(0, nl + 1);
+                if (!l.empty() && l.back() == '\r') l.pop_back();
+                line = CString(CA2W(l.c_str(), CP_UTF8));
+            } else if (!s->sock->recvBuf.empty()) {
+                line = CString(CA2W(s->sock->recvBuf.c_str(), CP_UTF8));
+                s->sock->recvBuf.clear();
+            }
+#if DEBUGGING
+            { CString d; d.Format(L"* [sock:sockread] name=\"%s\" line=\"%s\"", (LPCWSTR)s->name, (LPCWSTR)line); Show(ActiveOrStatus(), d, cInfo); }
+#endif
+            if (!varName.IsEmpty()) StoreVar(varName, line, VarSw(), false);
+        }
+        else if (cmd == L"sockmark") {
+            CString name = RunWord(a);
+            MircSock* s = FindSock(name);
+            if (s) s->mark = a;
+        }
+        else if (cmd == L"sockclose") {
+            CString name = RunWord(a);
+            if (name.Find(L'*') >= 0 || name.Find(L'?') >= 0) {   // "/sockclose name*" wildcard form, same as /close -@
+                std::vector<CString> names; for (auto& s : m_socks) if (!s->pendingClose && GlobMatch(name, s->name)) names.push_back(s->name);
+                for (auto& n : names) RemoveSock(n, L"sockclose-wildcard");   // same deferred-removal path as the single-name case -- see its own comment
+            } else RemoveSock(name, L"sockclose-name");
+        }
+    }
     // ---- /window: create/manipulate a custom @window. A large chunk of mIRC's own switch list has no equivalent in
     // this client (desktop windows, treebar, side-listbox, progress bar, picture windows, tab stops, icons,
     // fullscreen) and is accepted-but-ignored so a script's switch string doesn't error out; see CmdWindow's inline
@@ -14101,7 +14566,7 @@ class CMainFrame : public CMDIFrameWnd {
         CString a = arg; a.Trim();
         if (a.IsEmpty()) { Show(w, L"* Usage: /window [switches] <@name> [x y [w h]] [/command] [popup.txt] [font [size]]", cPart); return; }
         bool aFlag = false, cFlag = false, hFlag = false, eFlag = false, lFlag = false, CFlag = false, sFlagSw = false;
-        bool nFlagSw = false, rFlagSw = false, xFlagSw = false;
+        bool nFlagSw = false, rFlagSw = false, xFlagSw = false, zFlag = false;
         while (!a.IsEmpty() && (a[0] == L'-' || a[0] == L'+')) {
             CString swTok = Word(a);
             if (swTok[0] == L'-') {
@@ -14112,9 +14577,9 @@ class CMainFrame : public CMDIFrameWnd {
                     else if (c == L'l') { lFlag = true; while (i + 1 < swTok.GetLength() && iswdigit(swTok[i + 1])) i++; }
                     else if (c == L'n') { nFlagSw = true; while (i + 1 < swTok.GetLength() && iswdigit(swTok[i + 1])) i++; }
                     else if (c == L'r') rFlagSw = true; else if (c == L'x') xFlagSw = true; else if (c == L'C') CFlag = true;
-                    else if (c == L's') sFlagSw = true;
+                    else if (c == L's') sFlagSw = true; else if (c == L'z') zFlag = true;
                     else if (c == L't') while (i + 1 < swTok.GetLength() && (iswdigit(swTok[i + 1]) || swTok[i + 1] == L',')) i++;   // -tN,..,N (tab stops): parsed past, not applied
-                    // everything else (b B d D f g[N] G H i j[N] k[N] m M o p q R u v w[N] z, and +switches) is
+                    // everything else (b B d D f g[N] G H i j[N] k[N] m M o p q R u v w[N], and +switches) is
                     // accepted for compatibility but has no effect: no desktop-window mode, treebar, side-listbox,
                     // progress bar, picture windows, custom border styles, or icons in this client.
                 }
@@ -14138,7 +14603,7 @@ class CMainFrame : public CMDIFrameWnd {
         CChatWnd* cw = Find(nullptr, name);
         if (cFlag) { if (cw) cw->DestroyWindow(); return; }
         bool creating = !cw;
-        if (!cw) cw = OpenCustomWindow(name, hFlag);
+        if (!cw) cw = OpenCustomWindow(name, hFlag, zFlag);
         if (eFlag) cw->m_hasEdit = true;
         if (lFlag) cw->m_cwListMode = true;
         if (sFlagSw) { cw->m_cwSort = true; CwSort(cw); }
@@ -14158,11 +14623,36 @@ class CMainFrame : public CMDIFrameWnd {
             // its 360x454 canvas rendering in the corner instead of the window actually being that size.
             if ((pw >= 0 || ph >= 0) && cw->IsZoomed()) cw->ShowWindow(SW_RESTORE);
             CRect cur; cw->GetWindowRect(cur); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&cur, 2);
-            int finalW = pw >= 0 ? pw : cur.Width(), finalH = ph >= 0 ? ph : cur.Height();
-            cw->MoveWindow(px >= 0 ? px : cur.left, py >= 0 ? py : cur.top, finalW, finalH);
-            // Sizes the /drawXXX picture canvas to match, independent of whether this window is actually shown --
-            // Tetris's sprite-sheet buffer windows are created hidden and only ever drawn into, never displayed.
-            if (finalW > 0 && finalH > 0) cw->SetCanvasSize(finalW, finalH);
+            CRect curClient; cw->GetClientRect(curClient);   // current chrome thickness (title bar + borders) -- constant for this window's style regardless of its current size, used below to convert the CLIENT size a script asks for into the OUTER size MoveWindow actually wants
+            int chromeW = cur.Width() - curClient.Width(), chromeH = cur.Height() - curClient.Height();
+            // mIRC's own /window w h means the window's CLIENT area (the part a script actually draws into) is
+            // w x h -- not its outer frame including the title bar and borders. Passing w/h straight to
+            // MoveWindow, which sizes the OUTER frame, used to leave the client area smaller than w x h by
+            // whatever the title bar/border chrome adds, while SetCanvasSize (below) sized the drawing canvas to
+            // the full w x h anyway -- so the canvas always ran off the bottom and right edges of the window's
+            // actual visible area, requiring a manual resize to see the rest.
+            int finalW = pw >= 0 ? pw + chromeW : cur.Width(), finalH = ph >= 0 ? ph + chromeH : cur.Height();
+            int finalX = px >= 0 ? px : cur.left, finalY = py >= 0 ? py : cur.top;
+            cw->MoveWindow(finalX, finalY, finalW, finalH);
+            // The chrome-delta estimate above assumes Windows honors the outer size exactly, but it doesn't
+            // always: a minimum caption width for the sysmenu/min/max/close buttons, DPI rounding, etc. can all
+            // make the resulting CLIENT area come out a few pixels off from what was asked for -- which was still
+            // enough to crop the right/bottom edge of a picture window's content after the first chrome-aware fix.
+            // Rather than trust the estimate, re-measure the actual client size Windows produced and, if it
+            // doesn't match, nudge the outer size by exactly the remaining difference and resize once more.
+            if (pw >= 0 || ph >= 0) {
+                CRect gotClient; cw->GetClientRect(gotClient);
+                int dw = pw >= 0 ? pw - gotClient.Width() : 0, dh = ph >= 0 ? ph - gotClient.Height() : 0;
+                if (dw != 0 || dh != 0) {
+                    CRect gotWin; cw->GetWindowRect(gotWin); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&gotWin, 2);
+                    cw->MoveWindow(finalX, finalY, gotWin.Width() + dw, gotWin.Height() + dh);
+                }
+            }
+            // Sizes the /drawXXX picture canvas to the CLIENT size that was actually asked for, independent of
+            // whether this window is actually shown -- Tetris's sprite-sheet buffer windows are created hidden
+            // and only ever drawn into, never displayed.
+            int canvasW = pw >= 0 ? pw : curClient.Width(), canvasH = ph >= 0 ? ph : curClient.Height();
+            if (canvasW > 0 && canvasH > 0) cw->SetCanvasSize(canvasW, canvasH);
         }
         if (hFlag && !creating) cw->ShowWindow(SW_HIDE);
         if (nFlagSw) cw->ShowWindow(SW_MINIMIZE);
@@ -14200,7 +14690,29 @@ class CMainFrame : public CMDIFrameWnd {
             for (size_t k = i; k + 1 < tok.size(); k += 2) { maxX = (std::max)(maxX, _wtoi(tok[k])); maxY = (std::max)(maxY, _wtoi(tok[k + 1])); }
             cw->GrowCanvasFor(maxX + size + 1, maxY + size + 1);
             CDC* dc = cw->CanvasDC();
-            for (; dc && i + 1 < tok.size(); i += 2) dc->FillSolidRect(_wtoi(tok[i]), _wtoi(tok[i + 1]), size, size, col);
+            // A dot is centered on its (x,y) coordinate, like any point/brush primitive -- not anchored by its
+            // top-left corner. That's invisible for every existing size-1 call throughout these scripts (size/2
+            // integer-divides to 0, so the offset vanishes), but drawclock.mrc's clock-face backdrop uses large
+            // sizes ("drawdot @buffer 14 300 420 340", size 300) meant to be three concentric CIRCLES forming the
+            // clock's round sunken-bevel frame. Real mIRC's /drawdot draws a filled circle at each point once
+            // size > 1, not a filled square -- but mIRC's "size" there is the circle's RADIUS, not its diameter:
+            // treating it as a diameter (radius size/2) drew a ring under half the size it should have been,
+            // nowhere near big enough to reach out past the "12"/"3"/"6"/"9" labels near the face's rim -- the
+            // small, undersized shadow circle the user reported, not wrapping around the numbers the way it does
+            // in mIRC. size == 1 still goes through FillSolidRect: a 1px "circle" would need a 2x2 bounding box
+            // for CDC::Ellipse to draw anything at all, and every single-pixel dot call elsewhere relies on
+            // exactly one pixel being set.
+            if (dc && size > 1) {
+                CBrush br(col); CBrush* oldB = dc->SelectObject(&br);
+                CPen pen(PS_SOLID, 1, col); CPen* oldP = dc->SelectObject(&pen);
+                for (; i + 1 < tok.size(); i += 2) {
+                    int x = _wtoi(tok[i]), y = _wtoi(tok[i + 1]);
+                    dc->Ellipse(x - size, y - size, x + size, y + size);
+                }
+                dc->SelectObject(oldP); dc->SelectObject(oldB);
+            } else {
+                for (; dc && i + 1 < tok.size(); i += 2) dc->FillSolidRect(_wtoi(tok[i]) - size / 2, _wtoi(tok[i + 1]) - size / 2, size, size, col);
+            }
             if (!swN) cw->RepaintCanvas();
         }
         else if (cmd == L"drawline") {
@@ -14280,9 +14792,15 @@ class CMainFrame : public CMDIFrameWnd {
             if (!cw) { Show(w, L"* /drawtext: no such window: " + name, cPart); return; }
             cw->ShowCanvas();
             CString rest = a; rest.TrimLeft();
+            // mIRC's /drawtext takes exactly ONE color (the text color) -- there is no separate background-color
+            // argument in its syntax at all. The background is just solid black when opaque (the default) or left
+            // untouched when -o (transparent) is given; it was never a second token to read off the line. Reading
+            // one anyway (as this used to) ate the very next word instead -- almost always the font name, e.g.
+            // "drawtext @win 1 Tahoma 50 375 85 12" had "Tahoma" consumed as a bogus color, which cascaded into
+            // "50"/"375"/"85" being misread as font/size/x and "12"/y/text sliding out of alignment, usually
+            // leaving nothing left over to actually draw -- text silently never appearing is exactly that failure.
             COLORREF fg = DrawColorFromTok(Word(rest), swR);
             COLORREF bg = RGB(0, 0, 0);
-            if (!swO) bg = DrawColorFromTok(Word(rest), swR);   // no background field at all when -o (transparent) is given
             CString font = RunWord(rest);   // quote-aware: a multi-word font name like "Courier New" arrives pre-quoted by $qt()
             int ptSize = _wtoi(Word(rest));
             int x = _wtoi(Word(rest)), y = _wtoi(Word(rest));
@@ -14292,13 +14810,21 @@ class CMainFrame : public CMDIFrameWnd {
             cw->GrowCanvasFor(x + sz.cx + 1, y + sz.cy + 1);
             CDC* dc = cw->CanvasDC();
             if (dc) {
-                int logHeight = -MulDiv(ptSize, dc->GetDeviceCaps(LOGPIXELSY), 72);
+                int logHeight = -MulDiv(ptSize, 96, 72);   // fixed 96 DPI -- must match MeasureTextSizePixels above, see its comment
                 HFONT hf = ::CreateFontW(logHeight, 0, 0, 0, swB ? FW_BOLD : FW_NORMAL, swI, swU, FALSE, DEFAULT_CHARSET,
                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, font);
                 CFont* oldF = dc->SelectObject(CFont::FromHandle(hf));
                 dc->SetTextColor(fg);
-                dc->SetBkMode(swO ? TRANSPARENT : OPAQUE);
-                if (!swO) dc->SetBkColor(bg);
+                // -o means OPAQUE (fill a solid background box behind the text) in real mIRC, not transparent --
+                // this had the two switched, so plain "drawtext <win> <color> <font> <size> <x> <y> <text>" (no
+                // -o, the overwhelmingly common case -- drawclock.mrc never passes it) was filling an opaque BLACK
+                // box behind every character before drawing on top, with the fix above also defaulting fg black --
+                // black text on an opaque black box is invisible, hence those solid black rectangles where the
+                // clock's "12"/"3"/"6"/"9" and the date/time text should have been legible. Default is now
+                // transparent (blends with whatever's already drawn, same as real mIRC), -o opts into the opaque
+                // black box instead.
+                dc->SetBkMode(swO ? OPAQUE : TRANSPARENT);
+                if (swO) dc->SetBkColor(bg);
                 dc->TextOut(x, y, text);
                 dc->SelectObject(oldF); ::DeleteObject(hf);
             }
@@ -15564,6 +16090,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_MESSAGE(WM_APP + 52, OnTrayNotify)
     ON_MESSAGE(WM_APP + 53, OnDccPumpMsg)
     ON_MESSAGE(WM_APP + 54, OnDeferredDeleteWnd)
+    ON_MESSAGE(WM_APP + 55, OnDeferredRemoveSock)
     ON_COMMAND(IDM_CONNECT, OnConnectDlg)
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
