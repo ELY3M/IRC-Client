@@ -87,6 +87,14 @@ extern "C" {
 #define VERSION L"IRC Client - https://github.com/ELY3M/IRC-Client"
 #define DEFAULT_FONT L"Fixedsys"
 
+// Flip to 1 to turn the engine's own internal script-call diagnostics back on (the noisy, per-tick/per-command
+// "* [timer-create] ..." and "* [unrecognized->raw] ..." lines added while chasing specific bugs this session) --
+// leave at 0 for normal play, since they print on every single timer firing / unknown command and will flood any
+// busy script (Tetris's own gravity timer alone is once a second or faster). This does NOT affect "* [script-
+// exception] ..." reporting -- that one only ever prints when a script command actually throws, so it stays on
+// unconditionally rather than behind this flag.
+#define DEBUGGING 0
+
 // These are plain (non-const) globals rather than compile-time constants so the Colors dialog can change them at
 // runtime; every existing call site that uses one as a default parameter value still works unchanged, since C++
 // re-reads a default argument's current value at each call rather than requiring it to be a compile-time constant.
@@ -668,6 +676,46 @@ static HBITMAP LoadImageFileScaled(const CString& path, int w, int h) {
     canvas.GetHBITMAP(Gdiplus::Color(255, 255, 255), &hb);
     return hb;
 }
+static bool IsNumTok(const CString& s) {   // a token that _wtoi can parse as a plain (optionally negative) integer -- used to tell a /drawXXX command's trailing numeric args apart from the text/filename that follows them
+    if (s.IsEmpty()) return false;
+    int st = (s[0] == L'-') ? 1 : 0;
+    if (st >= s.GetLength()) return false;
+    for (int i = st; i < s.GetLength(); i++) if (!iswdigit(s[i])) return false;
+    return true;
+}
+// Looks up the CLSID of the GDI+ encoder for a given MIME type (e.g. "image/bmp") -- the standard boilerplate
+// GDI+ requires before Image::Save can write anything, since Save takes an encoder CLSID rather than a format enum.
+static bool GetEncoderClsid(const WCHAR* mimeType, CLSID* clsid) {
+    UINT num = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return false;
+    std::vector<BYTE> buf(size);
+    Gdiplus::ImageCodecInfo* info = (Gdiplus::ImageCodecInfo*)buf.data();
+    Gdiplus::GetImageEncoders(num, size, info);
+    for (UINT i = 0; i < num; i++) {
+        if (info[i].MimeType && wcscmp(info[i].MimeType, mimeType) == 0) { *clsid = info[i].Clsid; return true; }
+    }
+    return false;
+}
+// Writes a GDI bitmap out as a .bmp file -- used by /drawsave. Goes through GDI+'s own encoder (the same library
+// /drawpic already loads images back through) rather than a hand-built BITMAPFILEHEADER/BITMAPINFOHEADER: an
+// earlier version wrote the file by hand via GetDIBits, and while the header layout looked right, GDI+ rejected
+// the result with "InvalidParameter" when loading it back -- not worth chasing a subtle DIB-packing mismatch by
+// hand when GDI+ can both write and read the format itself and is guaranteed to agree with its own encoder.
+// outStatus (when given) reports exactly which step failed: -1 = bad HBITMAP/size, -2 = Bitmap(hbmp) itself came up
+// invalid, -3 = no BMP encoder registered (shouldn't happen on real Windows), otherwise the Gdiplus::Status from
+// Save() itself (0 = Ok). Distinguishing these mattered once already -- see the comment above this function.
+static bool SaveBitmapAsBmpFile(HBITMAP hbmp, int w, int h, const CString& path, int* outStatus = nullptr) {
+    if (!hbmp || w <= 0 || h <= 0) { if (outStatus) *outStatus = -1; return false; }
+    Gdiplus::Bitmap bmp(hbmp, (HPALETTE)nullptr);
+    Gdiplus::Status bst = bmp.GetLastStatus();
+    if (bst != Gdiplus::Ok) { if (outStatus) *outStatus = -2; return false; }
+    CLSID clsid;
+    if (!GetEncoderClsid(L"image/bmp", &clsid)) { if (outStatus) *outStatus = -3; return false; }
+    Gdiplus::Status sst = bmp.Save(path, &clsid, nullptr);
+    if (outStatus) *outStatus = (int)sst;
+    return sst == Gdiplus::Ok;
+}
 
 // ---------------- TLS client layer (Windows SChannel, no external libs) ----------------
 class CTls {
@@ -783,7 +831,7 @@ public:
         return TRUE;
     }
     // Ticking/unticking TLS flips the port between the plaintext and TLS defaults, unless the user
-    // has already typed something else — connecting TLS to a plaintext port is the #1 cause of "SSL doesn't work".
+    // has already typed something else ï¿½ connecting TLS to a plaintext port is the #1 cause of "SSL doesn't work".
     afx_msg void OnTlsClick() {
         int p = GetDlgItemInt(IDC_PORT); bool on = IsDlgButtonChecked(IDC_TLS) != 0;
         if (p == 6667 || p == 6697) SetDlgItemInt(IDC_PORT, on ? 6697 : 6667);
@@ -1168,12 +1216,12 @@ class CFavDlg : public CDialog {
     }
     void Refill() {
         m_list.ResetContent();
-        //for (auto& e : fv) m_list.AddString(e.chan + (e.key.IsEmpty() ? CString() : L"  (key set)") + (e.net.IsEmpty() ? CString() : L"  — " + e.net));
+        //for (auto& e : fv) m_list.AddString(e.chan + (e.key.IsEmpty() ? CString() : L"  (key set)") + (e.net.IsEmpty() ? CString() : L"  ï¿½ " + e.net));
         for (auto& e : fv)
         {
             m_list.AddString(e.chan +
                 (e.key.IsEmpty() ? CString() : CString(L"  (key set)")) +
-                (e.net.IsEmpty() ? CString() : L"  — " + e.net));
+                (e.net.IsEmpty() ? CString() : L"  ï¿½ " + e.net));
         }
     }
 public:
@@ -1445,7 +1493,7 @@ class CAboutDlg : public CDialog {
         t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
         t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
     }
-    // A STATIC control whose picture is an icon/bitmap RESOURCE, referenced by numeric id rather than a string —
+    // A STATIC control whose picture is an icon/bitmap RESOURCE, referenced by numeric id rather than a string ï¿½
     // the DLGITEMTEMPLATE "text" field can be the 0xFFFF-ordinal form here too, same trick used for control classes.
     void ItemRes(DWORD st, int x, int y, int cx, int cy, WORD id, WORD resId) {
         if (t.size() & 1) t.push_back(0);
@@ -1803,6 +1851,37 @@ BEGIN_MESSAGE_MAP(CNickList, CListBox)
     ON_WM_RBUTTONDOWN()
 END_MESSAGE_MAP()
 
+class CChatWnd;   // forward: CCanvasWnd only ever touches its owner through a pointer -- CChatWnd itself (which embeds
+                  // one of these) is defined right below, and CCanvasWnd's message handlers that actually need the
+                  // full CChatWnd definition (OnPaint/OnKeyDown/OnLButtonDown/OnMouseMove) are implemented out-of-line
+                  // right after CChatWnd's closing brace.
+// ---------------- Picture-window canvas: the pixel surface a custom @window's /drawXXX commands paint onto ----
+// A separate child control from the rich-edit log (m_out), so a window can show either text content or a pixel
+// canvas without the two fighting over the same control area. CChatWnd swaps this in over m_out's spot the first
+// time any draw* command targets that window (see CChatWnd::ShowCanvas). The actual pixels live in the owner's own
+// memory-DC bitmap (CChatWnd::m_cwDC/m_cwBmp) rather than in this control, so they persist even for windows that
+// are hidden or never shown at all (e.g. Tetris's off-screen sprite-sheet buffer windows) -- this control just
+// blits them on WM_PAINT and forwards keyboard/mouse input back to the owner for on KEYDOWN / $mouse.x / $mouse.y.
+class CCanvasWnd : public CWnd {
+public:
+    CChatWnd* owner = nullptr;
+    BOOL Create(CWnd* parent, UINT id) {
+        return CWnd::Create(AfxRegisterWndClass(0, ::LoadCursor(nullptr, IDC_ARROW), (HBRUSH)(COLOR_WINDOW + 1)), nullptr,
+                             WS_CHILD | WS_TABSTOP, CRect(0, 0, 0, 0), parent, id);
+    }
+protected:
+    afx_msg void OnPaint();              // defined after CChatWnd, which these four need the full definition of
+    afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }   // OnPaint always fully repaints (either the canvas bitmap or a black fill)
+    afx_msg void OnKeyDown(UINT vk, UINT rep, UINT flags);
+    afx_msg void OnLButtonDown(UINT flags, CPoint p);
+    afx_msg void OnLButtonUp(UINT flags, CPoint p);   // mIRC's "sclick" -- a left click anywhere on a custom @window's picture canvas; see CChatWnd::OnCanvasLClick
+    afx_msg void OnMouseMove(UINT flags, CPoint p);
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CCanvasWnd, CWnd)
+    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE()
+END_MESSAGE_MAP()
+
 class CChatWnd : public CMDIChildWnd {
 public:
     CString m_name; bool m_chan, m_refresh = false; int m_act = 0, m_seq = 0;   // m_act: 0 none, 1 event, 2 message
@@ -1831,6 +1910,10 @@ public:
     }
     // ---- /window: custom @windows reuse this class (net stays null unless -i is used) ----
     bool m_custom = false;        // true for an @window created via /window
+    bool m_closing = false;       // set by Forget() for the duration of this window's own "on CLOSE" event -- guards
+                                   // against a script closing a wildcard pattern (e.g. "close -@ @Tetris*") from
+                                   // inside that very event that happens to also match the window already closing;
+                                   // see Forget()'s own comment for the crash this otherwise causes
     bool m_hasEdit = true;        // false = no editbox row at all (mIRC's default for a new custom window, unless -e is given)
     bool m_cwListMode = false;    // -l: recorded for $window().lb; the display area itself is the same rich-text log either way (see the note in CmdWindow)
     bool m_cwSort = false;        // -s: keep m_cwLines sorted whenever it's modified
@@ -1985,6 +2068,54 @@ public:
         if (m_nicks.m_hWnd) m_nicks.Invalidate();
     }
 
+    // ---- /drawXXX picture-window canvas: see CCanvasWnd's comment above for the overall design ----
+    CCanvasWnd m_canvas; bool m_canvasShown = false;
+    HDC m_cwDC = nullptr; HBITMAP m_cwBmp = nullptr, m_cwOldBmp = nullptr;   // raw GDI, not CDC/CBitmap wrappers -- this gets
+    int m_cwBmpW = 0, m_cwBmpH = 0;                                          // torn down and recreated at a new size often (every /window resize, every out-of-bounds draw), and doing that by hand with SelectObject/DeleteObject/DeleteDC is far less fiddly than fighting MFC's CGdiObject attach/detach semantics each time
+    int m_mouseX = 0, m_mouseY = 0;                        // last canvas mouse position, for $mouse.x/$mouse.y
+    std::function<void(CChatWnd*, UINT)> onCanvasKey;      // on KEYDOWN wiring, set by CMainFrame::OpenCustomWindow
+    std::function<void(CChatWnd*, CPoint)> onCanvasClick;  // left-click on the canvas -- mIRC's "sclick" (and dclick, below), wiring set by CMainFrame::OpenCustomWindow
+    CDC* CanvasDC() { return m_cwDC ? CDC::FromHandle(m_cwDC) : nullptr; }
+    void ResizeCanvasImpl(int nw, int nh) {   // common to SetCanvasSize/GrowCanvasFor: recreate at nw x nh, preserving whatever of the old content still fits, black-filling the rest
+        HDC scr = ::GetDC(nullptr);
+        HBITMAP nb = ::CreateCompatibleBitmap(scr, nw, nh);
+        HDC ndc = ::CreateCompatibleDC(scr);
+        ::ReleaseDC(nullptr, scr);
+        HGDIOBJ oldSel = ::SelectObject(ndc, nb);
+        RECT full = { 0, 0, nw, nh };
+        ::FillRect(ndc, &full, (HBRUSH)::GetStockObject(BLACK_BRUSH));
+        if (m_cwDC) ::BitBlt(ndc, 0, 0, (std::min)(m_cwBmpW, nw), (std::min)(m_cwBmpH, nh), m_cwDC, 0, 0, SRCCOPY);
+        if (m_cwDC) { ::SelectObject(m_cwDC, m_cwOldBmp); ::DeleteObject(m_cwBmp); ::DeleteDC(m_cwDC); }
+        m_cwDC = ndc; m_cwBmp = nb; m_cwOldBmp = (HBITMAP)oldSel; m_cwBmpW = nw; m_cwBmpH = nh;
+        if (m_canvasShown && m_canvas.m_hWnd) m_canvas.Invalidate();
+    }
+    void SetCanvasSize(int w, int h) {   // exact size -- driven by /window's own x y w h geometry
+        if (w < 1) w = 1; if (h < 1) h = 1;
+        if (m_cwDC && w == m_cwBmpW && h == m_cwBmpH) return;
+        ResizeCanvasImpl(w, h);
+    }
+    void GrowCanvasFor(int w, int h) {   // grow-only -- called by draw* commands so a coordinate past the current edge is never silently clipped instead of just auto-expanding the canvas, the way mIRC's own picture windows do
+        int nw = (std::max)(w, m_cwBmpW), nh = (std::max)(h, m_cwBmpH);
+        if (m_cwDC && nw == m_cwBmpW && nh == m_cwBmpH) return;
+        ResizeCanvasImpl(nw, nh);
+    }
+    void ShowCanvas() {   // first draw* command targeting this window: swap its display area from the text log over to the pixel canvas
+        if (m_canvasShown) return;
+        m_canvasShown = true;
+        if (!m_canvas.m_hWnd && m_hWnd) { m_canvas.Create(this, 20); m_canvas.owner = this; }
+        m_out.ShowWindow(SW_HIDE);
+        if (m_chan) { m_topic.ShowWindow(SW_HIDE); m_nicks.ShowWindow(SW_HIDE); }
+        if (m_canvas.m_hWnd) {
+            CRect cr; GetClientRect(cr); int inH = m_hasEdit ? 22 : 0;
+            m_canvas.MoveWindow(0, 0, cr.Width(), cr.Height() - inH);
+            m_canvas.ShowWindow(SW_SHOW);
+        }
+    }
+    void RepaintCanvas() { if (m_canvasShown && m_canvas.m_hWnd) { m_canvas.Invalidate(); m_canvas.UpdateWindow(); } }
+    void OnCanvasKeyDown(UINT vk) { if (onCanvasKey) onCanvasKey(this, vk); }
+    void OnCanvasMouseMove(CPoint p) { m_mouseX = p.x; m_mouseY = p.y; }
+    void OnCanvasLClick(CPoint p) { OnCanvasMouseMove(p); if (onCanvasClick) onCanvasClick(this, p); }   // mIRC's "sclick" -- see CCanvasWnd::OnLButtonUp and CMainFrame::OpenCustomWindow's wiring of onCanvasClick
+
 protected:
     long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = DEFAULT_FONT; bool m_baseBold = false, m_baseItalic = false;
     std::vector<CString> m_hist; int m_histPos = -1;   // per-window input history; -1 = not currently browsing it
@@ -2046,12 +2177,13 @@ protected:
         m_out.MoveWindow(0, top, cx - nw, cy - top - inH);
         if (m_chan) m_nicks.MoveWindow(cx - nw, top, nw, cy - top - inH);
         if (m_hasEdit) m_in.MoveWindow(0, cy - inH, cx, inH); else m_in.MoveWindow(0, cy, cx, 0);
+        if (m_canvasShown && m_canvas.m_hWnd) m_canvas.MoveWindow(0, top, cx - nw, cy - top - inH);
     }
     afx_msg void OnNickDbl() {   // double-click a nick in the list -> open a query window
         int i = m_nicks.GetCaretIndex(); CString n;   // (GetCurSel doesn't work on a multiple-selection list)
         if (i >= 0 && onOpen) { m_nicks.GetText(i, n); onOpen(this, Bare(n)); }
     }
-    afx_msg void OnSetFocus(CWnd*) { m_in.SetFocus(); }
+    afx_msg void OnSetFocus(CWnd*) { if (m_canvasShown && m_canvas.m_hWnd) m_canvas.SetFocus(); else m_in.SetFocus(); }
     afx_msg HBRUSH OnCtlColor(CDC* dc, CWnd* w, UINT type) {
         HBRUSH br = CMDIChildWnd::OnCtlColor(dc, w, type);
         if (w->m_hWnd == m_in.m_hWnd && m_editBg != CLR_NONE) { dc->SetBkColor(m_editBg); return (HBRUSH)m_editBrush; }
@@ -2060,7 +2192,26 @@ protected:
     }
     // (the MDI-activate repaint timer that used to live here was specifically to fight the background-image race;
     // it's gone along with that feature, since a plain color via SetBackgroundColor doesn't have that problem)
-    afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClose) onClose(this); }
+    afx_msg void OnDestroy() {
+        if (m_cwDC) { ::SelectObject(m_cwDC, m_cwOldBmp); ::DeleteObject(m_cwBmp); ::DeleteDC(m_cwDC); m_cwDC = nullptr; m_cwBmp = nullptr; }
+        CMDIChildWnd::OnDestroy(); if (onClose) onClose(this);
+    }
+    // CMDIChildWnd's own PostNcDestroy() deletes `this` immediately once WM_NCDESTROY finishes -- fine for an
+    // ordinary close driven from outside any script, but a script can close ITS OWN window from deep inside the
+    // very RunScript() call that's currently executing with this object as its `w`/execution context (Tetris's
+    // "on *:CLOSE:@Tetris,@Tetris:{ Tetris:Cleanup }" -> "close -@ @Tetris*", reached synchronously from
+    // Tetris:Check's in-canvas X-button hit test, called from Tetris:Play, called from CMainFrame::TimerTick --
+    // every one of those still holds this same pointer on its stack). Deleting the object right there turns every
+    // later touch of it anywhere up that call stack into a use-after-free -- most command dispatchers keep using
+    // `w` to echo/log after running whatever command they just dispatched, so there's almost always a later touch.
+    // That's what was crashing the process the instant a script closed its own currently-running window (as
+    // opposed to the user clicking the system close box from outside any script, which Forget()'s m_closing guard
+    // already handles). Deferring the actual delete to a posted message guarantees it only happens once we're
+    // back at the top of the message loop with an empty call stack -- see CMainFrame::OnDeferredDeleteWnd. The
+    // HWND itself is still destroyed synchronously as before (MFC nulls out m_hWnd before this runs), so any
+    // GetSafeHwnd()/Find() check elsewhere sees it as gone right away; only the C++ object's own lifetime is
+    // extended a little further, which is harmless since nothing but this deferred delete will touch it again.
+    void PostNcDestroy() override { if (CWnd* mw = AfxGetMainWnd()) mw->PostMessage(WM_APP + 54, (WPARAM)this, 0); }
     BOOL PreTranslateMessage(MSG* p) override {
         if (p->hwnd == m_in.m_hWnd && p->message == WM_KEYDOWN && GetKeyState(VK_CONTROL) < 0 && p->wParam == 'K') {   // Ctrl+K: color picker
             CColorPickerDlg dlg(this);
@@ -2116,6 +2267,21 @@ BEGIN_MESSAGE_MAP(CChatWnd, CMDIChildWnd)
     ON_LBN_DBLCLK(4, OnNickDbl)
     ON_BN_CLICKED(11, OnDccCancelClick) ON_BN_CLICKED(12, OnDccOpenFolderClick) ON_BN_CLICKED(13, OnDccOpenClick) ON_BN_CLICKED(14, OnDccCloseClick)
 END_MESSAGE_MAP()
+// ---- CCanvasWnd's handlers, now that CChatWnd (its owner type) is fully defined -- see the comment above CCanvasWnd ----
+void CCanvasWnd::OnPaint() {
+    CPaintDC dc(this);
+    CRect r; GetClientRect(&r);
+    if (owner && owner->CanvasDC()) {
+        int bw = owner->m_cwBmpW, bh = owner->m_cwBmpH;
+        dc.BitBlt(0, 0, (std::min)(r.Width(), bw), (std::min)(r.Height(), bh), owner->CanvasDC(), 0, 0, SRCCOPY);
+        if (r.Width() > bw) dc.FillSolidRect(bw, 0, r.Width() - bw, r.Height(), RGB(0, 0, 0));
+        if (r.Height() > bh) dc.FillSolidRect(0, bh, r.Width(), r.Height() - bh, RGB(0, 0, 0));
+    } else dc.FillSolidRect(r, RGB(0, 0, 0));
+}
+void CCanvasWnd::OnKeyDown(UINT vk, UINT, UINT) { if (owner) owner->OnCanvasKeyDown(vk); }
+void CCanvasWnd::OnLButtonDown(UINT, CPoint p) { SetFocus(); if (owner) owner->OnCanvasMouseMove(p); }
+void CCanvasWnd::OnLButtonUp(UINT, CPoint p) { if (owner) owner->OnCanvasLClick(p); }   // mIRC's "sclick" fires on mouse-up, not mouse-down -- see CChatWnd::OnCanvasLClick
+void CCanvasWnd::OnMouseMove(UINT, CPoint p) { if (owner) owner->OnCanvasMouseMove(p); }
 
 // ---------------- Status bar: click a channel name in the "Channels:" pane to open it ----------------
 class CChanBar : public CStatusBar {
@@ -2781,7 +2947,15 @@ struct CalcParser {   // $calc(): + - * / % ^ , unary minus and parentheses, wit
     double primary() {
         ws();
         if (*p == L'(') { p++; double v = expr(); ws(); if (*p == L')') p++; else ok = false; return v; }
-        double v = 0; if (!ScanNum(p, v)) { ok = false; return 0; }
+        double v = 0;
+        if (!ScanNum(p, v)) {
+            // A missing operand -- e.g. an unset %variable leaving nothing before an operator, the same as
+            // "$calc(%Tetris:Lines / 10)" before %Tetris:Lines has ever been set -- is treated as 0, matching real
+            // mIRC's own lenient arithmetic (empty/unset reads as 0 in a numeric context) instead of failing the
+            // whole expression. Only genuine garbage (anything that isn't simply "nothing here") is still an error.
+            if (*p == 0 || *p == L')' || wcschr(L"+-*/%^", *p)) return 0;
+            ok = false; return 0;
+        }
         return v;
     }
 };
@@ -2819,11 +2993,18 @@ static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> c
     // in ordinary text -- most commonly ASCII art, e.g. "\|/(_)_(_)\|/" -- gets misread as splitting that single
     // /say (or similar) line into several bogus fragments, sending garbage raw commands to the server instead of
     // the intended text.
+    // Depth tracks BOTH parens and braces: a pipe inside an inline control body -- "while (%x < 8) { cmd1 | inc %x }" --
+    // is just as much "inside something" as one inside parens, and must not be treated as a top-level separator.
+    // Without this, that inner "| inc %x" split the while's own body apart from itself, which (combined with the
+    // caller needing to actually recognize "while" as a keyword even when it's not the very first piece of the
+    // line, not just a SplitPipes problem) was sending literal text starting with the word "while" to Dispatch,
+    // which doesn't know that command either and forwarded it straight to the server as a raw line (421 WHILE
+    // Unknown command) -- see ParseNodes' own per-piece loop for the other half of that fix.
     std::vector<CString> out; CString cur; int depth = 0;
     int n = s.GetLength();
     for (int i = 0; i < n; i++) {
         wchar_t c = s[i];
-        if (c == L'(') depth++; else if (c == L')' && depth > 0) depth--;
+        if (c == L'(' || c == L'{') depth++; else if ((c == L')' || c == L'}') && depth > 0) depth--;
         bool spacedBefore = i == 0 || s[i - 1] == L' ' || s[i - 1] == L'\t';
         bool spacedAfter = i + 1 >= n || s[i + 1] == L' ' || s[i + 1] == L'\t';
         if (c == L'|' && depth == 0 && spacedBefore && spacedAfter) { out.push_back(cur); cur.Empty(); } else cur += c;
@@ -3065,6 +3246,29 @@ static std::vector<CString> ScriptTokens(const std::vector<CString>& lines) {
         if (t.IsEmpty()) continue;
         if (t == L"{") { toks.push_back(t); continue; }
         if (t.Right(1) == L"{") { CString head = t.Left(t.GetLength() - 1); head.TrimRight(); if (!head.IsEmpty()) toks.push_back(head); toks.push_back(CString(L"{")); continue; }
+        // Trailing "}" glued onto the last command of a multi-line body ("echo x | break }") is just as valid as
+        // one sitting alone on its own line -- but only when it's actually DANGLING, i.e. closing a block whose
+        // own "{" was on an earlier, already-consumed line/token, not when it's the tail of a SELF-CONTAINED
+        // inline "{ ... }" written entirely within this one token (e.g. "else { foo }"), which MatchBrace/
+        // ParseBody already special-case elsewhere and which must be left alone here. The token's own net brace
+        // balance tells the two apart: a self-contained inline block balances to 0; one or more dangling closes
+        // leaves it negative, and it's exactly that many trailing "}" that need peeling into their own tokens the
+        // same way a trailing "{" already is just above. Without this, a block's real closing brace -- whenever
+        // it's written glued to its last command rather than alone on its own line -- is never recognized as
+        // closing anything, and parsing just keeps consuming subsequent lines (including a sibling "elseif"/
+        // "else", which is exactly what happened to Tetris's own spawn-collision check once its single-line
+        // "{ set ... | break }" got hand-edited into a multi-line body ending in "... | break }") as if they were
+        // still inside it.
+        if (t.Right(1) == L"}") {
+            int bal = 0; for (int i = 0; i < t.GetLength(); i++) { if (t[i] == L'{') bal++; else if (t[i] == L'}') bal--; }
+            if (bal < 0) {
+                std::vector<CString> closes;
+                while (bal < 0 && t.Right(1) == L"}") { t = t.Left(t.GetLength() - 1); t.TrimRight(); closes.push_back(CString(L"}")); bal++; }
+                if (!t.IsEmpty()) toks.push_back(t);
+                for (auto& c : closes) toks.push_back(c);
+                continue;
+            }
+        }
         toks.push_back(t);
     }
     return toks;
@@ -3229,6 +3433,20 @@ static std::vector<SNode> ParseNodes(const std::vector<CString>& t, size_t& pos,
         for (size_t i = 0; i < parts.size(); i++) {
             CString c = parts[i]; c.Trim(); if (c.IsEmpty()) continue;
             if (c.GetLength() > 1 && c[0] == L':' && c.Find(L' ') < 0) { SNode n; n.kind = 3; n.text = c.Mid(1); out.push_back(n); continue; }
+            // "if"/"while" are just as valid starting a non-first pipe-separated piece as they are starting the
+            // whole line ("%x = 1 | while (%x < 8) { ... | inc %x }" is completely ordinary mIRC syntax) -- without
+            // this, only the very first piece of a line was ever checked for them (see the top of this function),
+            // so a mid-line "while"/"if" fell straight through to a plain command node, became literal text, and
+            // -- having no local meaning either -- ended up forwarded to the server as a raw, nonsense command.
+            // Routing the single piece back through ParseNodes reuses all of ParseCtrl's existing inline-body/
+            // elseif/else handling rather than duplicating any of it; SplitPipes (brace-depth aware, see above)
+            // already guaranteed this piece's own "{ ... }" body, if any, is intact and self-contained.
+            if (IsKw(c, L"if") || IsKw(c, L"while")) {
+                std::vector<CString> one; one.push_back(c); size_t p = 0;
+                auto extra = ParseNodes(one, p, false);
+                for (auto& e : extra) out.push_back(e);
+                continue;
+            }
             SNode n; n.text = c; out.push_back(n);
         }
     }
@@ -3696,6 +3914,28 @@ static std::vector<CString> SplitTopLevelCommasParen(const CString& s) {
     out.push_back(cur);
     return out;
 }
+// /var (and /set's comma form) separate declarations with commas, e.g. "%a = 1, %b = 2" -- but a declaration's
+// *value* can itself legitimately contain commas with nothing to do with that ("var %c = 255,000,000 000,255,000
+// ..." is one single declaration whose value happens to be a comma-separated list of numbers). Plain paren-aware
+// splitting still cuts through those, since there are no parens protecting them. The real tell mIRC itself goes
+// by: a comma only starts a NEW declaration when, after it, the next thing is actually "%name" -- so only split
+// there, not on every top-level comma.
+static std::vector<CString> SplitVarDecls(const CString& s) {
+    std::vector<CString> out; CString cur; int depth = 0; int n = s.GetLength();
+    for (int i = 0; i < n; i++) {
+        wchar_t c = s[i];
+        if (c == L'(' || c == L'[') depth++;
+        else if (c == L')' || c == L']') { if (depth > 0) depth--; }
+        if (c == L',' && depth == 0) {
+            int k = i + 1; while (k < n && s[k] == L' ') k++;
+            bool startsNewDecl = (k < n && s[k] == L'%' && k + 1 < n && (iswalnum(s[k + 1]) || s[k + 1] == L'_'));
+            if (startsNewDecl) { out.push_back(cur); cur.Empty(); continue; }
+        }
+        cur += c;
+    }
+    out.push_back(cur);
+    return out;
+}
 static CString UnquoteField(CString f) {
     f.Trim();
     if (f.GetLength() >= 2 && f.Left(1) == L"\"" && f.Right(1) == L"\"") f = f.Mid(1, f.GetLength() - 2);
@@ -4066,7 +4306,7 @@ struct RemoteEvent {
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
     static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal
-    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN" };
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN" };   // CLOSE/KEYDOWN: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
     CString curGroup;
@@ -4086,9 +4326,27 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
-        if (inList(ev.eventName, kNeedsWhere, 14)) {
+        if (inList(ev.eventName, kNeedsWhere, 16)) {
+            // The where-spec is a single ":"-delimited field (a window name/wildcard, or a comma list of them for
+            // CLOSE) immediately before the command body, so the naive first-colon search is correct UNLESS that
+            // field is itself followed by another field before the body -- which is exactly KEYDOWN's real mIRC
+            // syntax: "on LEVEL:KEYDOWN:window:key:{ ... }" has a WINDOW field *and* a separate KEY field (an ascii
+            // code, a key name, or "*" for any key), not one combined where-spec. Tetris's "on *:KEYDOWN:@Tetris:*:
+            // { ... }" is window="@Tetris", key="*". Earlier this was mis-parsed as if "@Tetris:*" were a single
+            // where-spec wildcard (worse, two different wrong guesses in a row: first taking the colon INSIDE that
+            // text as the field end at all, which split it as whereSpec="@Tetris" + bogus leftover command text
+            // "*:{ ... }" -- the real source of the "*: " raw-send flood on every keypress -- and then, trying to
+            // fix that, taking the whole "@Tetris:*" as one where-spec, which made MatchesWhereSpec wildcard-compare
+            // it against the actual window name "@Tetris" and fail outright, since "@Tetris:*" requires a literal
+            // ":" in the window name that isn't there -- breaking KEYDOWN matching completely). This engine's
+            // FireWindowEvent has no per-key filtering (the key code is only ever handed to the event body via
+            // $keyval), so the key field just needs to be consumed here, not matched on.
             int c4 = rest.Find(L':'); if (c4 < 0) continue;
             ev.whereSpec = rest.Left(c4); rest = rest.Mid(c4 + 1);
+            if (ev.eventName == L"KEYDOWN") {
+                int c5 = rest.Find(L':'); if (c5 < 0) continue;
+                rest = rest.Mid(c5 + 1);   // key spec consumed and discarded -- see comment above
+            }
         }
         CString cmdText = rest; cmdText.TrimLeft();
         int db = BraceDelta(cmdText);
@@ -5837,6 +6095,13 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<DialogTableDef> m_dialogTables;       // every "dialog name { ... }" block found across every script-kind file in m_rfiles, same spirit as m_remoteMenus
     std::vector<AliasDef> m_aliases; std::vector<CString> m_runStack;   // aliases (aliases.ini) and the alias names currently running
     int m_depth = 0, m_steps = 0; bool m_halt = false; CString m_result, m_prop, m_lastPrompt;   // state of the running script: $result, $prop, $!
+    ULONGLONG m_scriptStart = 0;   // GetTickCount64() when the current top-level script run began -- a wall-clock backstop alongside m_steps, since a runaway loop whose each "step" does real UI/GDI/network work can blow past several seconds long before it reaches the step cap
+    struct ExecCtx; ExecCtx* m_curCtx = nullptr;   // the currently-executing script line's ExecCtx, so /tokenize (handled deep inside Dispatch, which otherwise never sees ExecCtx) can replace $1../$1- for the rest of that script -- set/restored around each Dispatch() call from ExecCmd
+    CString m_vhist[9];   // $v1..$v9: see EvalCond's own comment where these get filled in
+    CString m_lastExecLine;   // the raw text of whatever script line most recently started executing -- surfaced by the watchdog message in ExecNodes so "taking too long" says WHAT it was stuck on, not just that it happened
+    bool m_silentCmd = false;   // true while running a "."-prefixed command -- see Dispatch's SilentGuard; individual command handlers that show their own confirmation/status line (CmdTimer's "activated", etc.) check this and skip it
+    struct SilentGuard { CMainFrame* f; bool saved; SilentGuard(CMainFrame* p, bool v) : f(p), saved(p->m_silentCmd) { f->m_silentCmd = v; } ~SilentGuard() { f->m_silentCmd = saved; } };
+    int m_lastKeyVal = 0;   // $keyval: the key code from the most recent on KEYDOWN, across every custom window (mIRC keeps this as a single global, not per-window) -- see CChatWnd::onCanvasKey
     VarMap m_vars; std::vector<VarScope> m_scopes; bool m_varsDirty = false;   // global variables (vars.ini) and the stack of per-script local scopes
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
@@ -5985,6 +6250,24 @@ class CMainFrame : public CMDIFrameWnd {
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
         w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowCustomPopup(c, pt); };
+        w->onCanvasKey = [this](CChatWnd* c, UINT vk) {   // on KEYDOWN: fired for whichever custom window currently has keyboard focus -- see CCanvasWnd/ShowCanvas
+            m_lastKeyVal = (int)vk;
+            CString params; params.Format(L"%d", (int)vk);
+            FireWindowEvent(c, L"KEYDOWN", c->m_name, params);
+        };
+        w->onCanvasClick = [this](CChatWnd* c, CPoint) {   // mIRC's "sclick" -- a left click anywhere in a custom @window's picture canvas runs that window's own popup.txt item literally titled "sclick:{...}" (same convention real mIRC uses: a reserved top-level label, not a real menu entry -- ShowCustomPopup filters it back out of the visible right-click menu for the same reason). Was entirely unwired before: a click on the canvas only ever updated $mouse.x/$mouse.y (via OnCanvasMouseMove), with nothing to actually run the window's sclick handler -- which is exactly why clicking @Tetris to pause/unpause (its "Menu @Tetris { sclick:{ ... } }") never did anything.
+            // A script almost always defines its custom window's menu with "Menu @windowname { ... }" rather than
+            // an external popup.txt file -- that's the ONLY form Tetris uses ("Menu @Tetris { sclick:{ ... } }"),
+            // which lives in m_remoteMenus (via RemoteMenuItemsFor), not c->m_cwPopup (which stays empty unless a
+            // popupFile was explicitly supplied to OpenCustomWindow -- essentially never). Checking only
+            // m_cwPopup here, as this originally did, meant the sclick handler could never actually fire for a
+            // script-defined menu like Tetris's, which is exactly why clicking @Tetris to pause/unpause still did
+            // nothing even after this handler was wired up. Both sources are checked, same as ShowCustomPopup.
+            std::vector<PopupItem> items = c->m_cwPopup.empty() ? std::vector<PopupItem>() : ParsePopupItems(c->m_cwPopup);
+            std::vector<PopupItem> remote = RemoteMenuItemsFor(c->m_name);
+            items.insert(items.end(), remote.begin(), remote.end());
+            for (auto& it : items) if (it.depth == 0 && it.cmd.empty() == false && it.title.CompareNoCase(L"sclick") == 0) { RunPopupLines(c, it.cmd, CString()); return; }
+        };
         w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
         w->tsFormat = [this]() { return m_tsEventFmt; };
         w->m_seq = ++m_seqn;
@@ -5996,6 +6279,23 @@ class CMainFrame : public CMDIFrameWnd {
         return w;
     }
     void Forget(CChatWnd* c) {   // user closed the window
+        // Re-entrancy guard: without this, a custom window whose own "on CLOSE" handler closes a wildcard pattern
+        // that happens to also match ITSELF -- exactly what Tetris's "on *:CLOSE:@Tetris,@Tetris:{ Tetris:Cleanup }"
+        // does, since Tetris:Cleanup's own "close -@ @Tetris*" matches @Tetris as well as its @Tetris:Buffer
+        // companion -- calls DestroyWindow() on a window that's already mid-destruction (we're here because OnDestroy
+        // already fired once for it). That re-enters OnDestroy -> onClose -> this very function -> the same CLOSE
+        // event -> the same close cascade, with nothing to stop it: unbounded recursion, which is exactly what was
+        // crashing the process the moment the window's own system close box (not the in-game menu, not a keypress)
+        // was clicked -- the one path that reaches Forget() directly rather than through a script-driven /close that
+        // an alias-level guard might otherwise have caught. (This danger only became live once the old, overly broad
+        // alias-reentrancy guard in Dispatch was removed earlier -- that guard used to silently swallow this exact
+        // recursive call, just via a different, equally-wrong symptom: see Dispatch's own comment.) Setting
+        // m_closing before firing the event, and bailing out immediately if it's already set, lets the cascade still
+        // correctly reach and close any OTHER matching window (like @Tetris:Buffer) while simply no-oping the
+        // redundant, re-entrant close of this one -- it's already on its way out.
+        if (c->m_closing) return;
+        c->m_closing = true;
+        if (c->m_custom) FireWindowEvent(c, L"CLOSE", c->m_name, CString());   // on CLOSE -- fires here rather than in OnDestroy's handler directly, since this is reached both from the user clicking the system close box and from /window -c
         Net* net = c->net;
         for (auto i = m_w.begin(); i != m_w.end(); ++i)
             if (i->second == c) { if (c->m_chan && net && net->conn) Send(net, L"PART " + c->m_name); m_w.erase(i); break; }
@@ -6021,7 +6321,19 @@ class CMainFrame : public CMDIFrameWnd {
         }
     }
     void Send(Net* net, CString l) {
+        // Temporary diagnostic: the generic "Not connected" message is printed from right here, so whatever is
+        // actually reaching Send() with a null/disconnected net -- not necessarily the raw-command catch-all in
+        // Dispatch, which turned out NOT to be it -- gets named explicitly instead of just announcing itself as
+        // "Not connected" with no trace of which caller or line produced it.
+#if DEBUGGING
+        if (!net || !net->conn) {
+            CString stackDump; for (auto& n : m_runStack) stackDump += n + L" > ";
+            CString d; d.Format(L"* [Send:no-conn] l=\"%s\" runStack=[%s] lastExecLine=\"%s\"", (LPCWSTR)l, (LPCWSTR)stackDump, (LPCWSTR)m_lastExecLine);
+            Note(net, d, cPart); return;
+        }
+#else
         if (!net || !net->conn) { Note(net, L"Not connected. Use /server <host> [port]", cPart); return; }
+#endif
         l.Remove(L'\r'); l.Remove(L'\n');
         DebugLine(net, L"->", l);
         CW2A conv(l, CP_UTF8);
@@ -6102,6 +6414,13 @@ class CMainFrame : public CMDIFrameWnd {
     bool IdentValue(CChatWnd* w, const CString& name, const CString& prop, CString& val) {
         Net* net = w ? w->net : nullptr;
         CTime now = CTime::GetCurrentTime();
+        if (name.GetLength() == 2 && name[0] == L'v' && name[1] >= L'1' && name[1] <= L'9') { val = m_vhist[name[1] - L'1']; return true; }   // $v1..$v9 -- see EvalCond's comment on m_vhist
+        if (name == L"mouse") {   // $mouse.x / $mouse.y -- last known mouse position within the current window's picture canvas (see CChatWnd::OnCanvasMouseMove)
+            if (prop == L"x") { val.Format(L"%d", w ? w->m_mouseX : 0); return true; }
+            if (prop == L"y") { val.Format(L"%d", w ? w->m_mouseY : 0); return true; }
+            return false;
+        }
+        if (name == L"keyval") { val.Format(L"%d", m_lastKeyVal); return true; }   // the key code from the most recent on KEYDOWN (see m_lastKeyVal's own comment)
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
@@ -6486,12 +6805,16 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void CmdVar(CChatWnd* w, CString arg) {   // /var %x = hello, %y, %z = $me   (local to this script run)
         VarSw sw; if (!ParseVarSw(w, L"var", arg, sw, L"snzeglkipu")) return;
-        for (auto& itemRaw : SplitTopLevelCommasParen(arg)) {   // paren-aware: a declaration's own value can be a $identifier(args) call whose arguments contain commas of their own, which a plain comma split would incorrectly cut through
+        for (auto& itemRaw : SplitVarDecls(arg)) {   // only splits a comma that's actually followed by a new %name -- see SplitVarDecls for why (a declaration's value can itself be a plain comma-separated list, e.g. Tetris's "var %c = 255,000,000 000,255,000 ...")
             CString item = itemRaw; item.Trim(); if (item.IsEmpty()) continue;
             int k = 0; while (k < item.GetLength() && item[k] != L' ' && item[k] != L'=') k++;
             CString name = item.Left(k), tail = item.Mid(k), val; tail.TrimLeft();
             if (name.Left(1) != L"%") { Show(w, L"* /var: variable names start with %", cPart); return; }
+            // mIRC's /var accepts a value two ways: "%x = value" (with an = sign) and, just as validly, a plain
+            // "%x value" with no = at all (real scripts rely on this -- e.g. "var ... %nShape $1-2"); only a bare
+            // "%x" with nothing after it at all means "declare it empty".
             if (tail.Left(1) == L"=") { if (!FinalValue(w, L"var", StripOneLeadingSpace(tail.Mid(1)), sw, val)) return; }
+            else if (!tail.IsEmpty()) { if (!FinalValue(w, L"var", tail, sw, val)) return; }
             StoreVar(name, val, sw, true);
         }
         FlushVars();
@@ -6525,6 +6848,24 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- $functions(...) : $calc $round $int $chr $var ----
     // Returns false if 'name' isn't one (or its arguments are unusable), so the text is left exactly as typed.
     bool FuncValue(CChatWnd* w, const CString& name, const CString& rawArgs, const CString& prop, const CString& params, CString& val) {
+        if (name == L"width" || name == L"height") {   // $width(text,font,size[,bold]) / $height(text,font,size[,bold]) -- Tetris uses both to center/right-align drawn text
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 3) return false;
+            CString text = p[0], font = p[1]; double ptD = 0; if (!ParseNum(p[2], ptD)) return false;
+            bool bold = false; if (p.size() >= 4) { double b = 0; bold = ParseNum(p[3], b) && b != 0; }
+            SIZE sz = MeasureTextSizePixels(text, font, (int)ptD, bold);
+            val.Format(L"%d", name == L"width" ? (int)sz.cx : (int)sz.cy);
+            return true;
+        }
+        if (name == L"inrect") {   // $inrect(x1,y1,x2,y2) -- whether the current window's last known mouse position (see $mouse.x/$mouse.y) falls within the given rectangle
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 4) return false;
+            double x1, y1, x2, y2; if (!ParseNum(p[0], x1) || !ParseNum(p[1], y1) || !ParseNum(p[2], x2) || !ParseNum(p[3], y2)) return false;
+            int mx = w ? w->m_mouseX : 0, my = w ? w->m_mouseY : 0;
+            bool inside = mx >= (std::min)(x1, x2) && mx <= (std::max)(x1, x2) && my >= (std::min)(y1, y2) && my <= (std::max)(y1, y2);
+            val = inside ? L"$true" : L"$false";
+            return true;
+        }
         if (name == L"calc") { double r; if (!CalcExpr(EvalIds(w, rawArgs, params), r)) return false; val = FmtNum(r); return true; }
         if (name == L"int") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false; val = FmtNum(x < 0 ? ceil(x) : floor(x)); return true; }
         if (name == L"round") {
@@ -6536,12 +6877,13 @@ class CMainFrame : public CMDIFrameWnd {
             val = FmtNum((x < 0 ? -1.0 : 1.0) * floor(fabs(x) * pw + 0.5) / pw); return true;
         }
         if (name == L"chr") { double x; if (!ParseNum(EvalIds(w, rawArgs, params), x) || x < 1 || x > 65535) return false; val = CString((wchar_t)(int)x); return true; }
-        if (name == L"abs" || name == L"sqrt" || name == L"ceil" || name == L"log" || name == L"log10" || name == L"sin" || name == L"cos" || name == L"tan" || name == L"asin" || name == L"acos" || name == L"atan" || name == L"sinh" || name == L"cosh") {
+        if (name == L"abs" || name == L"sqrt" || name == L"ceil" || name == L"floor" || name == L"log" || name == L"log10" || name == L"sin" || name == L"cos" || name == L"tan" || name == L"asin" || name == L"acos" || name == L"atan" || name == L"sinh" || name == L"cosh") {
             double x; if (!ParseNum(EvalIds(w, rawArgs, params), x)) return false;
             double r;
             if (name == L"abs") r = fabs(x);
             else if (name == L"sqrt") { if (x < 0) return false; r = sqrt(x); }
             else if (name == L"ceil") r = ceil(x);
+            else if (name == L"floor") r = floor(x);   // Tetris's own timer-interval calc ($floor(...) wrapping the whole speed-ramp expression) depends on this directly -- without it, the expression never reduced to a plain number, which is what the "/timer Usage:" error was actually reporting
             else if (name == L"log") { if (x <= 0) return false; r = log(x); }
             else if (name == L"log10") { if (x <= 0) return false; r = log10(x); }
             else if (name == L"sin") r = sin(x);
@@ -8311,9 +8653,24 @@ class CMainFrame : public CMDIFrameWnd {
             if (!cw || !cw->m_custom) { val.Empty(); m_flinen = 0; return true; }
             bool useRegex = (T == 2 || T == 3);
             auto& lines = cw->m_cwLines;   // this client has no separate side-listbox line array from the main lines, so T's "search the listbox instead" distinction (T=1/3) isn't modeled -- every T value searches the same m_cwLines
+            // Real mIRC writes a regex argument as "/pattern/flags" (the same convention $regex() uses, which
+            // already strips these delimiters before compiling -- see its own code just above). That was never
+            // done here: std::wregex got the RAW "/pattern/" text, slashes included, which -- since a literal "/"
+            // matches only itself in ECMAScript regex syntax -- silently required the searched text to literally
+            // start and end with "/". No real line of script data ever does, so a regex $fline() could never
+            // match anything, no matter how correct its own pattern was. This is exactly what made Tetris's own
+            // full-row-clear check ("$fline(@Tetris:Buffer,/^([^0](?:\x20|$)){15}$/,1,3)") never fire -- full rows
+            // just sat there instead of clearing.
+            CString patBody = expr, flags;
+            if (useRegex && patBody.GetLength() >= 2 && patBody[0] == L'/') {
+                int closeSlash = patBody.ReverseFind(L'/');
+                if (closeSlash > 0) { flags = patBody.Mid(closeSlash + 1); patBody = patBody.Mid(1, closeSlash - 1); }
+            }
+            bool ci = flags.Find(L'i') >= 0;
             int matchCount = 0, foundLine = 0; CString foundText;
             try {
-                std::wregex re; if (useRegex) re = std::wregex((LPCWSTR)expr);
+                std::wregex re;
+                if (useRegex) { auto reFlags = std::regex::ECMAScript; if (ci) reFlags |= std::regex::icase; re = std::wregex((LPCWSTR)patBody, reFlags); }
                 for (int i = S - 1; i < (int)lines.size(); ++i) {
                     bool matches = useRegex ? std::regex_search((LPCWSTR)lines[i], re) : GlobMatch(expr, lines[i]);
                     if (matches) { ++matchCount; if (N > 0 && matchCount == N) { foundLine = i + 1; foundText = lines[i]; break; } }
@@ -8325,11 +8682,17 @@ class CMainFrame : public CMDIFrameWnd {
             val = (prop == L"text") ? foundText : CString(std::to_wstring(foundLine).c_str());
             return true;
         }
-        if (name == L"line" || name == L"sline") {   // $line(@name,N) / $sline(@name,N): .state .color for $line; .ln for $sline
+        if (name == L"line" || name == L"sline") {   // $line(@name,N[,T]) / $sline(@name,N[,T]): .state .color for $line; .ln for $sline
+            // T (1 = listbox, 0 = display area) is accepted but not distinguished -- m_cwLines already serves as the
+            // single line-store behind both aline/cline/etc. and the on-screen log (see CwRebuild), so reading from
+            // it covers either case. Before this, N was parsed from "N,T" as ONE number via ParseNum and always
+            // failed on the comma, so $line(...) with a T argument -- which is how every real script calls it --
+            // silently returned false and left the whole $line(...) call as literal, unevaluated text.
             CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
             if (c < 0) return false;
             CString wn = a.Left(c); wn.Trim();
-            double nn; if (!ParseNum(a.Mid(c + 1), nn)) return false;
+            CString rest = a.Mid(c + 1); int c2 = rest.Find(L',');
+            double nn; if (!ParseNum(c2 < 0 ? rest : rest.Left(c2), nn)) return false;
             CChatWnd* cw = Find(nullptr, wn);
             if (!cw || !cw->m_custom) { val.Empty(); return true; }
             int idx = (int)nn;
@@ -8454,7 +8817,26 @@ class CMainFrame : public CMDIFrameWnd {
                 out += c; continue;
             }
             if (c == L'%' && evalVars && i + 1 < L && (iswalnum(in[i + 1]) || in[i + 1] == L'_')) {   // %variable (an unset one is empty)
-                int k = i + 1; while (k < L && (iswalnum(in[k]) || in[k] == L'_' || in[k] == L'.' || in[k] == L'-')) k++;   // '.' and '-' are both perfectly ordinary, valid characters within an mIRC variable name itself (e.g. %ircop.serv1 and %auto-todo1 are each one variable, not %ircop/%auto followed by literal trailing text) -- unlike a $identifier, where these characters mean something else (property access, subtraction), a %variable has no such conflicting syntax
+                int k = i + 1;
+                for (;;) {
+                    if (k < L && (iswalnum(in[k]) || in[k] == L'_' || in[k] == L'.' || in[k] == L'-' || in[k] == L'+')) { k++; continue; }   // '.', '-' and '+' are all perfectly ordinary, valid characters within an mIRC variable name itself (e.g. %ircop.serv1, %auto-todo1 and Tetris's own %nY+1/%nY+2/%nY+3 are each one variable, not %ircop/%auto/%nY followed by literal trailing text) -- unlike a $identifier, where these characters mean something else (property access, subtraction, concatenation), a %variable has no such conflicting syntax. Without the '+' here, every reference to %nY+1 etc. (declared fine, since /var's own name-parsing just reads up to the next space/'=') silently read as %nY's value with "+1"/"+2"/"+3" left as literal trailing text at every USE site -- corrupting (not halting) every sprite-border coordinate built from them
+                    // ':' is ALSO a perfectly ordinary variable-name character -- "%script:varname" (a namespacing
+                    // convention: Tetris's own %Tetris:Shape, %Tetris:State, %Tetris:Land, %Tetris:Lines, %Tetris:Score,
+                    // %Tetris:nShape are all exactly this) is extremely common real-world mIRC, and without this, every
+                    // one of those collapsed into literally the SAME single variable ("%Tetris"), with ":Shape"/
+                    // ":State"/etc. left as inert trailing text wherever each was READ -- %Tetris:Shape's own value
+                    // (correctly stored under its full, distinct name, since /set's name-extraction uses a different,
+                    // unaffected method) could then never be read back out correctly, and "if (!%Tetris:Shape)" in
+                    // particular evaluated the literal, always-non-empty text "!" + %Tetris's value + ":Shape" --
+                    // always truthy, no matter what -- which is what was actually driving Tetris:Shape's endless
+                    // "goto loop": it could never see its own flag as set. But ':' is ONLY taken as part of the name
+                    // when another name character immediately follows it -- otherwise (end of text, a space, anything
+                    // else) it's left alone as ordinary trailing punctuation, which is just as common a pattern
+                    // ("echo %nick: welcome!" must still mean %nick followed by literal ": welcome!", not a lookup for
+                    // a variable actually named "nick:").
+                    if (k < L && in[k] == L':' && k + 1 < L && (iswalnum(in[k + 1]) || in[k + 1] == L'_')) { k += 2; continue; }
+                    break;
+                }
                 out += GetVar(in.Mid(i, k - i)); i = k - 1; continue;
             }
             if (c != L'$' || i + 1 >= L) { if (hashPending) { out += L'#'; hashPending = false; } out += c; continue; }
@@ -8466,6 +8848,25 @@ class CMainFrame : public CMDIFrameWnd {
                 while (out.GetLength() > 0 && out[out.GetLength() - 1] == L' ') out.Truncate(out.GetLength() - 1);
                 int e = j + 1; while (e < L && in[e] == L' ') e++;
                 i = e - 1; continue;
+            }
+            else if (in[j] == L'(' && !dbl) {   // $(...) -- a bare, nameless identifier form with two real uses in real scripts:
+                // plain grouping ("$(text)", evaluated once, no different from "text" alone appearing right there), and
+                // -- the one that actually matters here -- INDIRECT identifier access when the content starts with a
+                // comma: "$(,$ $+ %x)" builds the literal text "$3" (say, if %x is 3) on a first pass, then that comma
+                // signals "evaluate this result again", which is what actually resolves it to $3's real value. This is
+                // mIRC's standard trick for indexing positional parameters by a variable instead of a literal number
+                // (Tetris's whole collision-check loop walks $3/$4/$5.../$10 this way, via a %x it increments) -- without
+                // this, "$(" was left as literal, inert text (nothing earlier matches '(' right after '$'), which fed
+                // garbage non-numeric strings into the rest of that loop's arithmetic and comparisons.
+                int depth = 1, m = j + 1;
+                for (; m < L; m++) { if (in[m] == L'(') depth++; else if (in[m] == L')') { if (--depth == 0) break; } }
+                if (m < L) {
+                    CString inner = in.Mid(j + 1, m - j - 1);
+                    CString pass1 = EvalIds(w, inner, params, evalVars);
+                    if (pass1.Left(1) == L',') val = EvalIds(w, pass1.Mid(1), params, evalVars);   // the leading-comma marker: double-evaluate (indirect access)
+                    else val = pass1;   // no marker: a plain grouping, already fully evaluated by the one pass above
+                    ok = true; endIdx = m + 1;
+                }
             }
             else if (in[j] == L'!' && !dbl) { val = m_lastPrompt; ok = true; endIdx = j + 1; }
             else if (in[j] == L'?') {   // $?  $?="Prompt text"  $?1  (a number: use that parameter if it was given, otherwise ask)
@@ -8493,6 +8894,26 @@ class CMainFrame : public CMDIFrameWnd {
             }
             else if (iswalpha(in[j])) {   // named identifier or function; matching is case-insensitive ($ME == $me)
                 int k = j; while (k < L && iswalnum(in[k])) k++;
+                // A custom alias's own name may itself contain colons ("Tetris:Check" is the standard mIRC way to
+                // namespace a private helper alias), and calling such an alias AS AN IDENTIFIER ($Tetris:Check(...),
+                // to use its /return value in an expression) is just as valid as calling a colon-free one. The
+                // plain alnum scan just above stops at the first colon, so "$Tetris:Check(...)" was never even
+                // recognized as a call attempt at all -- it fell through to this function's literal-text fallback
+                // with only the %variables inside its argument list substituted, leaving the identifier itself as
+                // inert text that read as permanently non-empty ("true") to any caller checking its truthiness via
+                // EvalCond, and as garbage data to any caller capturing it afterward via $v1 -- exactly what was
+                // silently corrupting Tetris's piece-rotation code (every piece type's rotation check calls
+                // $Tetris:Check(...) this way) into garbage shape data on every single rotation attempt. Only
+                // extend the name across a colon when it's unambiguously part of an alias-style call -- i.e. more
+                // identifier characters follow the colon, AND the whole extended run is immediately followed by
+                // "(" -- so an ordinary "$nick: hello" (colon as plain punctuation right after a short bare
+                // identifier, no parens following) is completely unaffected and still ends the name at "nick"
+                // exactly as before.
+                if (k < L && in[k] == L':' && k + 1 < L && iswalnum(in[k + 1])) {
+                    int k2 = k;
+                    while (k2 < L && in[k2] == L':' && k2 + 1 < L && iswalnum(in[k2 + 1])) { k2++; while (k2 < L && iswalnum(in[k2])) k2++; }
+                    if (k2 < L && in[k2] == L'(') k = k2;
+                }
                 CString name = in.Mid(j, k - j); name.MakeLower();
                 bool done = false;
                 // $func(args) -- any identifier can have one, not just $var/aliases (that used to be the only case
@@ -8520,6 +8941,18 @@ class CMainFrame : public CMDIFrameWnd {
                     // text). Otherwise -- no parens at all -- pass the property straight through.
                     CString identProp = hasArgs ? CString() : prop;
                     if (IdentValue(w, name, identProp, val)) { done = true; endIdx = hasArgs ? k : afterProp; }
+                }
+                // Real mIRC matches a parens-less identifier against its known name table, not just "read every
+                // following alnum character" -- scripts routinely butt a bare identifier straight up against
+                // trailing literal text with no separator (e.g. $scriptdirTetris.bmp means $scriptdir followed by
+                // the literal text "Tetris.bmp"). The greedy read above got that whole run as one candidate name
+                // ("scriptdirtetris"), which no identifier matches, so if that failed, retry with progressively
+                // shorter prefixes of the same run and take the longest one that IS a known bare identifier.
+                if (!done && !hasArgs) {
+                    for (int k2 = k - 1; k2 > j; k2--) {
+                        CString shortName = in.Mid(j, k2 - j); shortName.MakeLower();
+                        if (IdentValue(w, shortName, CString(), val)) { done = true; endIdx = k2; break; }
+                    }
                 }
                 ok = done;
             }
@@ -8561,13 +8994,19 @@ class CMainFrame : public CMDIFrameWnd {
             // command reaches Dispatch, it's expected to already be fully evaluated text.
             CString restCopy = rest;
             VarSw sw; if (!ParseVarSw(w, L"var", restCopy, sw, L"snzeglkipu")) { return L"var"; }   // ParseVarSw already reported its own error
-            for (auto& itemRaw : SplitTopLevelCommasParen(restCopy)) {   // paren-aware -- see $replace's own comment on why a plain comma split breaks a value that's itself a $identifier(args) call with commas of its own
+            for (auto& itemRaw : SplitVarDecls(restCopy)) {   // only splits a comma that's actually followed by a new %name -- a declaration's value can itself be a plain comma-separated list (e.g. "var %c = 255,000,000 000,255,000 ..."), which the old paren-only split cut through on every embedded comma
                 CString item = itemRaw; item.Trim(); if (item.IsEmpty()) continue;
                 int k = 0; while (k < item.GetLength() && item[k] != L' ' && item[k] != L'=') k++;
                 CString name = item.Left(k), tail = item.Mid(k), val; tail.TrimLeft();
                 if (name.Left(1) != L"%") { Show(w, L"* /var: variable names start with %", cPart); return L"var"; }
+                // Accept a value given either with "=" or, just as validly in real mIRC, as plain "%name value"
+                // with no "=" at all (e.g. Tetris's "... %nShape $1-2") -- only a bare "%name" with nothing
+                // after it at all means "declare it empty".
                 if (tail.Left(1) == L"=") {
                     CString evaluated = EvalIds(w, StripOneLeadingSpace(tail.Mid(1)), params);
+                    if (!FinalValue(w, L"var", evaluated, sw, val)) return L"var";
+                } else if (!tail.IsEmpty()) {
+                    CString evaluated = EvalIds(w, tail, params);
                     if (!FinalValue(w, L"var", evaluated, sw, val)) return L"var";
                 }
                 StoreVar(name, val, sw, true);
@@ -8768,7 +9207,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
 
     // ---- the script interpreter: runs an alias body (or a //line) ----
-    struct ExecCtx { CChatWnd* w = nullptr; const CString* params = nullptr; CString gotoLabel; };
+    struct ExecCtx { CChatWnd* w = nullptr; CString* params = nullptr; CString gotoLabel; };   // params is mutable (not just a pointer into the caller's const&) so /tokenize can actually replace $1../$1- for the rest of this running script, same as real mIRC -- see ExecCmd's use of m_curCtx below
     enum { C_NEXT = 0, C_BREAK, C_CONTINUE, C_RETURN, C_HALT, C_GOTO };
 
     // "[ ... ]" evaluation brackets (a space after [ and before ]): the innermost are worked out first and replaced by their value,
@@ -8812,7 +9251,17 @@ class CMainFrame : public CMDIFrameWnd {
         p = FindTop(s, L"&&");
         if (p >= 0) return EvalCond(w, s.Left(p), params) && EvalCond(w, s.Mid(p + 2), params);
         CString rest = s.Mid(1); rest.TrimLeft();
-        if (s.Left(1) == L"!" && rest.Left(1) == L"(") return !EvalCond(w, rest, params);
+        // A leading "!" negates whatever follows -- "!(...)" (a parenthesized sub-condition) is the common case,
+        // but just as ordinary and, until now, NOT handled at all: a bare "!%var" or "!$identifier(...)" with no
+        // parens, which simply means "negate this value's truthiness" (the exact form Tetris's own
+        // "if (!%Tetris:Shape) { ... goto loop }" uses). Without this, that whole leading "!%Tetris:Shape" fell
+        // through to the plain "evaluate as text, true if non-empty/non-zero" fallback further down WITH the "!"
+        // character still attached as part of that text -- which, being a literal, non-empty character, made the
+        // condition unconditionally true no matter what %Tetris:Shape actually held, which is what was actually
+        // driving that goto into a genuine endless loop. Recursing into EvalCond for whatever follows the "!"
+        // handles both forms (and a bare comparison like "!%x == 1") correctly rather than duplicating any of its
+        // own comparison/truthiness logic here.
+        if (s.Left(1) == L"!" && !rest.IsEmpty()) return !EvalCond(w, rest, params);
         static const wchar_t* symOps[] = { L"===", L"==", L"!=", L"<=", L">=", L"<", L">" };
         static const wchar_t* wordOps[] = { L"isnum", L"isincs", L"isin", L"iswmcs", L"iswm", L"ischan" };
         int pos = -1, len = 0; CString op; int d = 0;
@@ -8830,10 +9279,32 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (pos < 0) {   // no operator: true if it evaluates to something other than empty / 0
             CString v = EvalIds(w, s, params); v.Trim();
+            // A LOT of identifiers throughout this file (isfile, exists, isalias, window(...).state, every on/off
+            // flag...) return the literal text "$true"/"$false" rather than "1"/"0" -- that's fine wherever the
+            // caller compares the result with == ("if ($x == $true)"), but a bare "if ($isfile(...))" or
+            // "if (!$isfile(...))" with no operator at all lands here, and "$false" is a non-empty string that
+            // isn't literally "0" -- so every such identifier was being treated as unconditionally true, which is
+            // what silently skipped Tetris:MakeSprites every single run (its own gating condition is exactly this
+            // bare, operator-less "!$isfile(...)" form) regardless of whether the file actually existed.
+            // Real mIRC's $v1..$v9 cache the last-evaluated condition's value regardless of whether it went
+            // through a comparison operator -- a bare "if ($myIdent(...))" used purely for its truthiness is just
+            // as valid a source for a later "$v1" reference as "if (%x == 1)" is, and scripts rely on exactly
+            // that (Tetris's own piece-rotation code calls "$Tetris:Check(...)" bare as the condition specifically
+            // so it can grab its real return value -- the computed landing coordinates -- via $v1 in the action
+            // that follows). Only caching inside the operator branch below, as this used to, left $v1 holding
+            // whatever the PREVIOUS, unrelated atomic comparison happened to leave there instead (observed: a
+            // rotation handed down "%nShape = $1 2 $v1" that evaluated to the literal leftover "1" from an
+            // earlier "$2 == 1" check, not Tetris:Check's actual coordinates) -- silently corrupting %Tetris:Shape
+            // down to a handful of tokens and cascading into "No such line." floods and an eventual crash once
+            // enough garbage data reached $gettok/$puttok.
+            for (int k = 8; k > 0; k--) m_vhist[k] = m_vhist[k - 1]; m_vhist[0] = v;
+            if (v.CompareNoCase(L"$true") == 0) return true;
+            if (v.CompareNoCase(L"$false") == 0) return false;
             return !v.IsEmpty() && v != L"0";
         }
         CString lv = EvalIds(w, s.Left(pos), params), rv = EvalIds(w, s.Mid(pos + len), params);
         lv.Trim(); rv.Trim(); op.MakeLower();
+        for (int k = 8; k > 0; k--) m_vhist[k] = m_vhist[k - 1]; m_vhist[0] = lv;   // $v1.. : real mIRC caches each atomic comparison's already-evaluated left side here, so a chain of separate if-statements can keep testing the SAME expensive/random left-hand value against different right-hand values without re-evaluating (and, for something like $rand, re-rolling) it each time -- e.g. Tetris's "if ($r(1,7)==1) {..} / if ($v1==2) {..} / if ($v1==3) {..}..." is all testing one single dice roll
         bool neg = false; if (op.Left(1) == L"!" && op != L"!=") { neg = true; op = op.Mid(1); }
         bool r = false;
         if (op == L"==") r = lv.CompareNoCase(rv) == 0;
@@ -8859,6 +9330,7 @@ class CMainFrame : public CMDIFrameWnd {
         text.Trim();
         if (text.IsEmpty() || text[0] == L';') return C_NEXT;
         while (text.Left(1) == L"/") text = text.Mid(1);   // scripts don't need the slash, but aliases.ini bodies usually have one
+        m_lastExecLine = text;   // the raw (pre-substitution) line, so a watchdog trip can actually say what it was stuck on instead of just "an endless loop?" -- see ExecNodes
         text = ExpandBrackets(ctx.w, text, *ctx.params);
         text = EvalCmdLine(ctx.w, text, *ctx.params);
         if (m_halt) return C_HALT;
@@ -8871,19 +9343,57 @@ class CMainFrame : public CMDIFrameWnd {
         if (first == L"continue") return C_CONTINUE;
         if (first == L"reseterror") return C_NEXT;
         if (first == L"goto") { ctx.gotoLabel = rest; if (ctx.gotoLabel.Left(1) == L":") ctx.gotoLabel = ctx.gotoLabel.Mid(1); return C_GOTO; }
+        ExecCtx* savedCtx = m_curCtx; m_curCtx = &ctx;   // lets /tokenize (deep inside Dispatch's command chain) reach back and replace $1../$1- for the rest of this script
         Dispatch(ctx.w, L"/" + text);
+        m_curCtx = savedCtx;
         return m_halt ? C_HALT : C_NEXT;
+    }
+    CString WatchdogMsg() {   // see m_lastExecLine's own comment: says what it was stuck on, not just that something was stuck
+        CString alias = m_runStack.empty() ? CString(L"(top level)") : m_runStack.back();
+        CString line = m_lastExecLine; if (line.GetLength() > 120) line = line.Left(120) + L"...";
+        return L"* Script stopped: taking too long (an endless loop?) -- last in /" + alias + L": " + line;
+    }
+    // Catches a hardware/structured exception (access violation, divide-by-zero, ...) raised anywhere inside
+    // ExecNodes' whole call tree -- which covers every command handler reachable from script execution, including
+    // every /drawXXX handler Tetris's redraw hammers every tick. This is what the ordinary C++ try/catch wrapped
+    // around RunScript's own ExecNodes call (added earlier, see RunScript) CANNOT catch: a plain catch(...), under
+    // this project's exception model, only intercepts genuine C++ throws, not SEH exceptions like an AV -- and the
+    // three crashes reported so far (0xC000041D/STATUS_FATAL_APP_EXIT, each time with a DIFFERENT "faulting
+    // module" -- mfc140u.dll, then UxTheme.dll, then IRC.exe itself) are consistent with an uncaught structured
+    // exception terminating the process, every single time with no "[script-exception]" line logged first, which
+    // is exactly what you'd see if it's an AV rather than a throw. __try/__except is a Microsoft extension that
+    // compiles under any /EH setting, but the compiler forbids a C++ object with a destructor living in the SAME
+    // function as the __try block (error C2712) when compiled with synchronous-only exception handling -- so this
+    // wrapper is deliberately its own tiny function with nothing in its frame but a reference and a pointer, no
+    // CString/std:: objects of its own, leaving ExecNodes (and everything it calls) to construct and destroy
+    // whatever it needs normally; only objects that are mid-construction/destruction in frames BETWEEN here and
+    // the actual fault risk not being unwound cleanly on this path, which is an acceptable tradeoff (a handful of
+    // possible leaked GDI/CString locals from the one aborted script tick) against the alternative of the whole
+    // process going down. RunScript treats a caught exception here exactly like a caught C++ one: it stops just
+    // this one script run and logs what happened, instead of taking the whole client down.
+    int ExecNodesSEH(const std::vector<SNode>& nodes, size_t start, ExecCtx& ctx, DWORD* outCode, void** outAddr) {
+        DWORD code = 0; void* addr = nullptr;   // plain locals, not C++ objects -- fine to have in this frame alongside __try
+        __try {
+            return ExecNodes(nodes, start, ctx);
+        }
+        // GetExceptionCode()/GetExceptionInformation() are only valid inside the __except FILTER expression itself
+        // (this parenthesized part), not inside its handler block below -- so the capture has to happen right here.
+        __except ((code = GetExceptionCode()), (addr = GetExceptionInformation()->ExceptionRecord->ExceptionAddress), EXCEPTION_EXECUTE_HANDLER) {
+            if (outCode) *outCode = code;
+            if (outAddr) *outAddr = addr;
+            return C_HALT;
+        }
     }
     int ExecNodes(const std::vector<SNode>& nodes, size_t start, ExecCtx& ctx) {
         for (size_t i = start; i < nodes.size(); i++) {
             if (m_halt) return C_HALT;
-            if (++m_steps > 200000) { Show(ctx.w, L"* Script stopped: too many steps (an endless loop?)", cPart); m_halt = true; return C_HALT; }
+            if (++m_steps > 200000 || GetTickCount64() - m_scriptStart > 4000) { Show(ctx.w, WatchdogMsg(), cPart); m_halt = true; return C_HALT; }
             const SNode& n = nodes[i]; int r = C_NEXT;
             if (n.kind == 0) r = ExecCmd(ctx, n.text);
             else if (n.kind == 1) { if (EvalCond(ctx.w, n.text, *ctx.params)) r = ExecNodes(n.a, 0, ctx); else if (!n.b.empty()) r = ExecNodes(n.b, 0, ctx); }
             else if (n.kind == 2) {
                 while (!m_halt && EvalCond(ctx.w, n.text, *ctx.params)) {
-                    if (++m_steps > 200000) { Show(ctx.w, L"* Script stopped: too many steps (an endless loop?)", cPart); m_halt = true; return C_HALT; }
+                    if (++m_steps > 200000 || GetTickCount64() - m_scriptStart > 4000) { Show(ctx.w, WatchdogMsg(), cPart); m_halt = true; return C_HALT; }
                     int rr = ExecNodes(n.a, 0, ctx);
                     if (rr == C_BREAK) break;
                     if (rr == C_CONTINUE || rr == C_NEXT) continue;
@@ -8901,16 +9411,72 @@ class CMainFrame : public CMDIFrameWnd {
         return C_NEXT;
     }
     void RunScript(CChatWnd* w, const std::vector<CString>& lines, const CString& params) {
+        // The watchdog budget (m_steps/m_scriptStart) only gets reset at a handful of call sites that wrap
+        // RunScript -- RunPopupLines, ShowContextPopup, and the plain-input-line runner -- each gated on
+        // m_depth==0 so a NESTED call (an alias calling another alias) keeps sharing one total budget instead of
+        // each nested level getting its own fresh one. But RunScript itself is also called directly, with no such
+        // wrapper, from plenty of other places -- a /timer firing (TimerTick), channel/raw/CTCP/signal events,
+        // /timer -e -- and none of those reset anything first. That meant a timer firing picked up whatever
+        // m_steps/m_scriptStart an ENTIRELY UNRELATED earlier script run had left behind: if that earlier run had
+        // already tripped the watchdog (or just run long), the very next timer tick inherited an already-exhausted
+        // budget and could trip immediately, on its very first line, regardless of how simple that line was --
+        // exactly what turned a one-line "titlebar - $time(...)" timer into a reported "endless loop". Resetting
+        // here, in RunScript itself, covers every caller uniformly; it's a no-op for the wrapped callers above
+        // since m_depth is already incremented past 0 by the time they reach this point.
+        if (m_depth == 0) { m_halt = false; m_steps = 0; m_scriptStart = GetTickCount64(); for (auto& v : m_vhist) v.Empty(); }
         ScopeGuard scope(this, true);   // its own variable scope: /var locals vanish when the script ends
         std::vector<CString> toks = ScriptTokens(lines);
         size_t pos = 0; std::vector<SNode> nodes = ParseNodes(toks, pos, false);
-        ExecCtx ctx; ctx.w = w; ctx.params = &params;
-        if (ExecNodes(nodes, 0, ctx) == C_GOTO) Show(w, L"* Label not found: " + ctx.gotoLabel, cPart);
+        CString localParams = params;   // a local, mutable copy -- /tokenize (via m_curCtx) replaces this for the rest of this run, which is why it's not just a pointer into the caller's const& argument
+        ExecCtx ctx; ctx.w = w; ctx.params = &localParams;
+        // Every script run -- a timer firing, an incoming-event handler, a menu click, an alias call -- funnels
+        // through here, and ExecNodes ultimately reaches every command handler in the whole interpreter, so this
+        // is the one place that can catch ANY exception thrown anywhere during script execution before it reaches
+        // the OS. That matters because an uncaught C++ exception that unwinds out through a window-procedure
+        // callback (WM_TIMER, WM_KEYDOWN, WM_COMMAND, ...) doesn't behave like an ordinary crash: Windows can't
+        // unwind C++ exceptions across that callback boundary, so it force-terminates the whole process with
+        // STATUS_FATAL_APP_EXIT (0xC000041D) instead -- which is exactly what two different reported crashes
+        // both were, even though their "faulting module" (mfc140u.dll once, UxTheme.dll once) pointed at two
+        // unrelated DLLs: that field just names whatever happened to be on the stack at the instant the OS's own
+        // callback-boundary filter stepped in, not where the actual throw happened, so chasing it by module name
+        // is a dead end. Catching and logging here instead turns a silent, undiagnosable fatal exit into a visible
+        // "* [script-exception] ..." line naming the failing command and reporting the exception text, and lets
+        // the rest of the program keep running (this one script invocation simply stops, same as hitting /halt)
+        // rather than taking the whole client down. Caught here specifically -- not at some outer call site --
+        // so it stops BEFORE unwinding back through RunAlias's own manual (non-RAII) m_depth--/m_runStack.pop_back()
+        // cleanup, which would otherwise be skipped by a throw and leave that bookkeeping corrupted for every
+        // script run after this one; ScopeGuard above is RAII and unwinds safely either way, but RunAlias's isn't.
+        try {
+            DWORD sehCode = 0; void* sehAddr = nullptr;
+            int rr = ExecNodesSEH(nodes, 0, ctx, &sehCode, &sehAddr);   // SEH wrapper, not a direct ExecNodes call -- see ExecNodesSEH's own comment: this is what actually catches an access violation, which a plain catch(...) below cannot
+            if (sehCode) {
+                CString d; d.Format(L"* [script-exception] SEH 0x%08X at address 0x%p (an access violation or similar inside a command this script ran)", sehCode, sehAddr);
+                Show(w, d, cPart);
+            } else if (rr == C_GOTO) Show(w, L"* Label not found: " + ctx.gotoLabel, cPart);
+        } catch (CException* e) {
+            wchar_t buf[512]; e->GetErrorMessage(buf, 512); e->Delete();
+            Show(w, CString(L"* [script-exception] MFC: ") + buf, cPart);
+        } catch (const std::exception& e) {
+            CStringA msgA(e.what()); CString msg(msgA);
+            Show(w, L"* [script-exception] std: " + msg, cPart);
+        } catch (...) {
+            Show(w, L"* [script-exception] unknown exception type", cPart);
+        }
     }
     void RunAlias(CChatWnd* w, AliasDef ad, CString params, CString prop = CString()) {   // by value: the body may redefine aliases while it runs
         if (m_runStack.size() >= 24) { Show(w, L"* Aliases nested too deeply (/" + ad.name + L")", cPart); m_halt = true; return; }
         CString savedProp = m_prop; m_prop = prop; m_runStack.push_back(ad.name);
+        // m_depth++/-- here (not just at the handful of outer wrapper call sites) is what makes RunScript's own
+        // m_depth==0 watchdog-reset check mean "truly top-level", for every path an alias can be reached from --
+        // including a /timer firing or an incoming-event handler calling an alias directly, neither of which goes
+        // through any of those wrappers. Without this, a timer-triggered script calling into even one alias would
+        // have m_depth sitting at 0 the whole time, so every nested alias call along the way would ALSO look
+        // top-level and get its own fresh watchdog budget instead of sharing one total budget across the whole
+        // chain -- not dangerous by itself, just a looser cap than intended for exactly the callers that used to
+        // trip the watchdog falsely (see RunScript's own comment).
+        m_depth++;
         RunScript(w, ad.lines, params);
+        m_depth--;
         m_runStack.pop_back(); m_prop = savedProp;
     }
 
@@ -9225,6 +9791,27 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
+        return suppress;
+    }
+    // CLOSE/KEYDOWN: matched by window name/wildcard against the where-spec, same comma-list rule as JOIN/PART (see
+    // MatchesWhereSpec) but with no nick/address/IAL concept at all -- these are custom-window events, not IRC ones.
+    // KEYDOWN's params is the key code as text (also mirrored into $keyval via m_lastKeyVal); CLOSE's is empty.
+    bool FireWindowEvent(CChatWnd* w, const CString& eventName, const CString& winName, const CString& params) {
+        if (!m_remoteOn || !m_eventsOn) return false;
+        m_evHaltDef = false;
+        CString savedChan = m_evChan, savedName = m_evName, savedLevel = m_evLevel;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
+                if (!MatchesWhereSpec(ev.whereSpec, winName)) continue;
+                m_evChan = winName; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
+                RunScript(w, ev.lines, params);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evChan = savedChan; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
     // SIGNAL: matched by wildcard against the signal name itself (no channel/where concept -- a signal isn't tied
@@ -9599,7 +10186,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void RunPopupLines(CChatWnd* w, const std::vector<CString>& lines, const CString& params) {   // a chosen item: its commands run like an alias body, with $1.. = params
         if (!w) return;
-        if (m_depth == 0) { m_halt = false; m_steps = 0; }
+        if (m_depth == 0) { m_halt = false; m_steps = 0; m_scriptStart = GetTickCount64(); for (auto& v : m_vhist) v.Empty(); }
         m_depth++; RunScript(w, lines, params); m_depth--;
     }
     // $submenu($id($1)) items are replaced by the one-line menu items the identifier returns (called with begin, 1, 2, ... and end).
@@ -9672,7 +10259,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (!w) return false;
         std::vector<PopupItem> remoteItems = RemoteMenuItemsFor(kPopType[sec]);   // remote-script "menu" items add to popups.ini's own, same as real mIRC -- checked here too, so a section with ONLY remote-script items doesn't wrongly report "nothing to show"
         if (m_popRaw[sec].empty() && remoteItems.empty() && !canCopy) return false;
-        if (m_depth == 0) { m_halt = false; m_steps = 0; }
+        if (m_depth == 0) { m_halt = false; m_steps = 0; m_scriptStart = GetTickCount64(); for (auto& v : m_vhist) v.Empty(); }
         m_depth++;
         m_menuType = kPopType[sec];
         std::vector<PopupItem> items = m_popRaw[sec].empty() ? std::vector<PopupItem>() : ExpandSubmenus(ParsePopupItems(m_popRaw[sec]), w, params);
@@ -9695,9 +10282,14 @@ class CMainFrame : public CMDIFrameWnd {
         CString params; if (sec == 2) params = c->m_name;   // in a query window $1 is the person you're talking to
         return ShowContextPopup(c, sec, params, pt, c->LogHasSelection());
     }
-    bool ShowCustomPopup(CChatWnd* w, CPoint pt) {   // right-click in an @window: its own popup.txt, loaded fresh each time
-        if (w->m_cwPopup.empty()) return false;
-        std::vector<PopupItem> items = ParsePopupItems(w->m_cwPopup);
+    bool ShowCustomPopup(CChatWnd* w, CPoint pt) {   // right-click in an @window: its own popup.txt (if any) plus any script-defined "Menu @windowname { ... }" block (m_remoteMenus) -- see onCanvasClick's own comment on why both sources matter
+        std::vector<PopupItem> items = w->m_cwPopup.empty() ? std::vector<PopupItem>() : ParsePopupItems(w->m_cwPopup);
+        { std::vector<PopupItem> remote = RemoteMenuItemsFor(w->m_name); items.insert(items.end(), remote.begin(), remote.end()); }
+        if (items.empty()) return false;
+        // "sclick"/"dclick" are reserved top-level labels (see CChatWnd::onCanvasClick's wiring) -- real mIRC
+        // runs them directly on a left click/double-click rather than ever showing them as an actual entry in
+        // this right-click menu, so they're filtered back out here the same way.
+        items.erase(std::remove_if(items.begin(), items.end(), [](const PopupItem& it) { return it.depth == 0 && (it.title.CompareNoCase(L"sclick") == 0 || it.title.CompareNoCase(L"dclick") == 0); }), items.end());
         CMenu m; m.CreatePopupMenu(); std::vector<std::vector<CString>> acts; size_t i = 0;
         BuildPopupLevel(m, items, i, 0, IDP_CTX, acts, w, CString());
         if (m.GetMenuItemCount() == 0) return false;
@@ -9795,7 +10387,7 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- user input ----
     void OnInput(CChatWnd* w, CString s) {   // whatever was typed (or issued from a menu)
         if (s.IsEmpty()) return;
-        if (m_depth == 0) { m_halt = false; m_steps = 0; }
+        if (m_depth == 0) { m_halt = false; m_steps = 0; m_scriptStart = GetTickCount64(); for (auto& v : m_vhist) v.Empty(); }
         m_depth++;
         if (s.Left(2) == L"//") { std::vector<CString> one; one.push_back(s.Mid(2)); RunScript(w, one, CString()); }   // "//cmd | cmd": a one-line script, identifiers evaluated
         else { ScopeGuard scope(this, true); Dispatch(w, s); }
@@ -9813,7 +10405,16 @@ class CMainFrame : public CMDIFrameWnd {
         CString arg = s.Mid(1), cmdRaw = Word(arg);
         bool bypass = false;
         if (cmdRaw.Left(1) == L"!") { bypass = true; cmdRaw = cmdRaw.Mid(1); }   // "/!join": skip any alias of that name
-        else if (cmdRaw.Left(1) == L".") cmdRaw = cmdRaw.Mid(1);                 // "/.cmd": accepted, but its output isn't suppressed
+        bool dotPrefixed = cmdRaw.Left(1) == L".";
+        if (dotPrefixed) cmdRaw = cmdRaw.Mid(1);
+        // The dot prefix (".timer", ".remove", etc.) is real mIRC's near-universal convention for "run this but
+        // suppress its own default confirmation/feedback echo" -- scripts lean on it constantly specifically to
+        // avoid cluttering the user's window, and Tetris's own self-rescheduling ".timerTetris -h 1 ... Tetris:Play"
+        // (which recreates that timer on EVERY single game tick, so potentially dozens of times a second) is exactly
+        // this: without actually suppressing anything, that alone was spamming "* TimerTetris activated." at the
+        // tick rate. SilentGuard's destructor restores whatever this was before, once Dispatch (and the
+        // DispatchPart2/3 continuation chain it tail-calls into for this same command) finishes.
+        SilentGuard sg(this, dotPrefixed);
         CString cmd = cmdRaw; cmd.MakeLower();
         if (cmd.IsEmpty()) return;
         if (cmd[0] == L'%') {   // "%x = value" (also "%x=value"): assignment -- only when an "=" is actually present; see EvalCmdLine's own matching fix for why a bare "%var" (no "=" anywhere) must NOT be treated as an assignment attempt. Normally EvalCmdLine already expands that case into its real command before Dispatch ever sees it, but this is also reachable directly (typing "/%var" straight into the input box skips EvalCmdLine entirely), so the same guard belongs here too.
@@ -9828,7 +10429,23 @@ class CMainFrame : public CMDIFrameWnd {
         bool inChat = w->m_name != L"*status*";
         if (!bypass) {
             AliasDef* ad = FindAlias(cmd);
-            if (ad && !OnRunStack(ad->name)) { RunAlias(w, *ad, arg); return; }   // an alias may still call the built-in command of its own name
+            // This used to also require !OnRunStack(ad->name) -- skip RunAlias, and fall through this whole
+            // function to the raw-send catch-all at the very bottom, whenever this alias's name was already
+            // anywhere on the call stack. The intent (per the old comment here) was narrow and reasonable: let an
+            // alias named the same as a built-in command (e.g. "alias away { ... /away $1- }") reach the REAL
+            // built-in on its last line instead of recursing into itself forever. But keying it off "name anywhere
+            // on the stack" also blocks completely ordinary, legitimate re-entrancy that has nothing to do with
+            // that scenario -- Tetris:Cleanup is a concrete example: it calls "close -@ @Tetris*", which fires
+            // "on *:CLOSE:@Tetris: { Tetris:Cleanup }" SYNCHRONOUSLY while the outer Tetris:Cleanup call is still
+            // on the stack, so the inner call hit this guard, found no matching built-in to fall back to either,
+            // and silently fell through to raw-sending the literal text "TETRIS:CLEANUP" to the (disconnected)
+            // server instead of an error -- which is what "game died and start over" / the "*: " flood turned out
+            // to actually be. None of this client's own built-in command names collide with any alias name Tetris
+            // (or presumably any other script) defines, so the narrow shadowing case this guarded against doesn't
+            // come up in practice; the existing 24-deep nesting cap in RunAlias and the global step/time watchdog
+            // in ExecNodes are what actually protect against a genuinely runaway/infinite recursion, same as they
+            // always did regardless of this check.
+            if (ad) { RunAlias(w, *ad, arg); return; }
         }
         if (cmd == L"timers") { CmdTimers(w, arg); return; }   // reserved: "/timers" is always the list/off-all command, never a timer literally named "s"
         if (cmd == L"identd") { CmdIdentd(w, arg); return; }
@@ -10245,17 +10862,18 @@ class CMainFrame : public CMDIFrameWnd {
             else { CWnd* o = w->GetDlgItem(1); o->SendMessage(EM_SETSEL, pos, pos + a.GetLength()); o->SetFocus(); }
         }
         else if (cmd == L"linesep") { CString a = arg; bool toStatus = a.Left(2).CompareNoCase(L"-s") == 0; CChatWnd* t = toStatus ? Status(net) : w; if (t) Show(t, L"-", cText); }
-        else if (cmd == L"tokenize") {   // NOT fully implemented: real mIRC re-sets $1../$1- for the rest of the calling script. This client's
-            // $1../$1- come from the params string threaded explicitly through RunScript/ExecCmd's call chain, not
-            // a variable /tokenize could reach into and mutate from here -- doing that properly means changing
-            // ExecCtx itself, which is a deeper change than this pass should make blind. This shows what the split
-            // would produce and nothing more, so at least it's honest about not doing the real thing.
+        else if (cmd == L"tokenize") {   // re-splits <text> on <charcode> and replaces $1../$1- with the result, for the rest of the
+            // currently-running script -- exactly like real mIRC. $1.. are always space-based regardless of the separator used
+            // here, so the split parts are rejoined with plain spaces; m_curCtx->params is the mutable CString that every
+            // subsequent line of this same script (including nested if/while blocks, since they share the same ExecCtx) reads
+            // $1../$1- back out of -- see ExecCtx/m_curCtx and RunScript's localParams.
             CString a = arg; CString chTok = Word(a);
             if (!IsAllDigits(chTok)) { Show(w, L"* Usage: /tokenize <charcode> <text>", cPart); return; }
             wchar_t sep = (wchar_t)_wtoi(chTok);
             std::vector<CString> parts; CString cur; for (int i = 0; i < a.GetLength(); i++) { if (a[i] == sep) { parts.push_back(cur); cur.Empty(); } else cur += a[i]; } parts.push_back(cur);
-            CString countStr; countStr.Format(L"%d", (int)parts.size());
-            Show(w, L"* /tokenize: not implemented in this client (would split into " + countStr + L" parts) -- see the chat reply for why.", cPart);
+            CString joined; for (size_t i = 0; i < parts.size(); i++) { if (i) joined += L" "; joined += parts[i]; }
+            if (m_curCtx && m_curCtx->params) *m_curCtx->params = joined;
+            else Show(w, L"* /tokenize: nothing to tokenize outside a running script.", cPart);   // typed directly at the input box: no $1../$1- scope for it to affect
         }
         else if (cmd == L"mkdir") {
             arg.Trim();
@@ -10268,9 +10886,28 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"rmdir") { arg.Trim(); if (arg.IsEmpty()) Show(w, L"* Usage: /rmdir <dirname>", cPart); else if (!RemoveDirectoryW(arg)) Show(w, L"* /rmdir failed (directory not empty or doesn't exist).", cPart); }
         else if (cmd == L"remove") { CString a = arg; bool bin = a.Left(2).CompareNoCase(L"-b") == 0; if (bin) { a = a.Mid(2); a.TrimLeft(); }
+            a = UnquoteField(a);   // scripts almost always pass this through $qt(...) (e.g. /remove $qt($scriptdirfoo.bmp)) to protect spaces in the path -- DeleteFileW/SHFileOperationW take the path literally, quote characters and all, so a surviving pair of quotes made every such call fail with a path that doesn't actually exist
             if (a.IsEmpty()) Show(w, L"* Usage: /remove [-b] <filename>", cPart);
             else if (bin) { SHFILEOPSTRUCTW op = {}; CString z = a + CString(L'\0'); op.wFunc = FO_DELETE; op.pFrom = z; op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT; SHFileOperationW(&op); }
-            else if (!DeleteFileW(a)) Show(w, L"* /remove: couldn't delete " + a, cPart);
+            else if (!DeleteFileW(a)) {
+                DWORD attrs = GetFileAttributesW(a);
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {   // a read-only file (common for one just extracted/copied in) fails DeleteFileW outright; real mIRC's own /remove clears this first too
+                    SetFileAttributesW(a, attrs & ~FILE_ATTRIBUTE_READONLY);
+                }
+                if (!DeleteFileW(a)) {
+                    DWORD err = GetLastError();
+                    // ERROR_FILE_NOT_FOUND/ERROR_PATH_NOT_FOUND: the file is already gone -- for a delete, that's
+                    // an outcome, not a failure (scripts routinely guard with $isfile first, same as Tetris does
+                    // here, specifically to avoid this; showing an alarming error for "there was nothing to
+                    // delete" is worse than saying nothing, same reasoning as the earlier /timer off fix).
+                    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                        wchar_t* msg = nullptr;
+                        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, err, 0, (LPWSTR)&msg, 0, nullptr);
+                        CString why = msg ? CString(msg) : CString(); if (msg) LocalFree(msg); why.TrimRight(L"\r\n");
+                        Show(w, L"* /remove: couldn't delete " + a + (why.IsEmpty() ? CString() : L" (" + why + L")"), cPart);
+                    }
+                }
+            }
         }
         else if (cmd == L"fserve") {   // /fserve <nickname> <maxgets> <homedirectory> [welcomefile] -- initiates a DCC Chat whose incoming lines are interpreted as fileserver commands (dir/ls/cd/get/read) instead of displayed as plain chat
             if (!net || !net->conn) { Show(w, L"* Not connected.", cPart); return; }
@@ -10862,7 +11499,23 @@ class CMainFrame : public CMDIFrameWnd {
             Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart);
         }
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
-        else { cmd.MakeUpper(); Send(net, cmd + L" " + arg); }
+        else if (cmd.Left(4) == L"draw") CmdDraw(w, cmd, arg);   // /drawdot /drawline /drawrect /drawfill /drawtext /drawpic /drawcopy /drawsave -- see CmdDraw's own comment. Still never falls through to the raw-server catch-all below, which is what used to flood the server with dozens of garbage lines per second from something like a Tetris redraw loop and freeze the client.
+        else {
+            // Temporary diagnostic: a script alias name that IS found by FindAlias but is still sitting on
+            // m_runStack (OnRunStack(...) true) silently skips RunAlias above and drops straight through every
+            // built-in "cmd ==" check in this whole function to land here, indistinguishable from a genuine unknown
+            // command/raw server line -- which is exactly what a run-stack entry that never got popped (a leaked
+            // push_back in RunAlias, or similar) would look like from the outside: the alias "stops working" with
+            // no error, forever, after its first successful run. Report what actually fell through and why.
+#if DEBUGGING
+            AliasDef* adDiag = FindAlias(cmd);
+            CString stackDump; for (auto& n : m_runStack) stackDump += n + L" > ";
+            CString diag; diag.Format(L"* [unrecognized->raw] cmd=\"%s\" arg=\"%s\" knownAlias=%d onRunStack=%d runStack=[%s]",
+                (LPCWSTR)cmd, (LPCWSTR)arg, adDiag ? 1 : 0, adDiag ? (OnRunStack(adDiag->name) ? 1 : 0) : -1, (LPCWSTR)stackDump);
+            Show(w, diag, cPart);
+#endif
+            cmd.MakeUpper(); Send(net, cmd + L" " + arg);
+        }
     }
 
     // ---- server input ----
@@ -12735,6 +13388,15 @@ class CMainFrame : public CMDIFrameWnd {
         for (auto& s : m_dcc) if (s.get() == sess) { DccSendPump(sess); break; }   // the session may have been cancelled/closed since this was posted, so it's only touched if still found alive in m_dcc
         return 0;
     }
+    // See CChatWnd::PostNcDestroy's own comment: a script can close ITS OWN currently-executing window (Tetris's
+    // "on *:CLOSE" -> Tetris:Cleanup -> "close -@ @Tetris*", hit from Tetris:Check's in-canvas X-button test,
+    // called from Tetris:Play, called from TimerTick -- all still holding a pointer to this very window as their
+    // execution context `w`/`fw`). CMDIChildWnd's default PostNcDestroy() would delete the C++ object right then,
+    // making every later touch of that same pointer anywhere up that call stack a use-after-free -- this is what
+    // was crashing the process the moment a script closed its own window from inside its own tick, rather than
+    // the user clicking the system close box from outside any script. Posting the actual delete here instead
+    // guarantees it only happens once we're back at the top of the message loop with an empty call stack.
+    afx_msg LRESULT OnDeferredDeleteWnd(WPARAM wp, LPARAM) { delete (CChatWnd*)wp; return 0; }
     void DccSendOnAck(DccSession* sess, const char* data, int n) {
         sess->inbuf.append(data, n);   // CHAT's line-buffer field, reused here as a generic byte buffer -- a session is only ever CHAT or SEND/GET, never both, so this is safe
         while (sess->inbuf.size() >= 4) {
@@ -13445,14 +14107,244 @@ class CMainFrame : public CMDIFrameWnd {
             if (px < 0) px = scr.left + ((scr.Width() - pw) / 2); if (py < 0) py = scr.top + ((scr.Height() - ph) / 2);
         }
         if (px >= 0 || py >= 0 || pw >= 0 || ph >= 0) {
+            // A brand-new custom window inherits the maximized state of whatever MDI child was active when it was
+            // created (see OpenCustomWindow's wasMax/SW_SHOWMAXIMIZED) -- the right thing for a new channel window,
+            // but wrong here: an explicit size was just given, and MoveWindow on a still-maximized window is
+            // largely ignored by Windows until it's restored, which is what left @Tetris stuck full-screen with
+            // its 360x454 canvas rendering in the corner instead of the window actually being that size.
+            if ((pw >= 0 || ph >= 0) && cw->IsZoomed()) cw->ShowWindow(SW_RESTORE);
             CRect cur; cw->GetWindowRect(cur); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&cur, 2);
-            cw->MoveWindow(px >= 0 ? px : cur.left, py >= 0 ? py : cur.top, pw >= 0 ? pw : cur.Width(), ph >= 0 ? ph : cur.Height());
+            int finalW = pw >= 0 ? pw : cur.Width(), finalH = ph >= 0 ? ph : cur.Height();
+            cw->MoveWindow(px >= 0 ? px : cur.left, py >= 0 ? py : cur.top, finalW, finalH);
+            // Sizes the /drawXXX picture canvas to match, independent of whether this window is actually shown --
+            // Tetris's sprite-sheet buffer windows are created hidden and only ever drawn into, never displayed.
+            if (finalW > 0 && finalH > 0) cw->SetCanvasSize(finalW, finalH);
         }
         if (hFlag && !creating) cw->ShowWindow(SW_HIDE);
         if (nFlagSw) cw->ShowWindow(SW_MINIMIZE);
         if (rFlagSw) cw->ShowWindow(SW_RESTORE);
         if (xFlagSw) cw->ShowWindow(SW_MAXIMIZE);
         if (aFlag) Activate(cw);
+    }
+    CChatWnd* FindDrawWin(const CString& name) { CChatWnd* cw = Find(nullptr, name); return (cw && cw->m_custom) ? cw : nullptr; }
+    static COLORREF DrawColorFromTok(const CString& tok, bool rgb) { return rgb ? (COLORREF)(DWORD)_wtol(tok) : MircColor(_wtoi(tok)); }   // -r: the token is already an RGB int packed the same way $rgb() returns it (see its own comment); otherwise it's a plain 0-15 mIRC color number
+    // ---- /drawdot /drawline /drawrect /drawfill /drawtext /drawpic /drawcopy /drawsave: the picture-window
+    // commands, dispatched here as one group since they share the same leading "-switches <@win> ..." shape.
+    // Argument order follows mirc.com's own command reference; a few less-common switches (inverse-color mode,
+    // drawpic's -t/-s/-o/-g icon-frame forms, drawfill's fill-pattern file, drawsave's -a region/-v binvar/-b bit
+    // depth) are accepted but not implemented -- this covers everything a real drawing script actually needs
+    // (solid-color pixels/lines/rects/fills/text/blits on an auto-growing canvas), not mIRC's full switch matrix.
+    void CmdDraw(CChatWnd* w, CString cmd, CString arg) {
+        CString a = arg; a.TrimLeft();
+        CString sw; if (!a.IsEmpty() && a[0] == L'-') { sw = Word(a); sw = sw.Mid(1); sw.MakeLower(); a.TrimLeft(); }
+        bool swR = sw.Find(L'r') >= 0, swN = sw.Find(L'n') >= 0, swF = sw.Find(L'f') >= 0, swE = sw.Find(L'e') >= 0;
+        bool swD = sw.Find(L'd') >= 0, swO = sw.Find(L'o') >= 0, swB = sw.Find(L'b') >= 0, swU = sw.Find(L'u') >= 0;
+        bool swI = sw.Find(L'i') >= 0, swS = sw.Find(L's') >= 0, swT = sw.Find(L't') >= 0;
+
+        if (cmd == L"drawdot") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawdot: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            std::vector<CString> tok = PlayTokenize(a);
+            if (tok.empty()) { cw->RepaintCanvas(); return; }   // bare "/drawdot @win": mIRC's convention for forcing an immediate repaint of a buffered (-n) window
+            if (tok.size() < 3) return;
+            COLORREF col = DrawColorFromTok(tok[0], swR);
+            size_t i = 1, remain = tok.size() - 1;
+            int size = 1;
+            if (remain % 2 == 1) { size = (std::max)(1, _wtoi(tok[i])); i++; }   // the size field is only present when it's needed to make the rest an even count of x,y pairs
+            int maxX = 0, maxY = 0;
+            for (size_t k = i; k + 1 < tok.size(); k += 2) { maxX = (std::max)(maxX, _wtoi(tok[k])); maxY = (std::max)(maxY, _wtoi(tok[k + 1])); }
+            cw->GrowCanvasFor(maxX + size + 1, maxY + size + 1);
+            CDC* dc = cw->CanvasDC();
+            for (; dc && i + 1 < tok.size(); i += 2) dc->FillSolidRect(_wtoi(tok[i]), _wtoi(tok[i + 1]), size, size, col);
+            if (!swN) cw->RepaintCanvas();
+        }
+        else if (cmd == L"drawline") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawline: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            std::vector<CString> tok = PlayTokenize(a);
+            if (tok.size() < 5) return;
+            COLORREF col = DrawColorFromTok(tok[0], swR);
+            int size = (std::max)(1, _wtoi(tok[1]));
+            int maxX = 0, maxY = 0;
+            for (size_t k = 2; k + 1 < tok.size(); k += 2) { maxX = (std::max)(maxX, _wtoi(tok[k])); maxY = (std::max)(maxY, _wtoi(tok[k + 1])); }
+            cw->GrowCanvasFor(maxX + size + 1, maxY + size + 1);
+            CDC* dc = cw->CanvasDC();
+            if (dc) {
+                CPen pen(PS_SOLID, size, col); CPen* old = dc->SelectObject(&pen);
+                bool first = true;
+                for (size_t k = 2; k + 1 < tok.size(); k += 2) {
+                    int x = _wtoi(tok[k]), y = _wtoi(tok[k + 1]);
+                    if (first) dc->MoveTo(x, y); else dc->LineTo(x, y);
+                    first = false;
+                }
+                dc->SelectObject(old);
+            }
+            if (!swN) cw->RepaintCanvas();
+        }
+        else if (cmd == L"drawrect") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawrect: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            std::vector<CString> tok = PlayTokenize(a);
+            if (tok.size() < 6) return;
+            COLORREF col = DrawColorFromTok(tok[0], swR);
+            int size = (std::max)(1, _wtoi(tok[1]));
+            size_t i = 2;
+            int maxX = 0, maxY = 0;
+            for (size_t k = i; k + 3 < tok.size(); k += 4) { maxX = (std::max)(maxX, _wtoi(tok[k]) + _wtoi(tok[k + 2])); maxY = (std::max)(maxY, _wtoi(tok[k + 1]) + _wtoi(tok[k + 3])); }
+            cw->GrowCanvasFor(maxX + size + 1, maxY + size + 1);
+            CDC* dc = cw->CanvasDC();
+            if (dc) {
+                CPen pen(PS_SOLID, size, col); CPen* oldP = dc->SelectObject(&pen);
+                CBrush brush(col);
+                CBrush* oldB = swF ? dc->SelectObject(&brush) : dc->SelectObject(CBrush::FromHandle((HBRUSH)::GetStockObject(HOLLOW_BRUSH)));
+                while (i + 3 < tok.size()) {
+                    int x = _wtoi(tok[i]), y = _wtoi(tok[i + 1]), ww = _wtoi(tok[i + 2]), hh = _wtoi(tok[i + 3]); i += 4;
+                    if (swD && i + 1 < tok.size() && IsNumTok(tok[i]) && IsNumTok(tok[i + 1])) {
+                        int rw = _wtoi(tok[i]), rh = _wtoi(tok[i + 1]); i += 2;
+                        dc->RoundRect(x, y, x + ww, y + hh, rw, rh);
+                    } else if (swE) dc->Ellipse(x, y, x + ww, y + hh);
+                    else dc->Rectangle(x, y, x + ww, y + hh);
+                }
+                dc->SelectObject(oldP); dc->SelectObject(oldB);
+            }
+            if (!swN) cw->RepaintCanvas();
+        }
+        else if (cmd == L"drawfill") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawfill: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            std::vector<CString> tok = PlayTokenize(a);
+            if (tok.size() < 4) return;
+            COLORREF fillCol = DrawColorFromTok(tok[0], swR), edgeCol = DrawColorFromTok(tok[1], swR);
+            CDC* dc = cw->CanvasDC();
+            if (dc) {
+                CBrush br(fillCol); CBrush* old = dc->SelectObject(&br);
+                size_t i = 2;
+                while (i + 1 < tok.size() && IsNumTok(tok[i]) && IsNumTok(tok[i + 1])) {
+                    dc->ExtFloodFill(_wtoi(tok[i]), _wtoi(tok[i + 1]), edgeCol, swS ? FLOODFILLSURFACE : FLOODFILLBORDER);
+                    i += 2;
+                }
+                dc->SelectObject(old);
+            }
+            if (!swN) cw->RepaintCanvas();
+        }
+        else if (cmd == L"drawtext") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawtext: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            CString rest = a; rest.TrimLeft();
+            COLORREF fg = DrawColorFromTok(Word(rest), swR);
+            COLORREF bg = RGB(0, 0, 0);
+            if (!swO) bg = DrawColorFromTok(Word(rest), swR);   // no background field at all when -o (transparent) is given
+            CString font = RunWord(rest);   // quote-aware: a multi-word font name like "Courier New" arrives pre-quoted by $qt()
+            int ptSize = _wtoi(Word(rest));
+            int x = _wtoi(Word(rest)), y = _wtoi(Word(rest));
+            CString text = rest;   // whatever's left, verbatim -- mIRC's drawtext takes the rest of the line as the text, spaces and all
+            if (ptSize < 1) ptSize = 10;
+            SIZE sz = MeasureTextSizePixels(text, font, ptSize, swB);
+            cw->GrowCanvasFor(x + sz.cx + 1, y + sz.cy + 1);
+            CDC* dc = cw->CanvasDC();
+            if (dc) {
+                int logHeight = -MulDiv(ptSize, dc->GetDeviceCaps(LOGPIXELSY), 72);
+                HFONT hf = ::CreateFontW(logHeight, 0, 0, 0, swB ? FW_BOLD : FW_NORMAL, swI, swU, FALSE, DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, font);
+                CFont* oldF = dc->SelectObject(CFont::FromHandle(hf));
+                dc->SetTextColor(fg);
+                dc->SetBkMode(swO ? TRANSPARENT : OPAQUE);
+                if (!swO) dc->SetBkColor(bg);
+                dc->TextOut(x, y, text);
+                dc->SelectObject(oldF); ::DeleteObject(hf);
+            }
+            if (!swN) cw->RepaintCanvas();
+        }
+        else if (cmd == L"drawpic") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawpic: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            CString rest = a; rest.TrimLeft();
+            if (swT) Word(rest);   // transparent-color arg -- consumed, transparency itself isn't implemented
+            int x = _wtoi(Word(rest)), y = _wtoi(Word(rest));
+            CString save = rest; CString t1 = Word(rest), t2 = Word(rest);
+            int destW = -1, destH = -1;
+            if (IsNumTok(t1) && IsNumTok(t2)) { destW = _wtoi(t1); destH = _wtoi(t2); } else rest = save;
+            CString filename = RunWord(rest);
+            if (filename.IsEmpty()) return;
+            Gdiplus::Bitmap src(filename);
+            Gdiplus::Status st = src.GetLastStatus();   // captured once and reused below -- GetLastStatus() resets the image's internal status back to Ok as a side effect of being read, so calling it a second time (e.g. from inside the error message) always reports 0/Ok regardless of what the real failure was
+            if (st != Gdiplus::Ok) {
+                // GDI+ Bitmap's constructor returns InvalidParameter (2) both for "file has bad/unreadable image
+                // data" AND for "file doesn't exist at all" -- it doesn't distinguish them -- so under DEBUGGING,
+                // report disk existence/size separately to tell those two cases apart.
+#if DEBUGGING
+                DWORD attr = ::GetFileAttributesW(filename);
+                bool existsOnDisk = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+                __int64 sizeOnDisk = -1;
+                if (existsOnDisk) { WIN32_FILE_ATTRIBUTE_DATA fad; if (::GetFileAttributesExW(filename, GetFileExInfoStandard, &fad)) sizeOnDisk = ((__int64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow; }
+                CString err; err.Format(L"* /drawpic: couldn't load %s (GDI+ status %d, existsOnDisk=%d, size=%lld)",
+                    (LPCWSTR)filename, (int)st, existsOnDisk ? 1 : 0, sizeOnDisk);
+                Show(w, err, cPart); return;
+#else
+                Show(w, L"* /drawpic: couldn't load " + filename, cPart); return;
+#endif
+            }
+            int iw = (int)src.GetWidth(), ih = (int)src.GetHeight();
+            int dw = destW > 0 ? destW : iw, dh = destH > 0 ? destH : ih;
+            cw->GrowCanvasFor(x + dw, y + dh);
+            CDC* dc = cw->CanvasDC();
+            if (dc) { Gdiplus::Graphics g(dc->GetSafeHdc()); g.DrawImage(&src, x, y, dw, dh); }
+            if (!swN) cw->RepaintCanvas();
+        }
+        else if (cmd == L"drawcopy") {
+            CString srcName = RunWord(a); CChatWnd* srcCw = FindDrawWin(srcName);
+            if (!srcCw) { Show(w, L"* /drawcopy: no such window: " + srcName, cPart); return; }
+            CString rest = a; rest.TrimLeft();
+            if (swT) Word(rest);
+            int sx = _wtoi(Word(rest)), sy = _wtoi(Word(rest)), srcW = _wtoi(Word(rest)), srcH = _wtoi(Word(rest));
+            CString dstName = RunWord(rest); CChatWnd* dstCw = FindDrawWin(dstName);
+            if (!dstCw) { Show(w, L"* /drawcopy: no such window: " + dstName, cPart); return; }
+            dstCw->ShowCanvas();
+            int dx = _wtoi(Word(rest)), dy = _wtoi(Word(rest));
+            CString t1 = Word(rest), t2 = Word(rest);
+            int dw = -1, dh = -1;
+            if (IsNumTok(t1) && IsNumTok(t2)) { dw = _wtoi(t1); dh = _wtoi(t2); }
+            if (srcW <= 0 || srcH <= 0) return;
+            dstCw->GrowCanvasFor(dx + (dw > 0 ? dw : srcW), dy + (dh > 0 ? dh : srcH));
+            CDC* sdc = srcCw->CanvasDC(); CDC* ddc = dstCw->CanvasDC();
+            if (!sdc || !ddc) return;
+            if (dw > 0 && (dw != srcW || dh != srcH)) { ddc->SetStretchBltMode(HALFTONE); ddc->SetBrushOrg(0, 0); ddc->StretchBlt(dx, dy, dw, dh, sdc, sx, sy, srcW, srcH, SRCCOPY); }
+            else ddc->BitBlt(dx, dy, srcW, srcH, sdc, sx, sy, SRCCOPY);
+            if (!swN) dstCw->RepaintCanvas();
+        }
+        else if (cmd == L"drawsave") {
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawsave: no such window: " + name, cPart); return; }
+            CString rest = a; rest.TrimLeft();
+            CString filename = RunWord(rest);
+            if (filename.IsEmpty()) return;
+            if (!cw->m_cwBmp) { Show(w, L"* /drawsave: " + name + L" has nothing drawn on it yet", cPart); return; }   // previously a silent no-op -- which left no file on disk and no error, so a later /drawpic loading that path would fail with no clue why this was the actual cause
+            int st = 0;
+            bool ok = SaveBitmapAsBmpFile(cw->m_cwBmp, cw->m_cwBmpW, cw->m_cwBmpH, filename, &st);
+            // Under DEBUGGING, always report the outcome (not just on failure) plus whether the file is actually
+            // sitting on disk afterward, with its byte size -- useful when GDI+ reports Ok but the file still
+            // isn't where a later /drawpic looks for it. Normally (DEBUGGING off) this only speaks up on failure,
+            // same as every other /drawXXX command here -- a successful save is silent, matching real mIRC.
+#if DEBUGGING
+            DWORD attr = ::GetFileAttributesW(filename);
+            bool existsOnDisk = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+            __int64 sizeOnDisk = -1;
+            if (existsOnDisk) { WIN32_FILE_ATTRIBUTE_DATA fad; if (::GetFileAttributesExW(filename, GetFileExInfoStandard, &fad)) sizeOnDisk = ((__int64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow; }
+            CString diag; diag.Format(L"* /drawsave: %s -> %s [Save()=%d, ok=%d, existsOnDisk=%d, size=%lld]",
+                (LPCWSTR)name, (LPCWSTR)filename, st, ok ? 1 : 0, existsOnDisk ? 1 : 0, sizeOnDisk);
+            Show(w, diag, cPart);
+#else
+            if (!ok) Show(w, L"* /drawsave: couldn't save " + filename, cPart);
+#endif
+        }
+        // /drawscroll, /drawreplace, /drawrotate etc. aren't implemented -- silently accepted rather than falling
+        // through to the raw-server catch-all (see the original comment this whole block replaced).
     }
     static void CwSort(CChatWnd* cw) {   // -s: keeps m_cwLines (and the parallel color array) sorted together
         std::vector<size_t> order(cw->m_cwLines.size()); for (size_t i = 0; i < order.size(); i++) order[i] = i;
@@ -13559,7 +14451,10 @@ class CMainFrame : public CMDIFrameWnd {
             bool wild = tname.Find(L'?') >= 0 || tname.Find(L'*') >= 0;
             size_t before = m_timers.size();
             m_timers.erase(std::remove_if(m_timers.begin(), m_timers.end(), [&](const TimerInfo& t) { return wild ? GlobMatch(tname, t.name) : t.name.CompareNoCase(tname) == 0; }), m_timers.end());
-            Show(w, before == m_timers.size() ? L"* No matching timer: " + tname : L"* Timer(s) turned off: " + tname, before == m_timers.size() ? cPart : cInfo);
+            // Real mIRC says nothing when "/timerName off" matches nothing -- scripts routinely call this
+            // defensively on cleanup (stop a timer that may never have been started), and an error here for that
+            // completely ordinary case was pure noise, not a sign anything was actually wrong.
+            if (before != m_timers.size() && !m_silentCmd) Show(w, L"* Timer(s) turned off: " + tname, cInfo);
             return;
         }
         if (pFlag || PFlag || rFlagSw) {   // pause / hold / resume an existing timer -- no reps/interval/command needed for this
@@ -13595,6 +14490,17 @@ class CMainFrame : public CMDIFrameWnd {
         t.totalReps = _wtoi(repsStr); t.repsLeft = t.totalReps;
         t.intervalSec = t.msMode ? intervalVal / 1000.0 : intervalVal;
         t.command = TimerPreEval(w, command);
+        {   // Temporary diagnostic: chasing a "*: " raw line that floods Send() with runStack=[] (so it's not
+            // coming from inside any alias call) -- Tetris's own self-rescheduling ".timerTetris -h 1 <$iif expr>
+            // Tetris:Play" is the only timer this script creates, and it recreates itself on every single tick, so
+            // if ITS stored command or interval is somehow getting corrupted at creation time, this is where to
+            // catch it before guessing any further.
+#if DEBUGGING
+            CString diag; diag.Format(L"* [timer-create] tname=\"%s\" arg=\"%s\" repsStr=\"%s\" intervalStr=\"%s\" command=\"%s\" t.command=\"%s\"",
+                (LPCWSTR)tname, (LPCWSTR)arg, (LPCWSTR)repsStr, (LPCWSTR)intervalStr, (LPCWSTR)command, (LPCWSTR)t.command);
+            Show(w, diag, cPart);
+#endif
+        }
         ULONGLONG startDelayMs = 0;
         if (isClock) {
             int hh = 0, mm = 0, ss = 0; int c1 = timeStr.Find(L':');
@@ -13609,7 +14515,7 @@ class CMainFrame : public CMDIFrameWnd {
         m_timers.push_back(t);
         m_ltimer = tname;
         StartTimerTickIfNeeded();
-        Show(w, L"* Timer" + tname + L" activated.", cInfo);
+        if (!m_silentCmd) Show(w, L"* Timer" + tname + L" activated.", cInfo);
     }
     void CmdTimers(CChatWnd* w, CString arg) {
         arg.Trim(); CString a = arg; a.MakeLower();
@@ -13622,13 +14528,36 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_timers.empty()) { if (m_timerTickId) { KillTimer(m_timerTickId); m_timerTickId = 0; } return; }
         ULONGLONG now = GetTickCount64();
         for (size_t i = 0; i < m_timers.size();) {
-            TimerInfo& t = m_timers[i];
-            if (!t.offline && t.net && !t.net->conn) { m_timers.erase(m_timers.begin() + i); continue; }   // online timer: its network disconnected
-            if (t.paused || t.haltCountdown || now < t.nextFire) { i++; continue; }
-            CChatWnd* fw = Find(t.net, t.winName); if (!fw) fw = t.net ? Status(t.net) : (m_w.empty() ? nullptr : m_w.begin()->second);
-            if (fw) { m_ctimer = t.name; RunScript(fw, std::vector<CString>{ t.command }, CString()); m_ctimer.Empty(); }
-            if (t.totalReps > 0 && --t.repsLeft <= 0) { m_timers.erase(m_timers.begin() + i); continue; }
-            t.nextFire = t.catchUp ? t.nextFire + (ULONGLONG)(t.intervalSec * 1000) : now + (ULONGLONG)(t.intervalSec * 1000);
+            // Copy the timer's data out BY VALUE before running its command: this used to hold a live `TimerInfo&`
+            // into m_timers across the RunScript call below and kept using it afterward (reps/nextFire updates).
+            // That's only safe if nothing the fired command does can touch m_timers itself -- but a self-
+            // rescheduling timer (exactly what Tetris's own gravity tick is: ".timerTetris -h 1 <interval>
+            // Tetris:Play", recreated via /timer on every single firing) calls CmdTimer from inside that very
+            // RunScript, which erases the old same-named entry and push_back()s a new one -- either of which can
+            // reallocate or shift the vector, leaving the held reference dangling. Reading/writing through it
+            // afterward (t.repsLeft, t.nextFire) was undefined behavior: a very plausible source of the random
+            // corruption actually observed during play (a garbled raw "*: " line reaching Send(), state that
+            // looked fine one tick and wrong the next).
+            TimerInfo cur = m_timers[i];
+            if (!cur.offline && cur.net && !cur.net->conn) { m_timers.erase(m_timers.begin() + i); continue; }   // online timer: its network disconnected
+            if (cur.paused || cur.haltCountdown || now < cur.nextFire) { i++; continue; }
+            CChatWnd* fw = Find(cur.net, cur.winName); if (!fw) fw = cur.net ? Status(cur.net) : (m_w.empty() ? nullptr : m_w.begin()->second);
+            if (fw) { m_ctimer = cur.name; RunScript(fw, std::vector<CString>{ cur.command }, CString()); m_ctimer.Empty(); }
+            // Re-find this timer by name rather than trusting any index/reference from before the script ran: it
+            // may have replaced itself (same name, a fresh TimerInfo -- Tetris:Play's own self-reschedule), been
+            // turned off outright, or m_timers may simply have been resized by unrelated timers' own add/remove.
+            size_t idx = m_timers.size();
+            for (size_t k = 0; k < m_timers.size(); k++) if (m_timers[k].name.CompareNoCase(cur.name) == 0) { idx = k; break; }
+            if (idx == m_timers.size()) continue;   // gone (removed, or replaced and then removed again) -- nothing left to step; re-check i<size() at the loop top
+            TimerInfo& t2 = m_timers[idx];
+            // Only step reps/reschedule when this is still the SAME timer instance that just fired (cheap identity
+            // check via its own schedule/rep fields): if the fired command already replaced it with a fresh
+            // /timer call, that fresh instance's reps/schedule are exactly what the script wanted, and stepping
+            // them again here would consume a rep it never actually used.
+            if (t2.nextFire == cur.nextFire && t2.totalReps == cur.totalReps && t2.repsLeft == cur.repsLeft && t2.command == cur.command) {
+                if (t2.totalReps > 0 && --t2.repsLeft <= 0) { m_timers.erase(m_timers.begin() + idx); continue; }
+                t2.nextFire = t2.catchUp ? t2.nextFire + (ULONGLONG)(t2.intervalSec * 1000) : now + (ULONGLONG)(t2.intervalSec * 1000);
+            }
             i++;
         }
         if (m_timers.empty() && m_timerTickId) { KillTimer(m_timerTickId); m_timerTickId = 0; }
@@ -13901,7 +14830,7 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileString(L"Conn", L"Real", m_defOpts.real); a->WriteProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         a->WriteProfileInt(L"Conn", L"TLS", m_defOpts.tls); a->WriteProfileInt(L"Conn", L"Lax", m_defOpts.lax);
     }
-    void LoadBookmarks() {   // servers.ini is separate from MiniIRC.ini — a plain bookmark list, not app settings
+    void LoadBookmarks() {   // servers.ini is separate from MiniIRC.ini ï¿½ a plain bookmark list, not app settings
         m_bookmarks.clear();
         CString path = IniPath(L"servers.ini");
         int n = GetPrivateProfileIntW(L"Servers", L"Count", 0, path);
@@ -14252,7 +15181,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     afx_msg void OnInitMenuPopup(CMenu* pMenu, UINT nIndex, BOOL bSysMenu) {
         // CFrameWnd's default handling here auto-disables any item whose command ID has no ON_COMMAND
-        // handler in the message map — and it does this for ANY popup shown while we're the owner, not
+        // handler in the message map ï¿½ and it does this for ANY popup shown while we're the owner, not
         // just our own menu bar. Our switchbar context menus use raw ids read via TPM_RETURNCMD, with no
         // ON_COMMAND registered for them on purpose, so the default handling was silently greying every
         // item out (invisible-looking since we never called EnableMenuItem ourselves) right before display.
@@ -14576,7 +15505,7 @@ public:
         if (!m_sw.m_hWnd) AfxMessageBox(L"Switchbar creation failed");
         RecalcLayout(); LayoutBars(); SetTimer(1, 500, nullptr);
         PostMessage(WM_COMMAND, IDM_CONNECT);
-        Net* net = NewNet();   // an idle, disconnected network with just a Status window — lets local commands
+        Net* net = NewNet();   // an idle, disconnected network with just a Status window ï¿½ lets local commands
         Status(net);           // (/clear, testing the UI, etc.) be tried without ever connecting anywhere
         Note(net, L"IRC ready. Not connected use File > Connect, the toolbar, or /server [-m] host [+port] to connect. "
              L"Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
@@ -14590,7 +15519,8 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_MESSAGE(WM_APP + 51, OnIdentdRequest)
     ON_MESSAGE(WM_APP + 52, OnTrayNotify)
     ON_MESSAGE(WM_APP + 53, OnDccPumpMsg)
-    ON_COMMAND(IDM_CONNECT, OnConnectDlg) 
+    ON_MESSAGE(WM_APP + 54, OnDeferredDeleteWnd)
+    ON_COMMAND(IDM_CONNECT, OnConnectDlg)
     ON_COMMAND(IDM_DISCONNECT, OnDisconnect)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 

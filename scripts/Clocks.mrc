@@ -1,7 +1,8 @@
 on *:connect:{ /timertitlebar 0 1 title.update } 
 alias title.update { titlebar - $time(m-d-yyyy h:nn:ss tt) }
-
-
+alias edittest {
+/echo editing should work!!!!
+}
 alias gmttime {
   var %i = $calc($asctime(hh) $iif(- isin $calc($ctime - $gmt), +, -) $remove($duration($remove($calc($ctime - $gmt), -)), hr, s))
   ; The main mathematical procedure which calculates the time. May return a negative.
@@ -10,24 +11,17 @@ alias gmttime {
   else { return $calc(12 + %i) $+ $asctime(:nn:ss) AM }
   ; But id the time is greater than 12 hours, return ##:##:## AM
 }
-
-
 alias gmtt {
   if ($prop == text)  { return $asctime($calc($$1 - (($asctime(z) - $$2) * 3600)),$iif($3- == $null,ddd mmm dd yyyy hh:nn:ss.tt,$3-)) }
   else { return $calc($$1 - (($asctime(z) - $$2) * 3600)) }
 }
-
-
-
 alias Time2 { dialog -m Time Time }
-
 dialog Time {
   size -1 -1 330 200
   title "-= World Time =-"
   option dbu
   button "OK",1, 150 180 60 10, OK
   box "-= World Time =-",2, 5 5 320 190
-
   Text "-[Central America]-",3, 10 21 140 14
   edit "",4, 60 19 100 10, read, multi
   Text "-[Perth]-",5, 10 32 140 14
@@ -81,7 +75,6 @@ dialog Time {
   Text "-[Bangkok, Jakarta]-",55, 170 158 140 14
   edit "",56, 220 155 100 10, read, multi
 }
-
 on *:DIALOG:Time:*:*:{
   if ($devent == INIT) {
     did -ra time 6 $gmtoff(+8)
@@ -112,14 +105,10 @@ on *:DIALOG:Time:*:*:{
     did -ra time 54 $gmtoff(+13)
   }
 }
-
-
-
-menu channel,query,status,menubar { 
+menu channel,nicklist,query,status,menubar { 
   -
   -= Mouse Clocks =-
   .-= World Time =-:/Time2 
-
   .Mouse Bar:{
     /say 11,1       < :3   $asctime(h:nn tt)        )~~~          
   }
@@ -131,7 +120,6 @@ menu channel,query,status,menubar {
     /say 1,1....9 $asctime(h:nn tt) 1=======
     /say 1,1!!=8MouSeY TiMe1!!!==
   }
-
   .RATFINK: {
     /say 1,1=9RATFINK15_1===15_1==9TIME1==
     /say 1,1====15\|/(_)_(_)\|/1====
@@ -143,9 +131,13 @@ menu channel,query,status,menubar {
     /say 1,1=======15_\1===15/_1=======
     /say 1,1======9 $asctime(h:nn tt) 1======
   }
-
-  .Mousey Runs:/me 0,0...14(\"/)```~. | /me 0,0... 11o o 14(..( )_____ | /me 0,0...14->13ö14<- ~ "~ | /me 0,0.....4,1 $asctime(h:nn tt) | /me 11,5!12!13!8mousey Time12!13!11!
-
+  .Mousey Runs: {
+    /me 0,0...14(\"/)```~. 
+    /me 0,0... 11o o 14(..( )_____
+    /me 0,0...14->13ö14<- ~ "~
+    /me 0,0.....4,1 $asctime(h:nn tt)
+    /me 11,5!12!13!8mousey Time12!13!11!
+  }
   .bear-like: {
     /say 1,1T==15()__()1==C
     /say 1,1i15(\( 12oo 15)1==l
@@ -154,7 +146,6 @@ menu channel,query,status,menubar {
     /say 1,1o.=15Q/~~\Q1==k
     /say 1,1==9 $asctime(h:nn tt) 1=
   }
-
   .mousey: {
     /say 12,12                     
     /say 12,12  1,1                 12,12  
@@ -164,7 +155,6 @@ menu channel,query,status,menubar {
     /say 12,12  1,1....4,1 $asctime(h:nn tt)    12,12  
     /say 12,12  11,1!12!13!8mousey Time12!13!11!12,12  
     /say 12,12                     
-
   }
   .mousey2: {
     /say 10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»
@@ -175,9 +165,7 @@ menu channel,query,status,menubar {
     /say 6,6.13,13.1,1......9 $asctime(h:nn tt) 1====13,13.6,6.
     /say 6,6.13,13.1,1!!===8MouSeY TiMe1!!!=13,13.6,6.
     /say 10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»10,6«11,13®10,6»
-
   }
-
   .Mouse1:{
     /say 1,1------15_1----15_1TiMBoClo
     /say 1,1-----15(13o15)__(13o15)1-----ck
@@ -187,9 +175,7 @@ menu channel,query,status,menubar {
     /say 1,1-----15m8(____)15m__)1---=
     /say 1,1---=================
     /say 1,1---=9 $asctime(h:nn tt) 1======
-
   }
-
   .-= cute clocks =- 
   ..Bedtime
   ...bedtime {
@@ -560,7 +546,7 @@ menu channel,query,status,menubar {
     say 1,1.....15==0_13Y0_15==1--------
     say 1,1......0/`-'\1---------
     say 1,1...0()9 $asctime(h:nn tt) 0()1----
-    say 1,1.....0(_)1__0(_),··,·*
+    say 1,1.....0(_)1__0(_),·
     say 1,1---4!!!My Time!!!1----
   } 
   ...Lioness: {
@@ -758,7 +744,7 @@ menu channel,query,status,menubar {
   ...Froggytime:/me 0,0----------5@..@ | /me 0,0--------3(------) | /me 0,0-----3_«(4,1 $asctime(h:nn tt)       3)»_ | /me 0,0------12^^^~~~~~~^^^ | /me 0,0....11,8!12!13!12Froggy Time12!13!11!
   ...tweety time:/me 0,0......4\|/ | /me 0,0.....8/^ ^\ | /me 0,0.....8\110 08/ | /me 0,0.....8(7'V'8) | /me 0,0......8\ / | /me 0,0..8/(4,1 $asctime(h:nn tt) 8)\ | /me 0,0...5==8/\5=8/\5== | /me 11,5!12!13!8Tweety Time12!13!11
   ...hoot time:/me 0,0....7/\_/\ | /me 0,0...7((12@7v12@7)) | /me 0,0...7()5:::7() | /me 0,0.7(4,1 $asctime(h:nn tt) 7) | /me 0,0....5VV-VV | /me 11,5!12!13!8Hoot Time12!13!11
-  ...kitty time:/me 0,0....5/\_/\ | /me 0,0...5( 12o o 5) | /me 0,0...14==5_13Y5_14== | /me 0,0....5/`-'\ | /me 0,0.5()4,1 $asctime(h:nn tt) 5() | /me 0,0...5(_)__(_),··,·* | /me 11,5!12!13!8Hoot Time12!13!11
+  ...kitty time:/me 0,0....5/\_/\ | /me 0,0...5( 12o o 5) | /me 0,0...14==5_13Y5_14== | /me 0,0....5/`-'\ | /me 0,0.5()4,1 $asctime(h:nn tt) 5() | /me 0,0...5(_)__(_),·
   ...puppytime:/say 0,0.....5,,,,, | /say 0,0.. 5/))'''((\ | /say 0,0..5{.))12o o5((.} | /say 0,0.. 5\)(_o_)(/ | /say 0,05()4,1 $asctime(h:nn tt) 5() | /say 0,0..5(_).....(_) | /say 11,5!12!13!8Puppy Time12!13!11!
   ...tunatime:/me 1,1----------9,1------ | /me 1,1-------4.:/1------- | /me 1,1----12,,///;,   ,;/1-- | /me 1,1--13o)::::::;;///1-- | /me 1,1---11>4,1 $asctime(h:nn tt)  11\\\1 | /me 1,1---8''\\\\\'" ';\1- | /me 1,1-----9';\_/1------- | /me 1,1.11,9!12!13!12Tuna Time12!13!11! 
   ...bull time:/say 0,0...7,/0.........7\, | /say 0,0..7((__,-"""-,__)) | /say 0,0...7`--5)~0...5~(7--` | /say 0,0...5,-´(0.....5)`-, | /say 0,0..5`~~`d\0...5/b`~~` | /say 0,0......5(0.....5) | /say 0,0......5(8ö5___8ö5) | /say 0,0.......5`---` | /say 0,0.....4,1 $asctime(h:nn tt) | /say 0,0.11,5!12!13!8Bullsht Time12!13!11
@@ -770,16 +756,16 @@ menu channel,query,status,menubar {
   ...puppytime:/say 0,0.....5,,,,, | /say 0,0.. 5/))'''((\ | /say 0,0..5{.))12o o5((.} | /say 0,0.. 5\)(_o_)(/ | /say 0,05()4,1 $asctime(h:nn tt) 5() | /say 0,0..5(_).....(_) | /say 11,5!12!13!8Puppy Time12!13!11!
   ...tunatime:/me 1,1----------9,1------ | /me 1,1-------4.:/1------- | /me 1,1----12,,///;,   ,;/1-- | /me 1,1--13o)::::::;;///1-- | /me 1,1---11>4,1 $asctime(h:nn tt)  11\\\1 | /me 1,1---8''\\\\\'" ';\1- | /me 1,1-----9';\_/1------- | /me 1,1.11,9!12!13!12Tuna Time12!13!11! 
   ...OwlTime {
-    /say 0,1
+    /say 0,1
     /say 1,01,1-9,1Party Time!1,1-1,0
-    /say 0,1
+    /say 0,1
     /say 1,01,1Sher^0,_,1Silly1,0
     /say 1,01,1....0(4¤0v4¤0)1....1,0
     /say 1,01,1...0~{`-´}~1...1,0
     /say 1,00,1----`"-"´----1,0
-    /say 0,1
+    /say 0,1
     /say 1,01,1-9 $asctime(h:nn tt) 1-§1,0
-    /say 0,1
+    /say 0,1
     /say 1¯¯¯¯¯0§1 ¯¯¯¯
   }
   ..COLOR CLOCKS
@@ -801,7 +787,6 @@ menu channel,query,status,menubar {
     say 0,0. 04,6/14,14 $day $adate $asctime(h:nn tt) 4,6\
     halt
   }
-
   .-= more cute clocks =- 
   ..Magical
   ...Wizard1 {
@@ -1016,7 +1001,6 @@ menu channel,query,status,menubar {
     say 1,1===5~1=7`4v7'1=5~1==9 $asctime(h:nn tt) 1=
     say 1,1===artist unknown ====   
   } 
-
   ..girlie {
     say 1,1=====1Time to1=====
     say 1,1=T==7//1=5@@@1=7\\1====
@@ -1074,8 +1058,6 @@ menu channel,query,status,menubar {
     say 15,15---5~`4U5´~15=12Tired15=
     say 15,15==9,1 $asctime(h:nn tt) 15,15====
   }
-
-
   ..Elmo: {
     say 1,1--13Elmo1-13sez1-13its1--
     say 1,1-----0(.)(.)1-----
@@ -1125,7 +1107,6 @@ menu channel,query,status,menubar {
     say 1,1=====8 $asctime(h:nn tt) 1=======
     halt
   }
-
   ..Frogs
   ...frog1: {
     say 8,1 $asctime(h:nn tt) 1.
@@ -1157,8 +1138,6 @@ menu channel,query,status,menubar {
     say   1,1--9^^^~~~~~~^^^1---
     say   4,1!!!Froggy Time!!!
   }
-
-
   ..Cats
   ...Cat1:{
     say 1,1==12Kitty1TiMBo Clock14_1===
@@ -1176,7 +1155,7 @@ menu channel,query,status,menubar {
     say 1,1.....15==0_13Y0_15==1--------
     say 1,1......0/`-'\1---------
     say 1,1...0()9 $asctime(h:nn tt) 0()1----
-    say 1,1.....0(_)1__0(_),··,·*
+    say 1,1.....0(_)1__0(_),·
     say 1,1--4!!!Sheba Time!!!1--
   } 
   ...Lioness: {
@@ -1206,7 +1185,6 @@ menu channel,query,status,menubar {
     say 1,1..7(_).....7(_)1---
     say 4,1!!!Auggy Time!!!
   }
-
   ..bull time:{
     say 1,1...7,/0.........7\,
     say 1,1..7((__,-"""-,__)) 
@@ -1307,7 +1285,6 @@ menu channel,query,status,menubar {
   ..pig time:/say 1,1....13§,----.,_ | /say 1,1....13/0......13' 1"13_ | /say 1,1....13(0..13)___( ,_@ | /say 1,1.....13}/!0...13}{ | /say 1,1...1""0....1"" | /say 1,1.....4,1 $asctime(h:nn tt) | /say 1,1.11,5!12!13!8Piggy Time12!13!11
   ..foxxy time:/say 1,1.....5(\___/) | /say 1,1.....5/0.....5\ | /say 1,1....5/_,10ò ó5,_\ | /say 1,1.......5\13ö5/ | /say 1,1.....4,1 $asctime(h:nn tt) | /say 1,1.11,5!12!13!8Foxxy Time12!13!11
   ..Lego Clock:/say 12,12xx0,12 Here in Siletz, Oregon it's12,12xxx | /say 12,12xxx11,4 $day   ___ $adate  12,12xxx | /say 12,12xxx11,4 $asctime(h:nn tt)         __ PST4,4xx12,12xxx | /say 12,12xxxxxx0,12 © LEGO 1997   12,12xxxxxxxx
-
   ..mousey:{
     say 1,1TiMBo Clock=====----
     say 1,1...14(\"/)```~.1=======
@@ -1327,9 +1304,6 @@ menu channel,query,status,menubar {
     halt
   }
   ..Lego Clock:/say 12,12xx0,12 Here in Siletz, Oregon it's12,12xxx | /say 12,12xxx11,4 $day   ___ $adate  12,12xxx | /say 12,12xxx11,4 $asctime(h:nn tt)         __ PST4,4xx12,12xxx | /say 12,12xxxxxx0,12 © LEGO 1997   12,12xxxxxxxx
-
-
-
   ..Foxxy2:{
     __/)1.....
     say 1,1.....14/1.....14\1=====
@@ -1413,14 +1387,10 @@ menu channel,query,status,menubar {
     say 1,1==9 $asctime(h:nn tt) 1===
     halt
   }
-
 }
-
-
 alias alltime { 
   /time a*
   /time b*
   /time e*
   /time m*
-
 }
