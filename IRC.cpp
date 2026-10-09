@@ -818,7 +818,7 @@ public:
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
 enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_LOCALSETTINGS, IDM_DCCOPTIONS, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
-    IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT, IDM_URLLIST,
+    IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT, IDM_URLLIST, IDM_PROXY,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX, IDC_ANICK };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -1632,12 +1632,145 @@ public:
         m_banner.SetBitmap((HBITMAP)m_aboutBmp);
     }
 };
+static bool LooksLikeIpv4(const CString& s);   // forward declaration -- full definition is later in the file, CProxyTunnel::BuildSocks4Request just below needs it first
+
+// GetAddrInfoW(AF_UNSPEC) is free to list a host's IPv6 address(es) before its IPv4 one(s), and on a network where
+// that IPv6 route is actually dead (advertised but not really reachable -- common enough with some ISPs/routers),
+// blindly connecting to whatever comes first means sitting through a full ~20s TCP connect timeout before the
+// caller even finds out. Both of this file's ConnectSmart()s call this right after a successful GetAddrInfoW to
+// pick the first IPv4 entry when there is one, and fall back to the list's own first entry (IPv6 or otherwise)
+// only when no IPv4 entry exists at all. This isn't full "happy eyeballs" (no racing multiple candidates in
+// parallel), just skipping the single most common real-world trap.
+static PADDRINFOW PreferIPv4(PADDRINFOW list) {
+    for (PADDRINFOW p = list; p; p = p->ai_next) if (p->ai_family == AF_INET) return p;
+    return list;
+}
+
+// ---------------- Proxy tunneling (File > Proxy: Socks4[a]/Socks5/HTTP CONNECT) -- a small state machine shared by
+// CIrcSock (server connections) and CDccSock (connecting out to accept an incoming DCC offer). The caller is
+// expected to already have a plain, connected TCP socket to the PROXY itself (an ordinary CAsyncSocket OnConnect);
+// this only negotiates the tunnel to the real target host:port over that same socket from there. Usage: set proto/
+// user/pass/targetHost/targetPort, call Start() once the proxy TCP connection is up and send its returned bytes,
+// then call Feed() with every byte received afterward until Done() -- if Feed() also returns non-empty bytes in
+// 'toSend', those need to go out too (used only by SOCKS5's optional auth step and its own two-step request). Ok()
+// says whether the tunnel actually came up once Done() is true; if not, the caller should just Close() the socket,
+// the same as a plain connect failure.
+enum class ProxyProto { None = 0, Socks4 = 1, Socks5 = 2, Http = 3 };
+class CProxyTunnel {
+public:
+    ProxyProto proto = ProxyProto::None;
+    CString user, pass, targetHost; UINT targetPort = 0;
+    bool Done() const { return done; }
+    bool Ok() const { return ok; }
+    std::string Start() {
+        phase = 0; done = false; ok = false; buf.clear();
+        if (proto == ProxyProto::Socks4) { phase = 1; return BuildSocks4Request(); }
+        if (proto == ProxyProto::Socks5) {
+            phase = 2;
+            std::string r; r += '\x05';
+            bool haveAuth = !user.IsEmpty();
+            r += (char)(haveAuth ? 2 : 1); r += '\x00'; if (haveAuth) r += '\x02';
+            return r;
+        }
+        if (proto == ProxyProto::Http) {
+            phase = 5;
+            CStringA host = CW2A(targetHost, CP_UTF8), authLine;
+            if (!user.IsEmpty()) {
+                CStringA cred; cred.Format("%s:%s", (LPCSTR)CStringA(CW2A(user, CP_UTF8)), (LPCSTR)CStringA(CW2A(pass, CP_UTF8)));
+                DWORD outLen = 0;
+                CryptBinaryToStringA((const BYTE*)(LPCSTR)cred, cred.GetLength(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &outLen);
+                std::vector<char> enc(outLen + 1, 0);
+                CryptBinaryToStringA((const BYTE*)(LPCSTR)cred, cred.GetLength(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, enc.data(), &outLen);
+                authLine.Format("Proxy-Authorization: Basic %s\r\n", enc.data());
+            }
+            CStringA req; req.Format("CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n%sProxy-Connection: Keep-Alive\r\n\r\n",
+                (LPCSTR)host, targetPort, (LPCSTR)host, targetPort, (LPCSTR)authLine);
+            return std::string((LPCSTR)req, req.GetLength());
+        }
+        done = true; ok = true; return std::string();   // ProxyProto::None -- callers shouldn't reach here (they only use this class when a proxy is actually configured), but fail "already there" rather than "failed" just in case
+    }
+    bool Feed(const char* data, int len, std::string& toSend) {
+        buf.append(data, len); toSend.clear();
+        switch (phase) {
+        case 1:   // SOCKS4[a]: fixed 8-byte reply
+            if (buf.size() < 8) return false;
+            done = true; ok = ((BYTE)buf[1] == 0x5A); return true;
+        case 2: {   // SOCKS5: 2-byte method-selection reply
+            if (buf.size() < 2) return false;
+            BYTE method = (BYTE)buf[1]; buf.erase(0, 2);
+            if (method == 0x02) {
+                CStringA u = CW2A(user, CP_UTF8), p = CW2A(pass, CP_UTF8);
+                std::string r; r += '\x01'; r += (char)u.GetLength(); r.append((LPCSTR)u, u.GetLength());
+                r += (char)p.GetLength(); r.append((LPCSTR)p, p.GetLength());
+                toSend = r; phase = 3; return false;
+            }
+            if (method == 0x00) { toSend = BuildSocks5ConnectRequest(); phase = 4; return false; }
+            done = true; ok = false; return true;   // 0xFF (no acceptable method) or something this client doesn't speak
+        }
+        case 3:   // SOCKS5: 2-byte username/password auth-result reply
+            if (buf.size() < 2) return false;
+            if ((BYTE)buf[1] != 0x00) { done = true; ok = false; return true; }
+            buf.erase(0, 2); toSend = BuildSocks5ConnectRequest(); phase = 4; return false;
+        case 4: {   // SOCKS5: variable-length CONNECT reply (length depends on its address type)
+            if (buf.size() < 4) return false;
+            BYTE atyp = (BYTE)buf[3]; size_t addrLen;
+            if (atyp == 0x01) addrLen = 4;
+            else if (atyp == 0x04) addrLen = 16;
+            else if (atyp == 0x03) { if (buf.size() < 5) return false; addrLen = 1 + (BYTE)buf[4]; }
+            else { done = true; ok = false; return true; }
+            if (buf.size() < 4 + addrLen + 2) return false;
+            done = true; ok = ((BYTE)buf[1] == 0x00); return true;
+        }
+        case 5: {   // HTTP CONNECT: wait for the blank line ending the response headers
+            size_t p = buf.find("\r\n\r\n");
+            if (p == std::string::npos) return false;
+            CStringA status(buf.substr(0, buf.find("\r\n")).c_str());
+            done = true; ok = (status.Find(" 200") >= 0);   // "HTTP/1.1 200 Connection established" et al
+            return true;
+        }
+        }
+        done = true; ok = false; return true;
+    }
+private:
+    int phase = 0; bool done = false, ok = false; std::string buf;
+    std::string BuildSocks4Request() {
+        std::string r; r += '\x04'; r += '\x01';
+        r += (char)((targetPort >> 8) & 0xFF); r += (char)(targetPort & 0xFF);
+        BYTE ipBytes[4] = { 0, 0, 0, 1 };   // SOCKS4A "invalid IP" marker (0.0.0.x, x != 0) -- the default, overwritten below if a real IPv4 is found
+        bool useSocks4a = true;
+        if (LooksLikeIpv4(targetHost)) {
+            DWORD ipBE = ::inet_addr(CStringA(CW2A(targetHost, CP_UTF8)));
+            if (ipBE != INADDR_NONE) { memcpy(ipBytes, &ipBE, 4); useSocks4a = false; }
+        }
+        if (useSocks4a) {
+            ADDRINFOW hints = {}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+            PADDRINFOW res = nullptr;
+            if (::GetAddrInfoW(targetHost, nullptr, &hints, &res) == 0 && res) {
+                memcpy(ipBytes, &((sockaddr_in*)res->ai_addr)->sin_addr, 4); useSocks4a = false; ::FreeAddrInfoW(res);
+            }
+        }
+        r += (char)ipBytes[0]; r += (char)ipBytes[1]; r += (char)ipBytes[2]; r += (char)ipBytes[3];
+        CStringA userA = CW2A(user, CP_UTF8);
+        if (!userA.IsEmpty()) r.append((LPCSTR)userA, userA.GetLength());
+        r += '\x00';
+        if (useSocks4a) { CStringA h = CW2A(targetHost, CP_UTF8); r.append((LPCSTR)h, h.GetLength()); r += '\x00'; }
+        return r;
+    }
+    std::string BuildSocks5ConnectRequest() {
+        std::string r; r += '\x05'; r += '\x01'; r += '\x00'; r += '\x03';
+        CStringA h = CW2A(targetHost, CP_UTF8); r += (char)h.GetLength(); r.append((LPCSTR)h, h.GetLength());
+        r += (char)((targetPort >> 8) & 0xFF); r += (char)(targetPort & 0xFF);
+        return r;
+    }
+};
+
 // ---------------- Socket: line-buffered, UTF-8, optional TLS ----------------
 class CIrcSock : public CAsyncSocket {
 public:
     std::function<void(int)> onConn;
     std::function<void(const CString&)> onLine;
     std::function<void()> onDrop;
+    CProxyTunnel px;   // File > Proxy -- see CProxyTunnel; proto stays None when a proxy isn't configured/doesn't apply to this connection, in which case this is all a no-op
     CStringA buf; CTls* tls = nullptr; std::string sendq;
     ~CIrcSock() { delete tls; }
     void Queue(const std::string& x) { sendq += x; Flush(); }
@@ -1660,26 +1793,50 @@ public:
         CString portStr; portStr.Format(L"%u", port);
         PADDRINFOW result = nullptr;
         if (::GetAddrInfoW(host, portStr, &hints, &result) != 0 || !result) return false;
+        PADDRINFOW use = PreferIPv4(result);
         if (m_hSocket != INVALID_SOCKET) Close();
         bool ok = false;
-        SOCKET s = ::socket(result->ai_family, SOCK_STREAM, IPPROTO_TCP);   // created manually with the resolved family, since CAsyncSocket::Create itself has no family parameter to pick IPv6 with
+        SOCKET s = ::socket(use->ai_family, SOCK_STREAM, IPPROTO_TCP);   // created manually with the resolved family, since CAsyncSocket::Create itself has no family parameter to pick IPv6 with
         if (s != INVALID_SOCKET) {
             if (Attach(s, FD_READ | FD_WRITE | FD_OOB | FD_ACCEPT | FD_CONNECT | FD_CLOSE)) {   // Attach wires up the same async notifications Create would have, and puts the socket in non-blocking mode as a side effect
-                int rc = ::connect(m_hSocket, result->ai_addr, (int)result->ai_addrlen);
+                int rc = ::connect(m_hSocket, use->ai_addr, (int)use->ai_addrlen);
                 ok = (rc == 0) || (::WSAGetLastError() == WSAEWOULDBLOCK);
             } else ::closesocket(s);
         }
         ::FreeAddrInfoW(result);
         return ok;
     }
+    static const int PROXY_FAIL = -1;   // a sentinel 'e' value for onConn, distinct from any real WSA error code (always positive), so WireNet's failure message can tell a proxy handshake failure apart from a plain/TLS connect failure
     void OnConnect(int e) override {
-        if (e || !tls) { if (onConn) onConn(e); return; }
+        if (e) { if (onConn) onConn(e); return; }
+        if (px.proto != ProxyProto::None) {   // the TCP connect that just finished was to the PROXY, not the real target -- negotiate the tunnel to it before anything IRC/TLS-related happens
+            std::string first = px.Start();
+            if (px.Done()) { OnTunnelReady(); return; }   // ProxyProto::None safety path inside CProxyTunnel::Start() -- shouldn't normally be reached here
+            CAsyncSocket::Send(first.data(), (int)first.size());
+            return;
+        }
+        OnTunnelReady();
+    }
+    // Either there was no proxy to begin with, or the tunnel to the real target is now up: from here on this is
+    // exactly like a plain successful TCP connect always was (TLS ClientHello if requested, else onConn(0) right away).
+    void OnTunnelReady() {
+        if (!tls) { if (onConn) onConn(0); return; }
         if (!tls->Handshake()) { if (onConn) onConn((int)tls->lastStatus); return; }
         Queue(tls->tosend); tls->tosend.clear();          // send ClientHello; onConn fires when TLS is ready
     }
     void OnReceive(int) override {
         char b[16384]; int n = Receive(b, sizeof b);
         if (n <= 0) return;
+        if (px.proto != ProxyProto::None && !px.Done()) {
+            std::string toSend;
+            bool finished = px.Feed(b, n, toSend);
+            if (!toSend.empty()) CAsyncSocket::Send(toSend.data(), (int)toSend.size());
+            if (!finished) return;
+            if (!px.Ok()) { Close(); if (onConn) onConn(PROXY_FAIL); return; }
+            px.proto = ProxyProto::None;   // tunnel is up: stop routing further bytes through the proxy parser
+            OnTunnelReady();
+            return;
+        }
         std::string plain;
         if (tls) {
             tls->in.append(b, n);
@@ -1714,12 +1871,27 @@ public:
     std::function<void(const char*, int)> onData;   // raw bytes received
     std::function<void()> onClose;
     std::function<void()> onSend;                  // the socket is writable again -- DCC Send uses this to resume pushing file data after a partial/blocked write
-    void OnConnect(int e) override { if (onConnect) onConnect(e); }
+    CProxyTunnel px;   // File > Proxy, DCC/Both -- only set up when THIS socket is accepting a DCC offer (connecting out to the peer); a listening DCC socket never touches this, so it's a no-op there
+    void OnConnect(int e) override {
+        if (e || px.proto == ProxyProto::None) { if (onConnect) onConnect(e); return; }
+        std::string first = px.Start();
+        if (px.Done()) { if (onConnect) onConnect(0); return; }   // ProxyProto::None safety path inside CProxyTunnel::Start() -- shouldn't normally be reached here
+        CAsyncSocket::Send(first.data(), (int)first.size());
+    }
     void OnAccept(int) override { if (onAccept) onAccept(); }
     void OnReceive(int) override {
         char b[8192]; int n = Receive(b, sizeof b);
-        if (n > 0) { if (onData) onData(b, n); }
-        else if (onClose) onClose();
+        if (n <= 0) { if (onClose) onClose(); return; }
+        if (px.proto != ProxyProto::None && !px.Done()) {
+            std::string toSend;
+            bool finished = px.Feed(b, n, toSend);
+            if (!toSend.empty()) CAsyncSocket::Send(toSend.data(), (int)toSend.size());
+            if (!finished) return;
+            px.proto = ProxyProto::None;   // tunnel is up (or failed): stop routing further bytes through the proxy parser
+            if (onConnect) onConnect(px.Ok() ? 0 : -1);   // reuses the same "connect finished" contract the DCC code already expects, now reporting the TUNNEL's outcome instead of the raw TCP connect's
+            return;
+        }
+        if (onData) onData(b, n);
     }
     void OnSend(int) override { if (onSend) onSend(); }
     void OnClose(int) override { if (onClose) onClose(); }
@@ -5590,6 +5762,91 @@ BEGIN_MESSAGE_MAP(CLocalSettingsDlg, CDialog)
     ON_BN_CLICKED(909, OnHelpClick)
 END_MESSAGE_MAP()
 
+// ---------------- File > Proxy: Socks4[a]/Socks5/HTTP CONNECT, for Server connections, DCC (accepting an offer by
+// connecting out to the peer), or both -- see CProxyTunnel for the actual handshake, and CMainFrame's
+// m_proxyConnFor/m_proxyProto/ProxyAppliesTo*/ProxyExceptionMatches for how these fields get used. ----
+enum { IDC_PX_CONN = 701, IDC_PX_PROTO, IDC_PX_HOST, IDC_PX_USER, IDC_PX_PASS, IDC_PX_SHOWPASS, IDC_PX_PORT, IDC_PX_EXCEPT, IDC_PX_HELP };
+class CProxyDlg : public CDialog {
+    std::vector<WORD> t; int cnt = 0;
+    void W(DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); }
+    void S(const wchar_t* z) { do t.push_back(*z); while (*z++); }
+    void Item(DWORD st, int x, int y, int cx, int cy, WORD id, WORD cls, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
+    }
+public:
+    int connFor, proto; CString host, userId, pass, exceptions; UINT port;
+    CProxyDlg(CWnd* parent, int connForIn, int protoIn, const CString& hostIn, const CString& userIn, const CString& passIn, UINT portIn, const CString& exceptIn)
+        : connFor(connForIn), proto(protoIn), host(hostIn), userId(userIn), pass(passIn), exceptions(exceptIn), port(portIn) {
+        W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(230); t.push_back(222);
+        t.push_back(0); t.push_back(0); S(L"Proxy"); t.push_back(9); S(DEFAULT_FONT);
+
+        Item(SS_LEFT, 8, 8, 70, 10, 0xFFFF, 0x0082, L"Connection:");
+        Item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 82, 6, 140, 80, IDC_PX_CONN, 0x0085, L"");
+        Item(SS_LEFT, 8, 26, 70, 10, 0xFFFF, 0x0082, L"Protocol:");
+        Item(CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 82, 24, 140, 80, IDC_PX_PROTO, 0x0085, L"");
+
+        Item(SS_LEFT, 8, 46, 70, 10, 0xFFFF, 0x0082, L"Hostname:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 82, 44, 140, 12, IDC_PX_HOST, 0x0081, host);
+        Item(SS_LEFT, 8, 62, 70, 10, 0xFFFF, 0x0082, L"User ID:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 82, 60, 140, 12, IDC_PX_USER, 0x0081, userId);
+        Item(SS_LEFT, 8, 78, 70, 10, 0xFFFF, 0x0082, L"Password:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, 82, 76, 108, 12, IDC_PX_PASS, 0x0081, pass);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 194, 76, 28, 12, IDC_PX_SHOWPASS, 0x0080, L"Show");
+        Item(SS_LEFT, 8, 94, 70, 10, 0xFFFF, 0x0082, L"Port:");
+        Item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER, 82, 92, 60, 12, IDC_PX_PORT, 0x0081, L"");
+
+        Item(SS_LEFT, 8, 112, 150, 10, 0xFFFF, 0x0082, L"Exception masks:");
+        Item(WS_BORDER | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, 8, 124, 214, 60, IDC_PX_EXCEPT, 0x0081, exceptions);
+
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 24, 196, 58, 14, IDOK, 0x0080, L"OK");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 90, 196, 58, 14, IDCANCEL, 0x0080, L"Cancel");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 156, 196, 58, 14, IDC_PX_HELP, 0x0080, L"Help");
+
+        t[4] = (WORD)cnt;
+        InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
+    }
+    BOOL OnInitDialog() override {
+        CDialog::OnInitDialog();
+        const wchar_t* conns[] = { L"None", L"Server", L"DCC", L"Both" };
+        for (auto s : conns) SendDlgItemMessage(IDC_PX_CONN, CB_ADDSTRING, 0, (LPARAM)s);
+        SendDlgItemMessage(IDC_PX_CONN, CB_SETCURSEL, (connFor >= 0 && connFor <= 3) ? connFor : 0, 0);
+        const wchar_t* protos[] = { L"Socks4", L"Socks5", L"Proxy" };
+        for (auto s : protos) SendDlgItemMessage(IDC_PX_PROTO, CB_ADDSTRING, 0, (LPARAM)s);
+        SendDlgItemMessage(IDC_PX_PROTO, CB_SETCURSEL, (proto >= 0 && proto <= 2) ? proto : 1, 0);
+        SetDlgItemInt(IDC_PX_PORT, port, FALSE);
+        return TRUE;
+    }
+    afx_msg void OnShowPass() {
+        ((CEdit*)GetDlgItem(IDC_PX_PASS))->SetPasswordChar(IsDlgButtonChecked(IDC_PX_SHOWPASS) ? 0 : L'*');
+        GetDlgItem(IDC_PX_PASS)->Invalidate();
+    }
+    afx_msg void OnHelpBtn() {
+        AfxMessageBox(L"Routes this client's outgoing connections through a SOCKS4, SOCKS5, or HTTP (\"Proxy\") CONNECT proxy.\n\n"
+                      L"Connection: which kind of connection goes through the proxy -- Server (the IRC connection itself), "
+                      L"DCC (only accepting an incoming offer -- connecting out to a peer who offered you a DCC Chat/Send), "
+                      L"or Both.\n\nException masks: one wildcard host/IP mask per line that bypasses the proxy and connects "
+                      L"directly instead, e.g. *.lan or 192.168.*.", MB_ICONINFORMATION);
+    }
+    void OnOK() override {
+        connFor = (int)SendDlgItemMessage(IDC_PX_CONN, CB_GETCURSEL, 0, 0);
+        proto = (int)SendDlgItemMessage(IDC_PX_PROTO, CB_GETCURSEL, 0, 0);
+        GetDlgItemText(IDC_PX_HOST, host); GetDlgItemText(IDC_PX_USER, userId); GetDlgItemText(IDC_PX_PASS, pass);
+        GetDlgItemText(IDC_PX_EXCEPT, exceptions);
+        port = GetDlgItemInt(IDC_PX_PORT, nullptr, FALSE);
+        host.Trim(); userId.Trim();
+        if (connFor < 0) connFor = 0; if (proto < 0) proto = 1; if (port == 0) port = 1080;
+        CDialog::OnOK();
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CProxyDlg, CDialog)
+    ON_BN_CLICKED(IDC_PX_SHOWPASS, OnShowPass) ON_BN_CLICKED(IDC_PX_HELP, OnHelpBtn)
+END_MESSAGE_MAP()
+
 // ---------------- DCC Options: just the listen port range for now. A fixed range is what actually makes DCC
 // reachable across two separate networks -- without it, every offer listens on a random port, so there's nothing
 // consistent to forward through a router even if someone goes and sets up port forwarding. No custom button
@@ -6426,6 +6683,23 @@ class CMainFrame : public CMDIFrameWnd {
     std::shared_ptr<IdentdState> m_identdState;
     Net* m_identdTriggerNet = nullptr;   // which network's status window to report requests to, when started via "only when connecting"
     ULONGLONG m_identdAutoStopAt = 0;    // "only when connecting" fallback: stop even if no request ever arrives
+    // ---- File > Proxy: Socks4[a]/Socks5/HTTP CONNECT -- see CProxyTunnel (CIrcSock's net->sock.px) and the three
+    // DCC accept-connect sites (Connect() and DccChatConnectResult/DccSendConnectResult/DccGetConnectResult's
+    // callers) that actually use these. m_proxyConnFor: 0=None, 1=Server, 2=DCC, 3=Both. m_proxyProto (combo index):
+    // 0=Socks4, 1=Socks5, 2=Proxy (HTTP CONNECT) -- +1 maps it onto ProxyProto, which reserves 0 for None itself.
+    int m_proxyConnFor = 0, m_proxyProto = 1; CString m_proxyHost, m_proxyUser, m_proxyPass, m_proxyExceptions; UINT m_proxyPort = 1080;
+    bool ProxyAppliesToServer() const { return m_proxyConnFor == 1 || m_proxyConnFor == 3; }
+    bool ProxyAppliesToDcc() const { return m_proxyConnFor == 2 || m_proxyConnFor == 3; }
+    bool ProxyExceptionMatches(const CString& host) const {   // each line of m_proxyExceptions is a wildcard host/IP mask that bypasses the proxy, same spirit as every other mask list in this client (ignore, highlight, ...)
+        CString list = m_proxyExceptions; int pos = 0;
+        while (pos < list.GetLength()) {
+            int nl = list.Find(L"\r\n", pos); CString line = nl < 0 ? list.Mid(pos) : list.Mid(pos, nl - pos);
+            line.Trim();
+            if (!line.IsEmpty() && GlobMatch(line, host)) return true;
+            if (nl < 0) break; pos = nl + 2;
+        }
+        return false;
+    }
     // ---- System tray ----
     bool m_trayAlwaysShow = false, m_trayMinOnStartup = false, m_trayOnMinimize = false, m_trayAnimate = true, m_traySingleClick = false;
     CString m_trayIconPath; int m_trayIconIndex = 0;
@@ -6546,10 +6820,14 @@ class CMainFrame : public CMDIFrameWnd {
     void WireNet(Net* net) {   // hooks this network's socket callbacks; called once, right after NewNet()
         net->sock.onConn = [this, net](int err) {
             if (err) {
-                CString hex; hex.Format(L"0x%08X", (unsigned)err);
                 SetState(net, L"Connection failed");
-                Note(net, L"Connection/TLS failed (status " + hex + L"). If TLS is on, the most common cause is connecting to a plaintext port; "
-                     L"try the server's TLS port (often 6697) instead.", cPart);
+                if (err == CIrcSock::PROXY_FAIL)
+                    Note(net, L"Proxy handshake failed -- check the host, port, protocol and login under File > Proxy.", cPart);
+                else {
+                    CString hex; hex.Format(L"0x%08X", (unsigned)err);
+                    Note(net, L"Connection/TLS failed (status " + hex + L"). If TLS is on, the most common cause is connecting to a plaintext port; "
+                         L"try the server's TLS port (often 6697) instead.", cPart);
+                }
                 return;
             }
             net->conn = true; Note(net, L"Connected. Registering...");
@@ -6795,10 +7073,20 @@ class CMainFrame : public CMDIFrameWnd {
             net->sock.tls = new CTls;
             if (!net->sock.tls->Init(host, net->o.lax)) { Note(net, L"TLS initialisation failed", cPart); return; }
         }
-        Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L"...");
-        SetState(net, L"Connecting to " + host + L"...");
-        if (!net->sock.ConnectSmart(host, port))
-            Note(net, L"Connect failed", cPart);
+        bool viaProxy = ProxyAppliesToServer() && !m_proxyHost.IsEmpty() && m_proxyPort > 0 && !ProxyExceptionMatches(host);
+        if (viaProxy) {
+            net->sock.px.proto = (ProxyProto)(m_proxyProto + 1);   // UI index 0=Socks4,1=Socks5,2=Http -- enum reserves 0 for None
+            net->sock.px.user = m_proxyUser; net->sock.px.pass = m_proxyPass;
+            net->sock.px.targetHost = host; net->sock.px.targetPort = port;
+            Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L" via proxy " + m_proxyHost + L"...");
+            SetState(net, L"Connecting via proxy...");
+            if (!net->sock.ConnectSmart(m_proxyHost, m_proxyPort)) Note(net, L"Connect failed", cPart);
+        } else {
+            net->sock.px.proto = ProxyProto::None;
+            Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L"...");
+            SetState(net, L"Connecting to " + host + L"...");
+            if (!net->sock.ConnectSmart(host, port)) Note(net, L"Connect failed", cPart);
+        }
     }
     void ShowNickMenuLegacy(CChatWnd* c, const CString& nick, CPoint pt) {   // the built-in Whois / Query / Notice menu, used when [lpopup] is empty
         Net* net = c->net; if (!net) return;
@@ -14922,6 +15210,28 @@ class CMainFrame : public CMDIFrameWnd {
         SaveLocalSettings();
         if (m_localLookupMethod != oldMethod) LocalLookupNow(FirstConnectedNet());   // only auto-refresh when the method itself changed, so editing the host/IP fields by hand with the method unchanged isn't immediately overwritten
     }
+    // Connects a DCC socket out to accept an offer (DCC Chat/Send/Get), through the configured proxy when File >
+    // Proxy applies to DCC and the peer's address doesn't match an exception mask -- otherwise a plain direct
+    // connect, exactly as before this existed. Centralizes what Connect() above does for the IRC connection itself,
+    // for CDccSock's three "connecting out" call sites instead.
+    void DccConnectOut(CDccSock* sock, const CString& ip, UINT port) {
+        if (ProxyAppliesToDcc() && !m_proxyHost.IsEmpty() && m_proxyPort > 0 && !ProxyExceptionMatches(ip)) {
+            sock->px.proto = (ProxyProto)(m_proxyProto + 1);
+            sock->px.user = m_proxyUser; sock->px.pass = m_proxyPass;
+            sock->px.targetHost = ip; sock->px.targetPort = port;
+            sock->Connect(m_proxyHost, m_proxyPort);
+        } else {
+            sock->px.proto = ProxyProto::None;
+            sock->Connect(ip, port);
+        }
+    }
+    void OnProxyDialog() {
+        CProxyDlg dlg(this, m_proxyConnFor, m_proxyProto, m_proxyHost, m_proxyUser, m_proxyPass, m_proxyPort, m_proxyExceptions);
+        if (dlg.DoModal() != IDOK) return;
+        m_proxyConnFor = dlg.connFor; m_proxyProto = dlg.proto; m_proxyHost = dlg.host;
+        m_proxyUser = dlg.userId; m_proxyPass = dlg.pass; m_proxyPort = dlg.port; m_proxyExceptions = dlg.exceptions;
+        SaveProxySettings();
+    }
     void OnDccOptionsDialog() {
         CString firstS, lastS; firstS.Format(L"%d", m_dccPortMin); lastS.Format(L"%d", m_dccPortMax);
         CDccOptionsDlg dlg(this, firstS, lastS, m_dccUsePassive);
@@ -15341,7 +15651,7 @@ class CMainFrame : public CMDIFrameWnd {
             if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
             DccSession* raw = sess.get();
             sess->sock->onConnect = [this, raw](int e) { DccChatConnectResult(raw, e); };
-            sess->sock->Connect(ip, port);
+            DccConnectOut(sess->sock.get(), ip, port);
             m_dcc.push_back(std::move(sess));
             return;
         }
@@ -15366,7 +15676,7 @@ class CMainFrame : public CMDIFrameWnd {
                     DccProgressSetStatus(raw, L"Sending:  " + raw->filename + L"\r\nTo:       " + nick + L"\r\nFrom:     " + NoFilePart(raw->localPath) +
                         L"\r\n\r\nEstimate:\r\nRate:\r\nStatus:   Connecting...");
                     s->sock->onConnect = [this, raw](int e) { DccSendConnectResult(raw, e); };
-                    s->sock->Connect(ip, port);
+                    DccConnectOut(s->sock.get(), ip, port);
                     return;
                 }
             }
@@ -15415,7 +15725,7 @@ class CMainFrame : public CMDIFrameWnd {
                     L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Connecting...");
                 if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
                 sess->sock->onConnect = [this, raw](int e) { DccGetConnectResult(raw, e); };
-                sess->sock->Connect(ip, port);
+                DccConnectOut(sess->sock.get(), ip, port);
             }
             m_dcc.push_back(std::move(sess));
             return;
@@ -15567,6 +15877,28 @@ class CMainFrame : public CMDIFrameWnd {
         a->WriteProfileString(L"Identd", L"userId", m_identdUserId);
         a->WriteProfileString(L"Identd", L"system", m_identdSystem);
         a->WriteProfileInt(L"Identd", L"port", m_identdPort);
+    }
+    void LoadProxySettings() {
+        CWinApp* a = AfxGetApp();
+        m_proxyConnFor = a->GetProfileInt(L"Proxy", L"connFor", 0);
+        m_proxyProto = a->GetProfileInt(L"Proxy", L"proto", 1);
+        m_proxyHost = a->GetProfileString(L"Proxy", L"host", L"");
+        m_proxyUser = a->GetProfileString(L"Proxy", L"user", L"");
+        m_proxyPass = a->GetProfileString(L"Proxy", L"pass", L"");
+        m_proxyPort = a->GetProfileInt(L"Proxy", L"port", 1080);
+        m_proxyExceptions = a->GetProfileString(L"Proxy", L"exceptions", L"");
+        m_proxyExceptions.Replace(L";", L"\r\n");   // stored semicolon-joined (see SaveProxySettings) since a real embedded CRLF can't round-trip through WritePrivateProfileString's own ini-line format
+    }
+    void SaveProxySettings() {
+        CWinApp* a = AfxGetApp();
+        a->WriteProfileInt(L"Proxy", L"connFor", m_proxyConnFor);
+        a->WriteProfileInt(L"Proxy", L"proto", m_proxyProto);
+        a->WriteProfileString(L"Proxy", L"host", m_proxyHost);
+        a->WriteProfileString(L"Proxy", L"user", m_proxyUser);
+        a->WriteProfileString(L"Proxy", L"pass", m_proxyPass);
+        a->WriteProfileInt(L"Proxy", L"port", m_proxyPort);
+        CString forIni = m_proxyExceptions; forIni.Replace(L"\r\n", L";");
+        a->WriteProfileString(L"Proxy", L"exceptions", forIni);
     }
     bool IdentdRunning() const { return m_identdState && m_identdState->running; }
     void StartIdentd(Net* triggerNet = nullptr) {
@@ -17455,6 +17787,7 @@ public:
 		LoadOnlineTimer();
 		LoadIdentd();
 		if (m_identdEnabled && !m_identdOnlyConnecting) StartIdentd();
+		LoadProxySettings();
 		LoadAbook();
 		LoadNotify();
 		LoadUrls(CString());   // auto-restore the caught URL list from urls.ini at startup, same as real mIRC
@@ -17499,6 +17832,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
         f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
         f.AppendMenu(MF_STRING, IDM_LOCALSETTINGS, L"&Local Settings...");
+        f.AppendMenu(MF_STRING, IDM_PROXY, L"&Proxy...");
         f.AppendMenu(MF_STRING, IDM_DCCOPTIONS, L"DCC &Options...");
         f.AppendMenu(MF_STRING, IDM_TRAY, L"&Tray...");
         f.AppendMenu(MF_STRING, IDM_TIPS, L"T&ips...");
@@ -17654,7 +17988,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_URLLIST, OnUrlListBtn) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_LOCALSETTINGS, OnLocalSettingsDialog) ON_COMMAND(IDM_DCCOPTIONS, OnDccOptionsDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_URLLIST, OnUrlListBtn) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_LOCALSETTINGS, OnLocalSettingsDialog) ON_COMMAND(IDM_PROXY, OnProxyDialog) ON_COMMAND(IDM_DCCOPTIONS, OnDccOptionsDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
