@@ -54,6 +54,7 @@ along with this program.  If not, see <https://gnu.org>.
 #include <objbase.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+#include <sapi.h>   // /speak -- only the ISpVoice interface TYPE is needed from this header; CLSID_SpVoice/IID_ISpVoice are defined locally in CmdSpeak instead of linking the extern symbols this header declares, so no extra .lib is needed beyond the ole32/oleaut32 already linked below
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")     // MCI (sound playback) -- see /splay, /vol, $vol, $inwave/$inmidi/$insong
 #pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -
@@ -817,7 +818,7 @@ public:
 
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
 enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_LOCALSETTINGS, IDM_DCCOPTIONS, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
-    IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT,
+    IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT, IDM_URLLIST,
        IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX, IDC_ANICK };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
@@ -846,7 +847,7 @@ public:
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(232); t.push_back(200);   // cdit, x, y, cx, cy
         t.push_back(0); t.push_back(0); S(L"Connect to IRC server"); t.push_back(9); S(DEFAULT_FONT); //was Segoe UI
         Row(6, L"Server", IDC_HOST); Row(22, L"Port", IDC_PORT, ES_NUMBER); Row(38, L"Nickname", IDC_NICK);
-        Row(54, L"Alt Nick", IDC_ANICK);
+        Row(54, L"Alt Nickname", IDC_ANICK);
         Row(70, L"User name", IDC_USER); Row(86, L"Real name", IDC_REAL); Row(102, L"Password", IDC_PASS, ES_PASSWORD);
         Row(118, L"Auto-join", IDC_JOIN);
         Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 136, 150, 10, IDC_TLS, 0x0080, L"Use TLS (SSL) encryption");
@@ -1038,6 +1039,10 @@ struct NotifyEntry {   // one notify-list entry -- see /notify, CNotifyWnd, the 
     bool doWhois = false;          // the "+nick" prefix / "Perform /whois" checkbox
     CString soundJoin, soundPart;  // sound file paths, played via the same MCI machinery as /splay
     bool online = false;           // current known state, used to detect join/leave transitions
+};
+struct UrlEntry {   // one /url list entry -- see /url, $url, CUrlWnd, UrlCatch
+    CString addr, desc, group;   // desc: free-form ("nick on #chan"-style context when auto-caught); group: network tag
+    wchar_t mark = 0;            // single-character tag for /url -r <mark> / -i <mark> -- 0 = untagged
 };
 struct SoundChannel {   // one of wave/midi/song; see /splay, /vol, $vol, $inwave/$inmidi/$insong
     CString alias;       // MCI device alias for this channel
@@ -1735,6 +1740,7 @@ public:
     std::string recvBuf;                  // raw (TLS: already-decrypted) bytes buffered since the last /sockread
     CTls* tls = nullptr;                  // non-null only for a /sockopen -e socket; see CIrcSock's own copy of this exact pattern
     std::string sendq;                    // TLS only -- plaintext writes still go straight out via CAsyncSocket::Send, same as before this existed
+    bool paused = false;                  // /sockpause -- OnReceive below just leaves bytes sitting in the kernel's own receive buffer while this is set, since real mIRC's own /sockpause documents that paused data is "not discarded", only its SOCKREAD/UDPREAD event stops firing
     ~CMircSocket() { delete tls; }
     void Queue(const std::string& x) { sendq += x; Flush(); }
     void Write(const std::string& x) {   // the one entry point /sockwrite now goes through -- plaintext behaves exactly as it always did (one direct Send, no queueing), TLS encrypts first and queues (a single Send isn't guaranteed to take the whole encrypted record)
@@ -1792,27 +1798,27 @@ public:
         if (!tls->out.empty()) { recvBuf += tls->out; tls->out.clear(); if (onReceive) onReceive(); }
         return true;
     }
+    // Reads whatever Receive() hands back RIGHT NOW (a snapshot, not a wait) and feeds it through Ingest. Shared
+    // by OnClose's own drain (the remote can send its last data and close closely enough together that Windows
+    // delivers FD_CLOSE without ever delivering the FD_READ for bytes that already fully arrived in the kernel's
+    // receive buffer -- a classic CAsyncSocket gotcha; an HTTP body has been lost this way in practice) and by
+    // /sockpause -r (catching up on whatever accumulated while paused, since no NEW data -- and so no new
+    // FD_READ -- may ever arrive if the peer already finished sending everything before the resume).
+    void Drain() {
+        for (;;) {
+            char b[16384]; int n = Receive(b, sizeof b);
+            if (n <= 0) break;
+            if (!Ingest(b, n)) { Close(); break; }   // decrypt failed -- stop draining; the caller decides whether to fire onClose
+        }
+    }
     void OnReceive(int) override {
+        if (paused) return;   // leave it all sitting in the kernel's receive buffer -- see `paused`'s own comment
         char b[16384]; int n = Receive(b, sizeof b);
         if (n <= 0) { if (onClose) onClose(); return; }
         if (!Ingest(b, n)) { Close(); if (onClose) onClose(); }
     }
     void OnAccept(int) override { if (onAccept) onAccept(); }
-    void OnClose(int) override {
-        // The remote can send its last data and close within the same instant, closely enough that Windows
-        // delivers FD_CLOSE without first (or ever) delivering the FD_READ for bytes that already fully arrived
-        // in the socket's kernel receive buffer -- a classic CAsyncSocket gotcha. Concretely: an HTTP response's
-        // body can be sitting there, completely received, and this override used to fire onClose() immediately
-        // without ever reading it, silently discarding it (seen in practice: a GitHub Pages response where only
-        // the headers came through OnReceive and the whole body vanished). Drain whatever Receive() still hands
-        // back, same as a normal OnReceive would, before treating the socket as actually empty.
-        for (;;) {
-            char b[16384]; int n = Receive(b, sizeof b);
-            if (n <= 0) break;
-            if (!Ingest(b, n)) break;   // decrypt failed -- stop draining, still fall through to the one onClose() below
-        }
-        if (onClose) onClose();
-    }
+    void OnClose(int) override { Drain(); if (onClose) onClose(); }
 };
 // One open/listening /sockopen or /socklisten socket, keyed by the script's own name for it (case-insensitive,
 // same convention as every other named lookup in this client -- see Key()/VKey()).
@@ -1826,6 +1832,7 @@ struct MircSock {
     CString mark;                             // $sock(name).mark / /sockmark -- an arbitrary script-set tag, never touched by this client itself
     bool pendingClose = false;                // deferred-removal guard -- see CMainFrame::OnDeferredCloseSock
     bool remoteClosed = false;                // the connection itself has closed, but see OnSockClose's own comment -- the MircSock entry (and its still-unread recvBuf) is kept alive until OnSockReceive's drain loop actually empties it
+    bool isUdp = false;                       // created by /sockudp -- its "on SOCKREAD" equivalent is "on UDPREAD" (see OnUdpReceive), and /socklist -u matches it
 };
 // DCC's wire format for an IP address is a decimal string of the 4 octets packed big-endian into a 32-bit integer
 // (e.g. 192.168.1.1 -> 3232235777), not dotted-decimal -- this is what real mIRC and most other clients still send
@@ -1883,6 +1890,12 @@ class CLogEdit : public CRichEditCtrl {
 public:
     std::function<void(CString)> onLink;
     std::function<bool(CPoint)> onContext;   // right-click: return true if a popup menu was shown (otherwise the default edit menu appears)
+    // on HOTLINK: word, full line, 1-based line number, 1-based word-token position, 0-based char offset of the
+    // word within the line, and the mouse-action name ("mouse"/"sclick"/"uclick"/"dclick"/"rclick") -- fired for
+    // every distinct word the mouse is over or clicked, independent of (and in addition to) the existing
+    // URL/channel click-to-open and hand-cursor behavior below, which stays exactly as it was.
+    std::function<void(const CString&, const CString&, int, int, int, const CString&)> onHotlink;
+    long m_hlLastKey = -1;   // dedupe key for the last "mouse" hotlink fired, so OnMouseMove doesn't refire on every single pixel of movement over the same word
     // Background color only -- an image here was tried and abandoned (see CMainFrame's Colors/background notes):
     // RichEdit's own internal painting actively fights anything external trying to draw its background, in ways
     // that never fully resolved. A plain color goes through RichEdit's own native mechanism instead (see
@@ -1898,6 +1911,7 @@ protected:
     // afterward, since that synthesis isn't reliably reaching this control. Handling the raw click ourselves
     // sidesteps that entirely.
     afx_msg void OnRButtonUp(UINT, CPoint p) {
+        if (onHotlink) { CString w, ln; int lineNo, wordPos, charPos; if (WordInfoAtPoint(p, w, ln, lineNo, wordPos, charPos)) onHotlink(w, ln, lineNo, wordPos, charPos, L"rclick"); }   // fired first: a matching "on HOTLINK" handler's own /hotlink -m/-d (consumed by the owner's onContext callback below) decides what menu appears
         CPoint sp = p; ClientToScreen(&sp);
         if (!onContext || !onContext(sp)) Default();   // Default() here still lets Windows show its own Copy/Paste menu when we decline
     }
@@ -1915,12 +1929,52 @@ protected:
         CString w = ln.Mid(a, b - a); w.Trim(L",.;:!?()<>[]'\"");
         return w;
     }
+    // Same word lookup as WordAtPoint, but also hands back everything "on HOTLINK"/$hotlink need to describe
+    // where it happened: the full line, its 1-based line number, the word's 1-based token position within that
+    // line, and the word's 0-based character offset within the line (used as $hotlink(match).pos; this engine
+    // doesn't separately track a sub-word "match" portion distinct from the whole word, so match==word throughout).
+    bool WordInfoAtPoint(CPoint p, CString& word, CString& line, int& lineNo, int& wordPos, int& charPos) {
+        int idx = CharFromPos(p), li = LineFromChar(idx), st = LineIndex(li);
+        CString ln; GetTextRange(st, st + LineLength(idx), ln);
+        int q = idx - st, n = ln.GetLength(); if (q > n) q = n;
+        int a = q, b = q;
+        while (a > 0 && !iswspace(ln[a - 1])) a--;
+        while (b < n && !iswspace(ln[b])) b++;
+        CPoint pa = PosFromChar(st + a), pb = PosFromChar(st + b);
+        if (p.x < pa.x || p.x > pb.x) return false;   // clicked/hovered blank space, not a word
+        CString w = ln.Mid(a, b - a); w.Trim(L",.;:!?()<>[]'\"");
+        if (w.IsEmpty()) return false;
+        int realStart = ln.Find(w, a); if (realStart < 0) realStart = a;   // Trim() above may have eaten leading punctuation -- re-find the trimmed word's true start for an accurate char offset
+        int count = 0; bool inWord = false;
+        for (int k = 0; k < realStart; k++) { if (!iswspace(ln[k])) { if (!inWord) { count++; inWord = true; } } else inWord = false; }
+        word = w; line = ln; lineNo = li + 1; charPos = realStart; wordPos = count + 1;
+        return true;
+    }
     static bool IsUrlWord(const CString& w) {
         CString wl = w; wl.MakeLower();
         return wl.Left(7) == L"http://" || wl.Left(8) == L"https://" || wl.Left(6) == L"ftp://" || wl.Left(4) == L"www.";
     }
     bool IsLinkWord(const CString& w) const { return (w.GetLength() > 1 && (w[0] == L'#' || w[0] == L'&')) || IsUrlWord(w); }
+    afx_msg void OnLButtonDown(UINT, CPoint p) {
+        if (onHotlink) { CString w, ln; int lineNo, wordPos, charPos; if (WordInfoAtPoint(p, w, ln, lineNo, wordPos, charPos)) onHotlink(w, ln, lineNo, wordPos, charPos, L"sclick"); }
+        Default();
+    }
+    afx_msg void OnLButtonDblClk(UINT, CPoint p) {
+        if (onHotlink) { CString w, ln; int lineNo, wordPos, charPos; if (WordInfoAtPoint(p, w, ln, lineNo, wordPos, charPos)) onHotlink(w, ln, lineNo, wordPos, charPos, L"dclick"); }
+        Default();
+    }
+    afx_msg void OnMouseMove(UINT, CPoint p) {
+        if (onHotlink) {
+            CString w, ln; int lineNo, wordPos, charPos;
+            if (WordInfoAtPoint(p, w, ln, lineNo, wordPos, charPos)) {
+                long key = ((long)lineNo << 16) ^ charPos;   // only refire once per distinct word/position, not on every pixel of movement over the same word -- "very intensive" per mIRC's own docs
+                if (key != m_hlLastKey) { m_hlLastKey = key; onHotlink(w, ln, lineNo, wordPos, charPos, L"mouse"); }
+            } else m_hlLastKey = -1;
+        }
+        Default();
+    }
     afx_msg void OnLButtonUp(UINT, CPoint p) {
+        if (onHotlink) { CString w, ln; int lineNo, wordPos, charPos; if (WordInfoAtPoint(p, w, ln, lineNo, wordPos, charPos)) onHotlink(w, ln, lineNo, wordPos, charPos, L"uclick"); }
         Default();
         long s = 0, e = 0; GetSel(s, e);
         if (s != e) { Copy(); return; }                         // a selection was just made: auto-copy it, like a Windows console window
@@ -1948,6 +2002,9 @@ BEGIN_MESSAGE_MAP(CLogEdit, CRichEditCtrl)
     ON_WM_CONTEXTMENU()
     ON_WM_RBUTTONUP()
     ON_WM_LBUTTONUP()
+    ON_WM_LBUTTONDOWN()
+    ON_WM_LBUTTONDBLCLK()
+    ON_WM_MOUSEMOVE()
     ON_WM_SETCURSOR()
 END_MESSAGE_MAP()
 
@@ -2033,6 +2090,7 @@ public:
     std::function<void(CChatWnd*, CString)> onOpen;      // open/join a nick or #channel, on this window's network
     std::function<void(CChatWnd*, CString, CPoint)> onNickMenu;   // right-click nick(s) in the user list (the nicks, space separated)
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
+    std::function<void(CChatWnd*, const CString&, const CString&, int, int, int, const CString&)> onHotlinkFire;   // on HOTLINK: word, line, lineNo, wordPos, charPos, mouse-action name -- see CLogEdit::onHotlink
     std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped, un-timestamped) text of each new line, for history logging
     int m_tsMode = -1;   // this window's /timestamp override: -1 = follow the global setting, 0 = off, 1 = on
     ULONGLONG m_lastMsgTick = 0;   // GetTickCount64() of the last PRIVMSG/NOTICE/DCC-chat line shown OR sent in this window -- $query().idle / $chat().idle ("seconds since a message was sent or received")
@@ -2293,6 +2351,7 @@ protected:
         m_out.Create(WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, z, this, 1);
         m_out.LimitText(0x7FFFFFF); m_out.onLink = [this](CString w) { if (onOpen) onOpen(this, w); };
         m_out.onContext = [this](CPoint pt) { return onLogMenu ? onLogMenu(this, pt) : false; };
+        m_out.onHotlink = [this](const CString& w, const CString& ln, int lineNo, int wordPos, int charPos, const CString& evt) { if (onHotlinkFire) onHotlinkFire(this, w, ln, lineNo, wordPos, charPos, evt); };
         m_in.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, z, this, 2);
         m_font.CreatePointFont(100, DEFAULT_FONT);
         m_out.SetFont(&m_font); m_in.SetFont(&m_font);
@@ -2989,6 +3048,50 @@ protected:
 };
 BEGIN_MESSAGE_MAP(CNotifyWnd, CMDIChildWnd)
     ON_WM_CREATE() ON_WM_SIZE() ON_WM_DESTROY() ON_WM_INITMENUPOPUP()
+END_MESSAGE_MAP()
+
+// ---------------- URL list window: /url show|hide, $url -- see UrlEntry, UrlCatch ----------------
+class CUrlWnd : public CMDIChildWnd {
+public:
+    int m_seq = 0;
+    std::function<void(CUrlWnd*)> onClosed;
+    std::function<void(CString)> onOpenUrl;   // double-click a row: open it in the default browser
+    void Populate(const std::vector<UrlEntry>& urls) {
+        m_list.DeleteAllItems();
+        for (size_t i = 0; i < urls.size(); i++) {
+            int idx = m_list.InsertItem((int)i, urls[i].addr);
+            m_list.SetItemText(idx, 1, urls[i].desc);
+            m_list.SetItemText(idx, 2, urls[i].group);
+            m_list.SetItemText(idx, 3, urls[i].mark ? CString(urls[i].mark) : CString());
+        }
+        CString t; t.Format(L"URL List (%d)", (int)urls.size());
+        SetWindowText(t);
+    }
+protected:
+    CListCtrl m_list;
+    afx_msg int OnCreate(LPCREATESTRUCT cs) {
+        if (CMDIChildWnd::OnCreate(cs) == -1) return -1;
+        CRect z(0, 0, 0, 0);
+        m_list.Create(WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_BORDER, z, this, 1);
+        m_list.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+        m_list.InsertColumn(0, L"Address", LVCFMT_LEFT, 360);
+        m_list.InsertColumn(1, L"Description", LVCFMT_LEFT, 180);
+        m_list.InsertColumn(2, L"Group", LVCFMT_LEFT, 80);
+        m_list.InsertColumn(3, L"Mark", LVCFMT_LEFT, 50);
+        return 0;
+    }
+    afx_msg void OnSize(UINT t, int cx, int cy) { CMDIChildWnd::OnSize(t, cx, cy); if (m_list.m_hWnd) m_list.MoveWindow(0, 0, cx, cy); }
+    afx_msg void OnDestroy() { CMDIChildWnd::OnDestroy(); if (onClosed) onClosed(this); }
+    afx_msg void OnInitMenuPopup(CMenu*, UINT, BOOL) { }   // see CListWnd's identical override for why
+    afx_msg void OnDblClick(NMHDR*, LRESULT* r) {
+        *r = 0;
+        int i = m_list.GetNextItem(-1, LVNI_SELECTED); if (i < 0) return;
+        if (onOpenUrl) onOpenUrl(m_list.GetItemText(i, 0));
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CUrlWnd, CMDIChildWnd)
+    ON_WM_CREATE() ON_WM_SIZE() ON_WM_DESTROY() ON_WM_INITMENUPOPUP() ON_NOTIFY(NM_DBLCLK, 1, OnDblClick)
 END_MESSAGE_MAP()
 
 
@@ -4606,8 +4709,8 @@ struct RemoteEvent {
     CString groupName;              // empty = not in any #group block, always active -- see IsGroupMarkerLine
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
-    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal
-    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"SOCKOPEN", L"SOCKREAD", L"SOCKCLOSE", L"SOCKLISTEN" };   // CLOSE/KEYDOWN: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal, but matched against the /sockopen-given socket name instead of a window name.
+    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL", L"HOTLINK" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal; HOTLINK's against the hovered/clicked word (control codes stripped), same as $1
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"SOCKOPEN", L"SOCKREAD", L"SOCKCLOSE", L"SOCKLISTEN", L"HOTLINK" };   // CLOSE/KEYDOWN: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal, but matched against the /sockopen-given socket name instead of a window name. HOTLINK's where-spec is the window-type code (*,#,?,=,!,@), matched by MatchesHotlinkWhere.
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
     CString curGroup;
@@ -4623,11 +4726,11 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
         { CString levelNum = level; levelNum.Remove(L'^'); levelNum.Remove(L'*'); ev.level = _wtoi(levelNum); }   // "*" (any level) parses to 0, same as a bare level field would
         int c2 = rest.Find(L':'); if (c2 < 0) continue;
         ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
-        if (inList(ev.eventName, kNeedsMatch, 5)) {
+        if (inList(ev.eventName, kNeedsMatch, 6)) {
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
-        if (inList(ev.eventName, kNeedsWhere, 20)) {
+        if (inList(ev.eventName, kNeedsWhere, 21)) {
             // The where-spec is a single ":"-delimited field (a window name/wildcard, or a comma list of them for
             // CLOSE) immediately before the command body, so the naive first-colon search is correct UNLESS that
             // field is itself followed by another field before the body -- which is exactly KEYDOWN's real mIRC
@@ -4905,6 +5008,26 @@ static bool MatchesTextWhere(const CString& spec, bool isPriv, const CString& ch
     if (s == L"?") return isPriv;
     if (s == L"#") return !isPriv;
     return !isPriv && GlobMatch(s, chanOrNick);
+}
+// HOTLINK's where-spec: blank or "*" = any window, "#" = channel, "?" = query, "=" = DCC chat, "!" = fserve session
+// window, "@" = custom @window. This client's fserve and DCC-chat sessions both reuse the same window class/flag
+// (CChatWnd::m_dccSession non-null), with no separate "is this one a fserve session" bit tracked on the window
+// itself -- so "!" and "=" aren't actually distinguishable here; a DCC-chat-or-fserve window's kind code is always
+// reported as '=', meaning a script that specifically asks for "!" alone (fserve only) won't match either one.
+// That's a narrower gap than it sounds: real-world scripts overwhelmingly either omit the where-spec (any window)
+// or ask for "#"/"?" , not "!" specifically.
+static wchar_t HotlinkWinKind(bool isStatus, bool isChan, bool isQuery, bool isDccOrFserve, bool isCustom) {
+    if (isCustom) return L'@';
+    if (isDccOrFserve) return L'=';
+    if (isChan) return L'#';
+    if (isQuery) return L'?';
+    return isStatus ? L'*' : L'*';   // the status window itself matches only a blank/"*" where-spec, same as real mIRC
+}
+static bool MatchesHotlinkWhere(const CString& spec, wchar_t kind) {
+    CString s = spec; s.Trim();
+    if (s.IsEmpty() || s == L"*") return true;
+    for (int i = 0; i < s.GetLength(); i++) if (s[i] == kind) return true;   // mIRC allows the window-type field to list more than one code with no separator, e.g. "#?"
+    return false;
 }
 
 // ---------------- Channel Central: /channel  (topic, modes, and the ban / except / invite / quiet lists) ----------------
@@ -6318,6 +6441,7 @@ class CMainFrame : public CMDIFrameWnd {
     bool m_tipsAppWasActive = true;
     // ---- Sound playback (/splay, /vol, $vol, $inwave/$inmidi/$insong, $sound) ----
     SoundChannel m_waveChan{ L"ircwave" }, m_midiChan{ L"ircmidi" }, m_mp3Chan{ L"ircmp3" };
+    ISpVoice* m_spVoice = nullptr;   // /speak -- lazily created on first use; see EnsureSpVoice
     CString m_soundDirWave, m_soundDirMidi, m_soundDirMp3, m_soundDirWma, m_soundDirOgg;
     // ---- Address Book (phase 1: the Users tab only -- Whois/Notify/Control/Colors/Highlight are placeholders for now) ----
     std::vector<AddressEntry> m_abook;
@@ -6526,7 +6650,8 @@ class CMainFrame : public CMDIFrameWnd {
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
         w->onNickMenu = [this](CChatWnd* c, CString nick, CPoint pt) { ShowNickMenu(c, nick, pt); };
-        w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowWindowPopup(c, pt); };
+        w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return m_hlMenuSet ? ShowHotlinkPopup(c, pt) : ShowWindowPopup(c, pt); };
+        w->onHotlinkFire = [this](CChatWnd* c, const CString& word, const CString& line, int lineNo, int wordPos, int charPos, const CString& evt) { FireHotlinkEvent(c, word, line, lineNo, wordPos, charPos, evt); };
         w->onLog = [this, net, w](const CString& line) { WriteLog(net, w->m_name, line); };
         w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
         w->tsFormat = [this]() { return m_tsEventFmt; };
@@ -6553,7 +6678,8 @@ class CMainFrame : public CMDIFrameWnd {
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
-        w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return ShowCustomPopup(c, pt); };
+        w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return m_hlMenuSet ? ShowHotlinkPopup(c, pt) : ShowCustomPopup(c, pt); };
+        w->onHotlinkFire = [this](CChatWnd* c, const CString& word, const CString& line, int lineNo, int wordPos, int charPos, const CString& evt) { FireHotlinkEvent(c, word, line, lineNo, wordPos, charPos, evt); };
         w->onCanvasKey = [this](CChatWnd* c, UINT vk) {   // on KEYDOWN: fired for whichever custom window currently has keyboard focus -- see CCanvasWnd/ShowCanvas
             m_lastKeyVal = (int)vk;
             CString params; params.Format(L"%d", (int)vk);
@@ -6937,6 +7063,9 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
         if (name == L"signal") { val = m_evSignal; return true; }
+        if (name == L"hotline") { val = m_hlLine; return true; }   // deprecated (pre-7.23) -- "replaced by $hotlink", kept for old scripts: the full line an "on HOTLINK" event fired for
+        if (name == L"hotlinepos") { val.Format(L"%d %d", m_hlLineNo, m_hlWordPos); return true; }   // deprecated -- "line-number word-position", space separated; also replaced by $hotlink
+        if (name == L"url") { val = m_urlList.empty() ? CString() : m_urlList.back().addr; return true; }   // bare $url: "currently open URL in your main browser" -- this client has no embedded browser to ask, so the most recently caught/opened address stands in. (The parenthesized $url(N) form is handled in FuncValue, which is only reached when a "(" follows -- this bare path is never taken for that form.)
         if (name == L"sockname") { val = m_evSockName; return true; }   // the socket name a currently-running on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN event fired for
         if (name == L"sockerr") { val = m_sockErr; return true; }       // non-empty only right after a failed /sockopen connect or /sockread; see m_sockErr's own comment
         if (name == L"sockbr") { val.Format(L"%d", m_sockBr); return true; }   // bytes read by the last /sockread call; see m_sockBr's own comment -- this is what a script's "if ($sockbr != 0) goto nextline" drain loop checks
@@ -7235,6 +7364,39 @@ class CMainFrame : public CMDIFrameWnd {
         VarEntry* e = StoreVar(name, FmtNum(cur + sign * amt), st, false);
         if (e && sw.c) { e->step = sign * amt; e->nextStep = GetTickCount64() + 1000; }   // -c: keep stepping once a second
         FlushVars();
+    }
+    // Shared engine behind /hinc and /hdec -- same shape as /hadd (table/item lookup, -m[N] creates the table if
+    // missing), except this adjusts the item's existing numeric value instead of replacing it outright. A
+    // missing item (or one whose current value isn't numeric) is treated as 0, matching real mIRC's own
+    // documented "/hinc treats a missing item as zero". -b (take the amount from a &binvar's .text), -z and -uN
+    // (give the item a scheduled unset) are accepted-but-ignored: no binary-variable subsystem or hash-item
+    // timer exists in this client.
+    void CmdHashIncDec(CChatWnd* w, const CString& cmd, CString arg, int sign) {
+        CString a = arg; bool showMsg = false, makeIfMissing = false; int makeSize = 100;
+        while (a.Left(1) == L"-" && a.GetLength() > 1) {
+            CString sw = Word(a); sw.MakeLower();
+            if (sw.Find(L's') >= 0) showMsg = true;
+            int mPos = sw.Find(L'm');
+            if (mPos >= 0) { makeIfMissing = true; CString numPart = sw.Mid(mPos + 1); double nD; if (!numPart.IsEmpty() && ParseNum(numPart, nD) && nD > 0) makeSize = (int)nD; }
+        }
+        CString tname = Word(a); CString item = Word(a);
+        CString numStr = a; numStr.Trim();
+        double amt = 1;
+        // A non-numeric [num] makes real mIRC schedule the item to unset a second later; this client has no such
+        // scheduling, so it just falls back to the default amount of 1 instead.
+        if (!numStr.IsEmpty()) ParseNum(numStr, amt);
+        if (tname.IsEmpty() || item.IsEmpty()) { Show(w, L"* /" + cmd + L": insufficient parameters", cPart); return; }
+        HashTableEntry* t = FindHashTable(tname);
+        if (!t) {
+            if (!makeIfMissing) { Show(w, L"* /" + cmd + L": table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
+            HashTableEntry nt; nt.name = tname; nt.size = makeSize; m_hashTables.push_back(nt); t = &m_hashTables.back();
+        }
+        double cur = 0;
+        auto it = std::find_if(t->items.begin(), t->items.end(), [&](const std::pair<CString, CString>& kv) { return kv.first.CompareNoCase(item) == 0; });
+        if (it != t->items.end()) ParseNum(it->second, cur);
+        CString newVal = FmtNum(cur + sign * amt);
+        if (it != t->items.end()) it->second = newVal; else t->items.push_back({ item, newVal });
+        if (showMsg) Show(w, L"* /" + cmd + L": " + tname + L"." + item + L" = " + newVal, cPart);
     }
     void CmdAssign(CChatWnd* w, const CString& name, CString arg) {   // "%x = 5 + 1"  (arg starts at the '=')
         arg.TrimLeft();
@@ -7582,7 +7744,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
             CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString sub = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString sub = rest.Mid(c1 + 1); sub.Trim(); auto toks = SplitTok(rest.Left(c1), delim);   // same "space after the comma" trim as $wildtok, see its comment
             double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
             int matchCount = 0; CString foundTok;
             for (auto& t : toks) {
@@ -7600,7 +7762,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
             CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString pat = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString pat = rest.Mid(c1 + 1); pat.Trim(); auto toks = SplitTok(rest.Left(c1), delim);   // trim: "$wildtok(list, *.exe*,1,32)" (space after the comma, as scripts commonly write it) would otherwise leave pat as " *.exe*", which can never match since the leading space is taken literally
             double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
             int matchCount = 0; CString foundTok;
             for (auto& t : toks) if (GlobMatch(pat, t, cs)) { ++matchCount; if (N > 0 && matchCount == N) { foundTok = t; break; } }
@@ -8237,6 +8399,23 @@ class CMainFrame : public CMDIFrameWnd {
             if (prop == L"len") val.Format(L"%d", result.GetLength()); else val = result;
             return true;
         }
+        if (name == L"hotlink") {   // $hotlink(item)[.pos/.type] -- item: word (control codes kept, unlike $1)/match/event/line; .pos: line's line number, word's/match's token-or-char position; .type (match only): nick/channel/url/other
+            CString item = EvalIds(w, rawArgs, params); item.MakeLower(); item.Trim();
+            if (item == L"word") { if (prop == L"pos") val.Format(L"%d", m_hlWordPos); else val = m_hlWordRaw; }
+            else if (item == L"match") { if (prop == L"pos") val.Format(L"%d", m_hlMatchPos); else if (prop == L"type") val = m_hlType; else val = m_hlMatch; }
+            else if (item == L"event") val = m_hlEvent;
+            else if (item == L"line") { if (prop == L"pos") val.Format(L"%d", m_hlLineNo); else val = m_hlLine; }
+            else return false;
+            return true;
+        }
+        if (name == L"url") {   // $url(N)[.desc/.group] -- N=0: total caught/listed count. Position matches the order shown in /url show's list window (oldest first).
+            CString a = EvalIds(w, rawArgs, params); double nD; if (!ParseNum(a, nD)) return false; int N = (int)nD;
+            if (N == 0) { val.Format(L"%d", (int)m_urlList.size()); return true; }
+            if (N < 1 || N > (int)m_urlList.size()) { val.Empty(); return true; }
+            UrlEntry& e = m_urlList[N - 1];
+            if (prop == L"desc") val = e.desc; else if (prop == L"group") val = e.group; else val = e.addr;
+            return true;
+        }
         if (name == L"ial") {   // $ial(nick/mask,N)[.nick/.user/.host/.addr] -- the Nth entry in the Internal Address List matching a nick or full mask; N=0 is the total match count. .mark/.account/.gecos/.id/.bot/.away aren't implemented -- this client's IAL only ever stores a plain nick->address mapping, none of that extra per-entry info.
             CString a = EvalIds(w, rawArgs, params);
             int c = a.ReverseFind(L','); if (c < 0) return false;
@@ -8585,7 +8764,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = a.ReverseFind(L','); if (c2 < 0) return false;
             CString rest = a.Left(c2); double cD; if (!ParseNum(a.Mid(c2 + 1), cD)) return false;
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), (wchar_t)(int)cD);
+            CString tok = rest.Mid(c1 + 1); tok.Trim(); auto toks = SplitTok(rest.Left(c1), (wchar_t)(int)cD);
             bool found = false; for (auto& t : toks) if (cs ? (t == tok) : (t.CompareNoCase(tok) == 0)) { found = true; break; }
             val = found ? L"$true" : L"$false"; return true;
         }
@@ -8597,7 +8776,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
             CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), (wchar_t)(int)cD);
+            CString tok = rest.Mid(c1 + 1); tok.Trim(); auto toks = SplitTok(rest.Left(c1), (wchar_t)(int)cD);
             double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;   // N=0: return the total number of matching tokens, not a position
             int matchCount = 0, foundPos = 0;
             for (size_t i = 0; i < toks.size(); ++i) if (cs ? (toks[i] == tok) : (toks[i].CompareNoCase(tok) == 0)) { ++matchCount; if (N > 0 && matchCount == N) { foundPos = (int)i + 1; break; } }
@@ -8609,7 +8788,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = a.ReverseFind(L','); if (c2 < 0) return false;
             CString rest = a.Left(c2); double cD; if (!ParseNum(a.Mid(c2 + 1), cD)) return false; wchar_t delim = (wchar_t)(int)cD;
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString tok = rest.Mid(c1 + 1); tok.Trim(); auto toks = SplitTok(rest.Left(c1), delim);
             if (tok.IsEmpty()) { val = JoinTok(toks, delim); return true; }
             bool exists = false; for (auto& t : toks) if (cs ? (t == tok) : (t.CompareNoCase(tok) == 0)) { exists = true; break; }
             if (!exists) toks.push_back(tok);
@@ -8639,7 +8818,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
             CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString data = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString data = rest.Mid(c1 + 1); data.Trim(); auto toks = SplitTok(rest.Left(c1), delim);
             double nD; if (!ParseNum(nStr, nD)) return false; int idx = TokIndex((int)nD, toks.size());
             if (idx < 0) { val = JoinTok(toks, delim); return true; }
             toks[idx] = data; val = JoinTok(toks, delim); return true;
@@ -8651,7 +8830,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
             CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString tok = rest.Mid(c1 + 1); tok.Trim(); auto toks = SplitTok(rest.Left(c1), delim);
             double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
             int cnt = (int)toks.size(); int insertAt;
             if (N > 0) insertAt = (std::min)(N - 1, cnt);
@@ -8668,7 +8847,7 @@ class CMainFrame : public CMDIFrameWnd {
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
             CString nStr = rest.Mid(c2 + 1); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString tok = rest.Mid(c1 + 1); tok.Trim(); auto toks = SplitTok(rest.Left(c1), delim);
             double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
             std::vector<CString> outv; int matchCount = 0;
             for (auto& t : toks) {
@@ -8686,9 +8865,9 @@ class CMainFrame : public CMDIFrameWnd {
             int c3 = rest.ReverseFind(L','); if (c3 < 0) return false;
             CString nStr = rest.Mid(c3 + 1); rest = rest.Left(c3);
             int c2 = rest.ReverseFind(L','); if (c2 < 0) return false;
-            CString newTok = rest.Mid(c2 + 1); rest = rest.Left(c2);
+            CString newTok = rest.Mid(c2 + 1); newTok.Trim(); rest = rest.Left(c2);
             int c1 = rest.ReverseFind(L','); if (c1 < 0) return false;
-            CString tok = rest.Mid(c1 + 1); auto toks = SplitTok(rest.Left(c1), delim);
+            CString tok = rest.Mid(c1 + 1); tok.Trim(); auto toks = SplitTok(rest.Left(c1), delim);
             double nD; if (!ParseNum(nStr, nD)) return false; int N = (int)nD;
             int matchCount = 0;
             for (auto& t : toks) {
@@ -8782,6 +8961,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"lines") {
             CString a = EvalIds(w, rawArgs, params);
+            if (a.GetLength() >= 2 && a.Left(1) == L"\"" && a.Right(1) == L"\"") a = a.Mid(1, a.GetLength() - 2);   // "$lines(\"my file.txt\")" -- same quoted-filename convention as /write
             val.Format(L"%d", (int)ReadAllLinesOf(a).size());
             return true;
         }
@@ -9652,7 +9832,7 @@ class CMainFrame : public CMDIFrameWnd {
             else if (prop == L"rport") val.Format(L"%d", s->rport);
             else if (prop == L"addr") val = s->addr;
             else if (prop == L"mark") val = s->mark;
-            else if (prop == L"type") val = s->listening ? L"listen" : L"tcp";
+            else if (prop == L"type") val = s->listening ? L"listen" : (s->isUdp ? L"udp" : L"tcp");
             else if (prop == L"ssl") val = (s->sock && s->sock->tls) ? L"1" : L"0";   // was this socket opened with /sockopen -e?
             else val = s->name;   // default: the name itself, i.e. $sock(name) is truthy/non-empty exactly when that socket exists
             return true;
@@ -10233,6 +10413,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (dlg.DoModal() != IDOK) return;
         ApplyColorScheme(dlg.Active());
     }
+    afx_msg void OnUrlListBtn() { ShowUrlWindow(); }   // toolbar/menu button right after Colors -- see /url show, which does the same thing
     afx_msg void OnLoggingDialog() {
         CLoggingDlg dlg(m_logEnabled, m_logFolder, this);
         if (dlg.DoModal() != IDOK) return;
@@ -10744,6 +10925,15 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_regErrStr;   // what $regerrstr returns -- the last $regex/$regsub/$regsubex compile error, if any. std::regex_error's own what() text, not literally PCRE's wording (this client uses std::regex, not PCRE), but the same role: a human-readable reason the pattern failed to compile.
     CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName, m_evNumeric;   // what $nick, $chan, $address, $knick,
     bool m_evHaltDef = false;   // $newnick, $event, $numeric resolve to while an event's commands are running
+    // ---- on HOTLINK / $hotlink / $hotline / $hotlinepos / /hotlink -- see CLogEdit::onHotlink, FireHotlinkEvent ----
+    CString m_hlWordRaw, m_hlWord, m_hlMatch, m_hlEvent, m_hlLine, m_hlType;   // m_hlWordRaw keeps control codes ($hotlink(word)); m_hlWord/m_hlMatch are stripped ($1, $hotlink(match))
+    int m_hlLineNo = 0, m_hlWordPos = 0, m_hlMatchPos = 0;
+    CString m_hlMenuName; bool m_hlMenuDefault = false, m_hlMenuSet = false;   // set by /hotlink -m/-d during an "on HOTLINK" run fired for a right-click; consumed by ShowHotlinkPopup right after
+    // ---- /url, $url, the URL catcher, CUrlWnd -- see UrlCatch, CmdUrl ----
+    bool m_urlOn = false;             // /url on|off -- the catcher itself is off by default, same as real mIRC
+    std::vector<UrlEntry> m_urlList;
+    CUrlWnd* m_urlWnd = nullptr;
+    CString m_urlFile;                // sticky "last file used" for a bare /url save|load -- defaults to urls.ini next to the .exe
     // Internal Address List: nick (lowercase) -> user@host, learned passively from any prefixed line we see (JOIN,
     // PRIVMSG/NOTICE, PART, KICK, NICK, QUIT -- anywhere this file already has both a nick and a host on hand).
     // Backs $address(nick,type)/$wildsite(nick)-style lookups for nicks other than whoever triggered the current event.
@@ -10899,6 +11089,80 @@ class CMainFrame : public CMDIFrameWnd {
         }
         m_evChan = savedChan; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
+    }
+    // HOTLINK: fired by CLogEdit::onHotlink for every distinct word the mouse moves over or clicks in any chat
+    // log (see the CChatWnd creation sites that wire onHotlinkFire). matchtext is compared against the word with
+    // control codes stripped, same as $1; $hotlink(word) keeps the codes. This engine has no separate notion of a
+    // "match" substring distinct from the whole hovered word (real mIRC's own doc example of that -- the bare
+    // "nick" inside a rendered "<@nick>" prefix -- depends on exactly how a client draws nick prefixes in chat
+    // text, which isn't standardized), so $hotlink(match)/.type/.pos are derived from that same whole word.
+    wchar_t HotlinkKindOf(CChatWnd* w) {
+        if (w->m_custom) return L'@';
+        if (w->m_dccSession) return L'=';   // DCC chat and fserve sessions both reuse this window kind here -- see MatchesHotlinkWhere's comment
+        if (w->m_chan) return L'#';
+        if (w->m_name == L"*status*") return L'*';
+        return L'?';   // query
+    }
+    CString ClassifyHotlinkWord(CChatWnd* w, const CString& word) {
+        if (word.GetLength() > 1 && (word[0] == L'#' || word[0] == L'&')) return L"channel";
+        CString wl = word; wl.MakeLower();
+        if (wl.Left(7) == L"http://" || wl.Left(8) == L"https://" || wl.Left(6) == L"ftp://" || wl.Left(4) == L"www.") return L"url";
+        if (w->m_chan && w->HasNick(Bare(word))) return L"nick";
+        return L"other";
+    }
+    void FireHotlinkEvent(CChatWnd* w, const CString& word, const CString& line, int lineNo, int wordPos, int charPos, const CString& evtName) {
+        if (evtName == L"rclick") { m_hlMenuSet = false; m_hlMenuName.Empty(); m_hlMenuDefault = false; }   // one right-click, one chance to call /hotlink -m/-d -- see ShowHotlinkPopup
+        if (!m_remoteOn || !m_eventsOn) return;
+        wchar_t kind = HotlinkKindOf(w);
+        CString stripped = Strip(word);
+        CString matchType = ClassifyHotlinkWord(w, stripped);
+        CString savedWordRaw = m_hlWordRaw, savedWord = m_hlWord, savedMatch = m_hlMatch, savedEvent = m_hlEvent, savedLine = m_hlLine, savedType = m_hlType, savedLevel = m_evLevel;
+        int savedLineNo = m_hlLineNo, savedWordPos = m_hlWordPos, savedMatchPos = m_hlMatchPos;
+        for (auto& ev : m_events) {
+            if (ev.eventName != L"HOTLINK") continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            if (!MatchesHotlinkWhere(ev.whereSpec, kind)) continue;
+            if (!GlobMatch(ev.matchText, stripped)) continue;
+            m_hlWordRaw = word; m_hlWord = stripped; m_hlMatch = stripped; m_hlEvent = evtName; m_hlLine = line;
+            m_hlLineNo = lineNo; m_hlWordPos = wordPos; m_hlMatchPos = charPos; m_hlType = matchType; m_evLevel.Format(L"%d", ev.level);
+            RunScript(w, ev.lines, stripped);
+        }
+        m_hlWordRaw = savedWordRaw; m_hlWord = savedWord; m_hlMatch = savedMatch; m_hlEvent = savedEvent; m_hlLine = savedLine;
+        m_hlLineNo = savedLineNo; m_hlWordPos = savedWordPos; m_hlMatchPos = savedMatchPos; m_hlType = savedType; m_evLevel = savedLevel;
+    }
+    // Shows the popup menu an "on HOTLINK" handler asked for via /hotlink -m [-d] during the rclick firing that
+    // just ran for this same right-click (FireHotlinkEvent, called from CLogEdit::OnRButtonUp, always runs before
+    // the onContext callback that leads here) -- -m's @menu items alone, or combined with this window's normal
+    // default popup if -d was also given. One-shot: cleared here so a right-click with no matching HOTLINK handler
+    // (or one that didn't call /hotlink) falls through to the ordinary default popup next time, via m_hlMenuSet.
+    bool ShowHotlinkPopup(CChatWnd* w, CPoint pt) {
+        CString menuName = m_hlMenuName; bool addDefault = m_hlMenuDefault;
+        m_hlMenuSet = false; m_hlMenuName.Empty(); m_hlMenuDefault = false;
+        std::vector<PopupItem> items = menuName.IsEmpty() ? std::vector<PopupItem>() : RemoteMenuItemsFor(menuName);
+        if (addDefault) {
+            if (w->m_custom) {
+                std::vector<PopupItem> def = w->m_cwPopup.empty() ? std::vector<PopupItem>() : ParsePopupItems(w->m_cwPopup);
+                std::vector<PopupItem> remote = RemoteMenuItemsFor(w->m_name);
+                def.insert(def.end(), remote.begin(), remote.end());
+                items.insert(items.end(), def.begin(), def.end());
+            } else {
+                int sec = w->m_name == L"*status*" ? 0 : (w->m_chan ? 1 : 2);
+                std::vector<PopupItem> def = m_popRaw[sec].empty() ? std::vector<PopupItem>() : ParsePopupItems(m_popRaw[sec]);
+                std::vector<PopupItem> remote = RemoteMenuItemsFor(kPopType[sec]);
+                def.insert(def.end(), remote.begin(), remote.end());
+                items.insert(items.end(), def.begin(), def.end());
+            }
+        }
+        if (items.empty()) return false;
+        items = ExpandSubmenus(items, w, CString());
+        CMenu m; m.CreatePopupMenu(); std::vector<std::vector<CString>> acts; size_t i = 0;
+        BuildPopupLevel(m, items, i, 0, IDP_CTX, acts, w, CString());
+        if (m.GetMenuItemCount() == 0) return false;
+        SetForegroundWindow(); m_menuOpen = true;
+        int cmd = m.TrackPopupMenu(TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON, pt.x, pt.y, this);
+        m_menuOpen = false; PostMessage(WM_NULL, 0, 0);
+        if (cmd >= IDP_CTX && (size_t)(cmd - IDP_CTX) < acts.size()) RunPopupLines(w, acts[cmd - IDP_CTX], CString());
+        return true;
     }
     // SIGNAL: matched by wildcard against the signal name itself (no channel/where concept -- a signal isn't tied
     // to any particular chat window). $1- is set to the signal's own parameters, and $signal to its name, for the
@@ -11763,9 +12027,24 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"logging") OnLoggingDialog();
         else if (cmd == L"play") CmdPlay(w, arg);
         else if (cmd == L"playctrl") CmdPlayCtrl(w);
+        else if (cmd == L"wavplay") {   // /wavplay <sound.wav> -- real mIRC itself calls this one "essentially replaced by /splay"; just hands off to the same wave channel /splay -w would use
+            CString fname = arg; fname.Trim();
+            if (fname.IsEmpty()) { Show(w, L"* Usage: /wavplay <sound.wav>", cPart); return; }
+            CString err = OpenAndPlaySound(m_waveChan, fname, -1);
+            if (!err.IsEmpty()) Show(w, L"* Could not play " + fname + L": " + err, cPart);
+        }
+        else if (cmd == L"speak") CmdSpeak(w, arg);
+        else if (cmd == L"mdi") {}   // /mdi -actv: arrange/cascade/tile MDI child windows -- this client has no MDI mode at all (its @windows are plain tabbed/floating windows, not MDI children), so there's nothing to arrange; accepted-but-ignored, same spirit as /window's own unsupported switches
+        else if (cmd == L"treebar") {   // /treebar [on|off] -- this client has no treebar panel at all (see $treebar's own "always reports off" comment), so on/off have nothing to actually toggle; no param just echoes the (permanently off) status, matching real mIRC's own "no parameter shows current status" behavior
+            CString a = arg; a.MakeLower(); a.Trim();
+            if (a.IsEmpty()) Show(w, L"* Treebar is off", cInfo);
+            else if (a == L"on") Show(w, L"* /treebar: not supported in this client", cPart);
+            // "off" is already a no-op -- it's always off
+        }
         else if (cmd == L"dns") CmdDns(w, arg);
         else if (cmd == L"window") CmdWindow(w, arg);
-        else if (cmd == L"sockopen" || cmd == L"socklisten" || cmd == L"sockaccept" || cmd == L"sockwrite" || cmd == L"sockread" || cmd == L"sockmark" || cmd == L"sockclose") CmdSock(w, cmd, arg);
+        else if (cmd == L"sockopen" || cmd == L"socklisten" || cmd == L"sockaccept" || cmd == L"sockwrite" || cmd == L"sockread" || cmd == L"sockmark" || cmd == L"sockclose" ||
+                 cmd == L"socklist" || cmd == L"sockrename" || cmd == L"sockudp" || cmd == L"sockpause") CmdSock(w, cmd, arg);
         else if (cmd == L"aline") CmdCwLine(w, arg, L'a');
         else if (cmd == L"cline") CmdCwLine(w, arg, L'c');
         else if (cmd == L"dline") CmdCwLine(w, arg, L'd');
@@ -11907,6 +12186,19 @@ class CMainFrame : public CMDIFrameWnd {
             if (markVal.IsEmpty()) { if (it != v.end()) v.erase(it); }
             else if (it != v.end()) it->mark = markVal;
             else v.push_back({ markName, markVal });
+        }
+        else if (cmd == L"ialclear") {   // /ialclear [nickname] -- clears one nick's IAL entry, or the whole thing if no nickname is given
+            CString nk = Word(arg); nk.Trim();
+            if (nk.IsEmpty()) m_ial.clear();
+            else m_ial.erase(VKey(nk));
+        }
+        else if (cmd == L"ialfill") {   // /ialfill [-f] <channel> -- sends a WHO request for the channel; the 352/315 numeric handlers below do the actual IAL learning as the replies arrive. -f (force a refill) is accepted but has no distinct behavior from the default: this client doesn't cache "already filled" state to skip on, so every call already re-sends the WHO request.
+            CString a = arg;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) Word(a);
+            CString chan = Word(a); chan.Trim();
+            if (chan.IsEmpty()) { Show(w, L"* Usage: /ialfill [-f] <channel>", cPart); return; }
+            if (!net || !net->conn) { Show(w, L"* /ialfill: not connected", cPart); return; }
+            Send(net, L"WHO " + chan);
         }
         else if (cmd == L"ban") {   // /ban [-k] [#channel] <nick|address> [type] [kick message] -- the -aurbeIq switches aren't implemented (no IAL account tracking, ban-list-type targeting, or timed-unban queue)
             CString a = arg; bool kickToo = false;
@@ -12094,6 +12386,66 @@ class CMainFrame : public CMDIFrameWnd {
             if (sigName.IsEmpty()) { Show(w, L"* /signal: insufficient parameters", cPart); return; }
             FireSignalEvent(w, sigName, a);
         }
+        else if (cmd == L"hotlink") {   // /hotlink -md [@menu] -- only meaningful while an "on HOTLINK" handler is running for a right-click (rclick); overrides the popup that's about to appear for it. -m: use @menu's own items. -d: also add this window's normal default popup. Neither switch: a no-op (the page's own second example, using plain /hotlink -d with no -m, is exactly this -d-alone case).
+            CString a = arg; bool setMenu = false, addDefault = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L'm') >= 0) setMenu = true;
+                if (sw.Find(L'd') >= 0) addDefault = true;
+            }
+            CString menuName = a; menuName.Trim();
+            if (setMenu) { m_hlMenuName = menuName; m_hlMenuSet = true; }
+            if (addDefault) { m_hlMenuDefault = true; m_hlMenuSet = true; }
+        }
+        else if (cmd == L"url") {   // /url on|off|show|hide|save|load|delete | -a/-n <url> | -r <N/mark> | -i <N/mark> <url> | -l/-s <file.ini>
+            CString a = arg; bool swA = false, swN = false, swR = false, swI = false, swL = false, swS = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L'a') >= 0) swA = true; if (sw.Find(L'n') >= 0) swN = true;
+                if (sw.Find(L'r') >= 0) swR = true; if (sw.Find(L'i') >= 0) swI = true;
+                if (sw.Find(L'l') >= 0) swL = true; if (sw.Find(L's') >= 0) swS = true;
+            }
+            a.Trim();
+            auto removeByTarget = [&](CString tgt) {
+                tgt.Trim(); if (tgt.IsEmpty()) return;
+                double nD;
+                if (ParseNum(tgt, nD)) { int n = (int)nD; if (n >= 1 && n <= (int)m_urlList.size()) m_urlList.erase(m_urlList.begin() + (n - 1)); }
+                else { wchar_t mk = tgt[0]; m_urlList.erase(std::remove_if(m_urlList.begin(), m_urlList.end(), [&](const UrlEntry& e) { return e.mark == mk; }), m_urlList.end()); }
+                RefreshUrlWnd(); SaveUrls(CString());
+            };
+            if (swR) { removeByTarget(Word(a)); return; }
+            if (swI) {   // -i <N/mark> <URLaddress>: a numeric N inserts at that position; a single-character mark appends, tagged with it
+                CString tgt = Word(a); CString url = a; url.Trim();
+                if (tgt.IsEmpty() || url.IsEmpty()) { Show(w, L"* Usage: /url -i <N/mark> <URLaddress>", cPart); return; }
+                UrlEntry e; e.addr = url; double nD;
+                if (ParseNum(tgt, nD)) { int n = (int)nD; int idx = (n >= 1 && n <= (int)m_urlList.size() + 1) ? n - 1 : (int)m_urlList.size(); m_urlList.insert(m_urlList.begin() + idx, e); }
+                else { e.mark = tgt[0]; m_urlList.push_back(e); }
+                RefreshUrlWnd(); SaveUrls(CString()); return;
+            }
+            if (swL) { CString file = a; file.Trim(); if (file.IsEmpty()) { Show(w, L"* Usage: /url -l <file.ini>", cPart); return; } LoadUrls(file); return; }
+            if (swS) { CString file = a; file.Trim(); if (file.IsEmpty()) { Show(w, L"* Usage: /url -s <file.ini>", cPart); return; } SaveUrls(file); return; }
+            if (swA || swN) {
+                CString url = a; url.Trim();
+                if (url.IsEmpty()) { Show(w, L"* Usage: /url -a|-n <URLaddress>", cPart); return; }
+                if (url.Left(4).CompareNoCase(L"www.") == 0) url = L"https://" + url;
+                ::ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+                return;
+            }
+            CString kw = Word(a); kw.MakeLower();
+            if (kw == L"on") { m_urlOn = true; Show(w, L"* URL catcher is now on", cInfo); }
+            else if (kw == L"off") { m_urlOn = false; Show(w, L"* URL catcher is now off", cInfo); }
+            else if (kw == L"show") ShowUrlWindow();
+            else if (kw == L"hide") HideUrlWindow();
+            else if (kw == L"save") SaveUrls(a);
+            else if (kw == L"load") LoadUrls(a);
+            else if (kw == L"delete") removeByTarget(a);
+            else if (!kw.IsEmpty()) {   // bare "/url <address>", no switch at all -- real mIRC just opens it directly, same as -a/-n
+                CString url = arg; url.Trim();
+                if (url.Left(4).CompareNoCase(L"www.") == 0) url = L"https://" + url;
+                ::ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            else Show(w, L"* Usage: /url on|off|show|hide|save|load|delete | -an <url> | -r <N/mark> | -i <N/mark> <url> | -ls <file.ini>", cPart);
+        }
         else if (cmd == L"hmake") {   // /hmake [-s] <name> [N] -- N (bucket count) is accepted and reported back via $hget(table).size but otherwise purely cosmetic, see the HashTableEntry comment
             CString a = arg; bool showMsg = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L's') >= 0) showMsg = true; }
@@ -12158,6 +12510,84 @@ class CMainFrame : public CMDIFrameWnd {
                 if (it != t->items.end()) { t->items.erase(it); if (showMsg) Show(w, L"* /hdel: removed item '" + item + L"'", cPart); }
                 // deleting a non-existent single item (no -w) is quietly a no-op in real mIRC too, unlike a missing table
             }
+        }
+        else if (cmd == L"hinc") CmdHashIncDec(w, cmd, arg, 1);
+        else if (cmd == L"hdec") CmdHashIncDec(w, cmd, arg, -1);
+        else if (cmd == L"hsave") {   // /hsave [-nsa] <name> <filename> -- plain-text format only (name line + data line per item, or -n for values-only); see this loop's own comment for what's skipped
+            CString a = arg; bool showMsg = false, namesOnly = false, append = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L's') >= 0) showMsg = true;
+                if (sw.Find(L'n') >= 0) namesOnly = true;
+                if (sw.Find(L'a') >= 0) append = true;
+                // -b/-B (binary -- no binary-variable subsystem exists in this client), -i (INI section format),
+                // -u (include items with a scheduled unset -- no such scheduling exists here, so every item is
+                // always "included" already) are all accepted-but-ignored: this always writes the same plain
+                // default text format (or -n's values-only form), so /hload reading it back with THIS client
+                // works regardless of which of those switches was given to /hsave.
+            }
+            CString tname = Word(a);
+            CString fname = a; fname.Trim();
+            if (fname.GetLength() >= 2 && fname.Left(1) == L"\"" && fname.Right(1) == L"\"") fname = fname.Mid(1, fname.GetLength() - 2);
+            if (tname.IsEmpty() || fname.IsEmpty()) { Show(w, L"* /hsave: insufficient parameters", cPart); return; }
+            HashTableEntry* t = FindHashTable(tname);
+            if (!t) { Show(w, L"* /hsave: table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
+            try {
+                CStdioFile f;
+                if (!f.Open(fname, CFile::modeCreate | CFile::modeWrite | (append ? CFile::modeNoTruncate : 0))) {
+                    Show(w, L"* /hsave: unable to open '" + fname + L"'", cPart); return;
+                }
+                if (append) f.SeekToEnd();
+                for (auto& kv : t->items) {
+                    if (!namesOnly) { CStringA n8 = CW2A(kv.first, CP_UTF8); f.Write(n8.GetString(), n8.GetLength()); f.Write("\r\n", 2); }
+                    CStringA d8 = CW2A(kv.second, CP_UTF8); f.Write(d8.GetString(), d8.GetLength()); f.Write("\r\n", 2);
+                }
+                if (showMsg) Show(w, L"* /hsave: saved hash table '" + tname + L"' to '" + fname + L"'", cInfo);
+            } catch (CFileException* fe) { fe->Delete(); Show(w, L"* /hsave: write error on '" + fname + L"'", cPart); }
+        }
+        else if (cmd == L"hload") {   // /hload [-snm[N]] <name> <filename> -- plain-text format only; see /hsave's own comment for what's skipped (-b/-B/-i all fall back to the same default text format, so a file this client itself /hsave'd always loads correctly here regardless of the switch originally given)
+            CString a = arg; bool showMsg = false, namesOnly = false, makeIfMissing = false; int makeSize = 100;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                if (sw.Find(L's') >= 0) showMsg = true;
+                if (sw.Find(L'n') >= 0) namesOnly = true;
+                int mPos = sw.Find(L'm');
+                if (mPos >= 0) { makeIfMissing = true; CString numPart = sw.Mid(mPos + 1); double nD; if (!numPart.IsEmpty() && ParseNum(numPart, nD) && nD > 0) makeSize = (int)nD; }
+            }
+            CString tname = Word(a);
+            CString fname = a; fname.Trim();
+            if (fname.GetLength() >= 2 && fname.Left(1) == L"\"" && fname.Right(1) == L"\"") fname = fname.Mid(1, fname.GetLength() - 2);
+            if (tname.IsEmpty() || fname.IsEmpty()) { Show(w, L"* /hload: insufficient parameters", cPart); return; }
+            HashTableEntry* t = FindHashTable(tname);
+            if (!t) {
+                if (!makeIfMissing) { Show(w, L"* /hload: table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
+                HashTableEntry nt; nt.name = tname; nt.size = makeSize; m_hashTables.push_back(nt); t = &m_hashTables.back();
+            }
+            CStdioFile f;
+            if (!f.Open(fname, CFile::modeRead)) { Show(w, L"* /hload: unable to open '" + fname + L"'", cPart); m_halt = true; return; }
+            CString line;
+            // Loading into a table that already has items replaces the value of any item whose name matches a
+            // loaded item and leaves everything else alone -- matching real mIRC's own documented behavior --
+            // rather than clearing the table first.
+            if (namesOnly) {   // -n: every line is a value only; items are named with sequential integers starting at 1
+                int seq = 1;
+                while (f.ReadString(line)) {
+                    CString itemName; itemName.Format(L"%d", seq++);
+                    bool found = false;
+                    for (auto& kv : t->items) if (kv.first.CompareNoCase(itemName) == 0) { kv.second = line; found = true; break; }
+                    if (!found) t->items.push_back({ itemName, line });
+                }
+            } else {   // default: each item is two lines -- its name, then its data
+                CString name; bool haveName = false;
+                while (f.ReadString(line)) {
+                    if (!haveName) { name = line; haveName = true; continue; }
+                    bool found = false;
+                    for (auto& kv : t->items) if (kv.first.CompareNoCase(name) == 0) { kv.second = line; found = true; break; }
+                    if (!found) t->items.push_back({ name, line });
+                    haveName = false;
+                }
+            }
+            if (showMsg) Show(w, L"* Loaded hash table '" + tname + L"' from '" + fname + L"'", cInfo);
         }
         else if (cmd == L"fopen") {   // /fopen [-nox] <handle> <filename> -- -x (exclusive access) is accepted but not distinguished from the default (this app always opens shared read/write already)
             CString a = arg; bool createNew = false, overwrite = false;
@@ -12342,6 +12772,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = arg; bool clearFirst = false, noCrlf = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'c') >= 0) clearFirst = true; if (sw.Find(L'n') >= 0) noCrlf = true; }
             CString file = Word(a), text = a;
+            if (file.GetLength() >= 2 && file.Left(1) == L"\"" && file.Right(1) == L"\"") file = file.Mid(1, file.GetLength() - 2);   // "/write \"my file.txt\" ..." -- mIRC lets filenames be quoted; Word() alone doesn't strip that
             if (file.IsEmpty()) { Show(w, L"* Usage: /write [-cn] <filename> [text]", cPart); return; }
             CFile f; if (f.Open(file, (clearFirst ? CFile::modeCreate : (CFile::modeCreate | CFile::modeNoTruncate)) | CFile::modeWrite)) {
                 f.SeekToEnd(); CString line = text + (noCrlf ? CString() : CString(L"\r\n")); CStringA a8(line); f.Write(a8.GetString(), a8.GetLength());
@@ -12648,6 +13079,8 @@ class CMainFrame : public CMDIFrameWnd {
             }
             Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart);
         }
+        else if (cmd == L"registration") Note(net, L"Hahahaha No need to register :)  This is Free and Open Sourced IRC Client.  https://github.com/ELY3M/IRC-Client");
+        else if (cmd == L"xyzzy") Note(net, "Nothing Happens");
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
         else if (cmd.Left(4) == L"draw") CmdDraw(w, cmd, arg);   // /drawdot /drawline /drawrect /drawfill /drawtext /drawpic /drawcopy /drawsave -- see CmdDraw's own comment. Still never falls through to the raw-server catch-all below, which is what used to flood the server with dozens of garbage lines per second from something like a Tetris redraw loop and freeze the client.
         else {
@@ -12758,6 +13191,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString evName = ctcp ? L"ACTION" : (notice ? L"NOTICE" : L"TEXT");
             CString evBody = ctcp ? txt.Mid(6) : txt;
             bool evSuppress = FireTextEvent(w, evName, priv, priv ? nick : tgt, nick, host, evBody);
+            UrlCatch(w, nick, evBody);   // /url on: scan every incoming TEXT/ACTION/NOTICE for URL-looking words, independent of whether a ^-event suppressed the line's own display
             if (evSuppress) { /* a ^-event halted the default display for this message */ }
             else if (ctcp) Show(w, L"* " + nick + txt.Mid(6), hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cAction));   // ACTION (/me): a real chat message, so it still uses the normal window
             else if (notice) {
@@ -12925,6 +13359,11 @@ class CMainFrame : public CMDIFrameWnd {
             if (net->listWnd) { CString modes, topic; ParseListModes(P(3), modes, topic); net->listWnd->AddRow(P(1), _wtoi(P(2)), modes, topic); }
         }
         else if (cmd == L"323") { if (net->listWnd) net->listWnd->Resort(); }   // RPL_LISTEND: results complete, sort and display
+        else if (cmd == L"352") {   // RPL_WHOREPLY: <me> <channel> <user> <host> <server> <nick> <flags> :<hopcount> <realname> -- used only to learn nick->address pairs for the IAL (via /ialfill); nothing is displayed, same as real mIRC's own default (no separate "on WHOREPLY" raw-WHO display exists here either)
+            CString whoNick = P(5), whoUser = P(2), whoHost = P(3);
+            if (!whoNick.IsEmpty() && !whoUser.IsEmpty() && !whoHost.IsEmpty()) IalLearn(whoNick, whoUser + L"@" + whoHost);
+        }
+        else if (cmd == L"315") {}   // RPL_ENDOFWHO: nothing further needed -- every entry was already learned from its own 352 line as it arrived
         else if (cmd == L"353") {
             if (CChatWnd* w = Find(net, P(2))) {
                 if (w->m_refresh) { w->ClearNicks(); w->m_refresh = false; }
@@ -12933,7 +13372,7 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         else if (cmd == L"366") {}
-        else if (cmd == L"433") {   // ERR_NICKNAMEINUSE -- try the configured alt nick (/connect's "Alt Nick" field) once, before falling back to just appending "_" repeatedly
+        else if (cmd == L"433") {   // ERR_NICKNAMEINUSE -- try the configured alt nick (/connect's "Alt Nickname" field) once, before falling back to just appending "_" repeatedly
             if (!net->connectTick && !net->triedAltNick && !net->o.anick.IsEmpty() && net->o.anick.CompareNoCase(net->nick) != 0) { net->triedAltNick = true; net->nick = net->o.anick; }
             else net->nick += L"_";
             Note(net, L"Nickname in use, trying " + net->nick, cText); Send(net, L"NICK " + net->nick);
@@ -13526,6 +13965,46 @@ class CMainFrame : public CMDIFrameWnd {
     static int GetMasterVolumeNow() { IAudioEndpointVolume* vol = nullptr; float f = 0; if (GetMasterEndpoint(&vol)) { vol->GetMasterVolumeLevelScalar(&f); vol->Release(); } return (int)(f * 65535.0f); }
     static void SetMasterMuteNow(bool m) { IAudioEndpointVolume* vol = nullptr; if (GetMasterEndpoint(&vol)) { vol->SetMute(m, nullptr); vol->Release(); } }
     static bool GetMasterMuteNow() { IAudioEndpointVolume* vol = nullptr; BOOL m = FALSE; if (GetMasterEndpoint(&vol)) { vol->GetMute(&m); vol->Release(); } return m != FALSE; }
+    // /speak -- lazily creates the one SAPI voice instance this client ever uses. CLSID_SpVoice/IID_ISpVoice are
+    // defined here as plain local constants (the well-known, published SAPI 5 GUID values) rather than
+    // referencing <sapi.h>'s own extern'd CLSID_SpVoice/IID_ISpVoice symbols, so nothing extra needs linking
+    // beyond the ole32/oleaut32 this app already links for other COM use (see /vol's own CoCreateInstance just
+    // above, which already establishes that CoInitialize is safe to call ad hoc like this).
+    bool EnsureSpVoice() {
+        if (m_spVoice) return true;
+        static bool comInit = false; if (!comInit) { ::CoInitialize(nullptr); comInit = true; }
+        const CLSID kClsidSpVoice = { 0x96749377, 0x3391, 0x11D2, { 0x9E, 0xE3, 0x00, 0xC0, 0x4F, 0x79, 0x73, 0x96 } };
+        const IID kIidSpVoice = { 0x6C44DF74, 0x72B9, 0x4992, { 0xA1, 0xEC, 0xEF, 0x99, 0x6E, 0x04, 0x22, 0xD4 } };
+        return SUCCEEDED(::CoCreateInstance(kClsidSpVoice, nullptr, CLSCTX_ALL, kIidSpVoice, (void**)&m_spVoice));
+    }
+    // /speak -spclu [speed] [pitch] [text] -- -l/-u (apply the speech dialog's own saved lexicon/option settings)
+    // are accepted-but-ignored, since no such dialog exists in this client; everything else is real, via SAPI.
+    void CmdSpeak(CChatWnd* w, CString arg) {
+        CString a = arg; bool clearQ = false; int rate = INT_MIN, pitch = INT_MIN;
+        while (a.Left(1) == L"-" && a.GetLength() > 1) {
+            CString sw = Word(a);
+            for (int i = 1; i < sw.GetLength(); i++) {
+                wchar_t c = sw[i];
+                if (c == L'c') clearQ = true;
+                else if (c == L's') { CString v = Word(a); rate = _wtoi(v); }
+                else if (c == L'p') { CString v = Word(a); pitch = _wtoi(v); }
+            }
+            a.TrimLeft();
+        }
+        if (!EnsureSpVoice()) { Show(w, L"* /speak: speech engine unavailable", cPart); return; }
+        if (rate != INT_MIN) m_spVoice->SetRate((long)((rate - 50) / 5));   // SAPI's own rate range is -10..10; 0-100 maps onto it linearly with 50 as the "normal" midpoint, same mapping used for pitch below
+        CString text = a; text.Trim();
+        if (text.IsEmpty()) { if (clearQ) m_spVoice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr); return; }
+        DWORD flags = SPF_ASYNC | (clearQ ? SPF_PURGEBEFORESPEAK : 0);
+        CString toSpeak = text;
+        if (pitch != INT_MIN) {   // SAPI has no direct SetPitch call -- pitch is only settable via XML prosody markup wrapped around the text itself
+            int absmiddle = (pitch - 50) / 5;
+            CString esc = toSpeak; esc.Replace(L"&", L"&amp;"); esc.Replace(L"<", L"&lt;"); esc.Replace(L">", L"&gt;");
+            toSpeak.Format(L"<pitch absmiddle=\"%d\">%s</pitch>", absmiddle, (LPCWSTR)esc);
+            flags |= SPF_IS_XML;
+        }
+        m_spVoice->Speak(toSpeak, flags, nullptr);
+    }
     void CmdSplay(CChatWnd* w, CString arg) {
         arg.Trim();
         bool wFlag = false, mFlag = false, pFlag = false, qFlag = false, cFlag = false;
@@ -13745,6 +14224,68 @@ class CMainFrame : public CMDIFrameWnd {
         Activate(m_notifyWnd);
     }
     void HideNotifyWindow() { if (m_notifyWnd) m_notifyWnd->DestroyWindow(); }
+    // ---- /url, $url, the URL catcher -- see UrlEntry, CUrlWnd, CmdUrl's dispatch block ----
+    void RefreshUrlWnd() { if (m_urlWnd) m_urlWnd->Populate(m_urlList); }
+    void ShowUrlWindow() {
+        if (!m_urlWnd) {
+            m_urlWnd = new CUrlWnd();
+            m_urlWnd->m_seq = ++m_seqn;
+            m_urlWnd->onClosed = [this](CUrlWnd*) { m_urlWnd = nullptr; };
+            m_urlWnd->onOpenUrl = [](CString url) { if (url.Left(4).CompareNoCase(L"www.") == 0) url = L"https://" + url; ::ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL); };
+            m_urlWnd->Create(nullptr, L"URL List", WS_CHILD | WS_VISIBLE | WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, rectDefault, this);
+            RefreshUrlWnd();
+        }
+        Activate(m_urlWnd);
+    }
+    void HideUrlWindow() { if (m_urlWnd) m_urlWnd->DestroyWindow(); }
+    void SaveUrls(CString file) {
+        if (file.IsEmpty()) { if (m_urlFile.IsEmpty()) m_urlFile = IniPath(L"urls.ini"); file = m_urlFile; } else m_urlFile = file;
+        WritePrivateProfileStringW(L"urls", nullptr, nullptr, file);   // drop the section, then rewrite it in order -- same pattern as SaveAliases
+        for (size_t i = 0; i < m_urlList.size(); i++) {
+            CString key; key.Format(L"n%d", (int)i);
+            CString mk = m_urlList[i].mark ? CString(m_urlList[i].mark) : CString();
+            WritePrivateProfileStringW(L"urls", key, m_urlList[i].addr + L"\t" + m_urlList[i].desc + L"\t" + m_urlList[i].group + L"\t" + mk, file);
+        }
+    }
+    void LoadUrls(CString file) {
+        if (file.IsEmpty()) { if (m_urlFile.IsEmpty()) m_urlFile = IniPath(L"urls.ini"); file = m_urlFile; } else m_urlFile = file;
+        m_urlList.clear();
+        if (GetFileAttributesW(file) != INVALID_FILE_ATTRIBUTES) {
+            std::vector<wchar_t> buf(262144, 0);
+            DWORD n = GetPrivateProfileSectionW(L"urls", buf.data(), (DWORD)buf.size(), file);
+            if (n) for (wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+                CString line = p; int eq = line.Find(L'='); if (eq <= 0) continue;
+                CString rest = line.Mid(eq + 1); UrlEntry e;
+                int t1 = rest.Find(L'\t'); e.addr = t1 < 0 ? rest : rest.Left(t1); rest = t1 < 0 ? CString() : rest.Mid(t1 + 1);
+                int t2 = rest.Find(L'\t'); e.desc = t2 < 0 ? rest : rest.Left(t2); rest = t2 < 0 ? CString() : rest.Mid(t2 + 1);
+                int t3 = rest.Find(L'\t'); e.group = t3 < 0 ? rest : rest.Left(t3); rest = t3 < 0 ? CString() : rest.Mid(t3 + 1);
+                if (!rest.IsEmpty()) e.mark = rest[0];
+                m_urlList.push_back(e);
+            }
+        }
+        RefreshUrlWnd();
+    }
+    // Scans an incoming TEXT/ACTION/NOTICE for URL-looking words and appends each one caught -- the URL catcher's
+    // whole job when /url is "on". Real mIRC's catcher additionally recognizes nick!user@host-style "addresses"
+    // and raw IPs in some configurations; this sticks to the same http(s)/ftp/www. word test $url's own click-to-
+    // open logic already uses elsewhere (CLogEdit::IsUrlWord), so a word this client would already show a hand
+    // cursor and open-in-browser for is exactly the set the catcher logs here too.
+    void UrlCatch(CChatWnd* w, const CString& nick, const CString& text) {
+        if (!m_urlOn) return;
+        CString rest = Strip(text); bool any = false;
+        while (!rest.IsEmpty()) {
+            CString word = Word(rest);
+            CString wl = word; wl.MakeLower();
+            if (wl.Left(7) != L"http://" && wl.Left(8) != L"https://" && wl.Left(6) != L"ftp://" && wl.Left(4) != L"www.") continue;
+            word.Trim(L",.;:!?()<>[]'\"");
+            if (word.IsEmpty()) continue;
+            UrlEntry e; e.addr = word;
+            e.desc = w ? (nick.IsEmpty() ? w->m_name : (nick + L" on " + w->m_name)) : nick;
+            e.group = (w && w->net) ? w->net->tag : CString();
+            m_urlList.push_back(e); any = true;
+        }
+        if (any) { RefreshUrlWnd(); SaveUrls(CString()); }   // real mIRC keeps urls.ini continuously in sync with the caught list, not just on an explicit /url save
+    }
     void ShowNotifyMessage(Net* net, const CString& msg) {
         if (m_notifyOnlyInWindow) { RefreshNotifyWnd(); return; }
         CChatWnd* target = Status(net);
@@ -15301,6 +15842,20 @@ class CMainFrame : public CMDIFrameWnd {
         // the close it deferred.
         if (s->remoteClosed && FindSock(s->name) == s && (!s->sock || s->sock->recvBuf.empty())) RemoveSock(s->name, L"drain-loop-finished");
     }
+    // /sockudp's equivalent of OnSockReceive -- same drain-loop shape (re-fire synchronously while unread data
+    // remains, bail out if the event itself closed/replaced this socket), just firing "UDPREAD" instead of
+    // "SOCKREAD" per real mIRC's own separate event name for datagram sockets. $sockread/$sockbr/$sockerr all
+    // still work unchanged inside it, since those key off whatever FireSockEvent set $sockname to, not the
+    // event name itself.
+    void OnUdpReceive(MircSock* s) {
+        for (;;) {
+            if (!s->sock || s->sock->recvBuf.empty()) break;
+            size_t before = s->sock->recvBuf.size();
+            FireSockEvent(ActiveOrStatus(), L"UDPREAD", s->name, CString());
+            if (FindSock(s->name) != s) break;   // /sockclose'd (or replaced under the same name) from inside that very event body
+            if (s->sock->recvBuf.empty() || s->sock->recvBuf.size() == before) break;
+        }
+    }
     void OnSockAccept(MircSock* s) { s->pendingAccept = true; FireSockEvent(ActiveOrStatus(), L"SOCKLISTEN", s->name, CString()); }
     void OnSockClose(MircSock* s) {
 #if DEBUGGING
@@ -15322,10 +15877,25 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void CmdSock(CChatWnd* w, CString cmd, CString arg) {
         CString a = arg; a.TrimLeft();
-        bool swE = false, swU = false, swN = false;
+        // One shared switch parse for every /sock* command -- each letter only means something to the specific
+        // command that reads it below (e.g. swN is "no CRLF" for /sockwrite but "append a CRLF" for /sockudp,
+        // matching each command's own real mIRC doc wording), and a letter a given command doesn't care about is
+        // just silently ignored, same as -u/-n always were here before this.
+        bool swE = false, swU = false, swN = false, swT = false, swL = false, swZ = false, swR = false;
         while (!a.IsEmpty() && a[0] == L'-') {
             CString t = Word(a);
-            for (int i = 1; i < t.GetLength(); i++) { wchar_t c = t[i]; if (c == L'e') swE = true; else if (c == L'u') swU = true; else if (c == L'n') swN = true; }   // -e (SSL, via the same CTls/SChannel wrapper CIrcSock uses): honored in sockopen below. -u (UDP): accepted, not implemented. -n (sockwrite: raw bytes, no appended CRLF): honored below.
+            for (int i = 1; i < t.GetLength(); i++) {
+                wchar_t c = t[i];
+                if (c == L'e') swE = true;        // /sockopen: SSL, via the same CTls/SChannel wrapper CIrcSock uses
+                else if (c == L'u') swU = true;    // /sockopen: UDP, accepted-not-implemented (use /sockudp instead) | /socklist: list UDP sockets
+                else if (c == L'n') swN = true;    // /sockwrite: raw bytes, no appended CRLF | /sockudp: append a CRLF
+                else if (c == L't') swT = true;    // /socklist: list TCP sockets | /sockudp: force &binvar as text -- accepted-not-implemented (no binary-variable subsystem exists)
+                else if (c == L'l') swL = true;    // /socklist: list listening sockets
+                else if (c == L'z') swZ = true;    // /sockudp: close right after sending, don't wait around for a reply
+                else if (c == L'r') swR = true;    // /sockpause: resume (restart reading) instead of pausing
+                // -b/-d/-k (sockudp: explicit byte count / bind address / keep socket open) are accepted-but-ignored --
+                // -k is effectively always on here (a /sockudp socket stays open for replies unless -z says otherwise).
+            }
             a.TrimLeft();
         }
         if (cmd == L"sockopen") {
@@ -15453,6 +16023,67 @@ class CMainFrame : public CMDIFrameWnd {
                 std::vector<CString> names; for (auto& s : m_socks) if (!s->pendingClose && GlobMatch(name, s->name)) names.push_back(s->name);
                 for (auto& n : names) RemoveSock(n, L"sockclose-wildcard");   // same deferred-removal path as the single-name case -- see its own comment
             } else RemoveSock(name, L"sockclose-name");
+        }
+        else if (cmd == L"socklist") {   // /socklist [-tul] [name] -- lists currently-open sockets to the active window; [name] is a wildcard filter, same convention as /sockclose's own
+            CString filter = RunWord(a);
+            bool anyTypeFilter = swT || swU || swL;
+            int shown = 0;
+            for (auto& s : m_socks) {
+                if (s->pendingClose) continue;
+                if (!filter.IsEmpty() && !GlobMatch(filter, s->name)) continue;
+                if (anyTypeFilter) {
+                    bool isTcp = !s->listening && !s->isUdp;
+                    bool match = (swT && isTcp) || (swU && s->isUdp) || (swL && s->listening);
+                    if (!match) continue;
+                }
+                CString typeStr = s->listening ? L"listen" : (s->isUdp ? L"udp" : L"tcp");
+                CString line; line.Format(L"* %s: type=%s addr=%s:%d raddr=%s:%d mark=%s",
+                    (LPCWSTR)s->name, (LPCWSTR)typeStr, (LPCWSTR)s->addr, s->port, (LPCWSTR)s->raddr, s->rport, (LPCWSTR)s->mark);
+                Show(w, line, cInfo);
+                shown++;
+            }
+            CString d; d.Format(L"* /socklist: %d socket(s)", shown); Show(w, d, cInfo);
+        }
+        else if (cmd == L"sockrename") {   // /sockrename <name> <newname>
+            CString name = RunWord(a), newname = RunWord(a);
+            if (name.IsEmpty() || newname.IsEmpty()) { Show(w, L"* /sockrename: invalid parameters", cPart); return; }
+            MircSock* s = FindSock(name);
+            if (!s) { Show(w, L"* /sockrename: no such socket: " + name, cPart); return; }
+            if (FindSock(newname)) { Show(w, L"* /sockrename: a socket named " + newname + L" already exists", cPart); return; }
+            s->name = newname;
+        }
+        else if (cmd == L"sockudp") {
+            // Scoped down from mIRC's full "/sockudp -bntkduz [bindip] <name> [port] <ipaddress> <port> [numbytes]
+            // [text|%var|&binvar]": supports the common one-shot-send case ("/sockudp <name> <ipaddress> <port>
+            // [text]"), staying open afterward so a reply can arrive via "on UDPREAD" unless -z says to close
+            // right away. An explicit local bind port/address, an explicit byte count, dual-stack IPv6, and
+            // &binvar payloads (this client has no binary-variable subsystem at all yet) are all accepted-but-
+            // ignored, same as -u/-n always were for /sockopen before this.
+            CString name = RunWord(a);
+            CString ipaddr = RunWord(a);
+            int port = _wtoi(RunWord(a));
+            CString text = a;   // rest of the line, verbatim -- same convention as /sockwrite's own text argument
+            if (name.IsEmpty() || ipaddr.IsEmpty() || port <= 0) { Show(w, L"* /sockudp: invalid parameters", cPart); return; }
+            RemoveSock(name, L"sockudp-reuse");
+            auto ms = std::make_unique<MircSock>(); ms->name = name; ms->addr = ipaddr; ms->port = port; ms->isUdp = true;
+            ms->sock = std::make_unique<CMircSocket>();
+            if (!ms->sock->Create(0, SOCK_DGRAM)) { Show(w, L"* /sockudp: unable to create UDP socket", cPart); return; }
+            MircSock* msp = ms.get();
+            ms->sock->onReceive = [this, msp]() { OnUdpReceive(msp); };
+            m_socks.push_back(std::move(ms));
+            CStringA utf8 = CW2A(text, CP_UTF8);
+            std::string out(utf8.GetString(), utf8.GetLength());
+            if (swN) out += "\r\n";   // -n here means APPEND a CRLF, per /sockudp's own doc wording -- the opposite sense from /sockwrite's -n
+            int sent = m_socks.back()->sock->SendTo(out.data(), (int)out.size(), (UINT)port, ipaddr);
+            if (sent == SOCKET_ERROR) { m_sockErr = L"Unable to send"; FireSockEvent(ActiveOrStatus(), L"SOCKWRITE", name, CString()); }
+            if (swZ) RemoveSock(name, L"sockudp-fire-and-forget");   // -z: don't wait around for a reply
+        }
+        else if (cmd == L"sockpause") {   // /sockpause [-r] <name>
+            CString name = RunWord(a);
+            MircSock* s = FindSock(name);
+            if (!s || !s->sock) { Show(w, L"* /sockpause: no such socket: " + name, cPart); return; }
+            s->sock->paused = !swR;
+            if (swR) s->sock->Drain();   // catch up on whatever accumulated while paused -- no NEW data (and so no new FD_READ) may ever arrive if the peer already finished sending before this resume
         }
     }
     // ---- /window: create/manipulate a custom @window. A large chunk of mIRC's own switch list has no equivalent in
@@ -16431,6 +17062,19 @@ class CMainFrame : public CMDIFrameWnd {
         };
         sq(0, 0, RGB(220,30,30)); sq(5, 0, RGB(30,160,30)); sq(0, 5, RGB(30,90,220)); sq(5, 5, RGB(230,180,0));
     }
+    // Two overlapping chain-link rings, for the URL List toolbar/menu button -- scaled against W rather than fixed
+    // 16px offsets (unlike the glyphs above, which only ever get drawn at W=16: this one also has to look right
+    // appended after a real W=24 MiniIRC.rc icon strip, since that resource file has no 12th icon of its own to
+    // swap in for this new button).
+    static void DrawUrlListGlyph(CDC& mem, int baseX, int W) {
+        int pw = (std::max)(1, W / 8);
+        CPen pn(PS_SOLID, pw, RGB(30, 110, 190)); CPen* op = mem.SelectObject(&pn);
+        CBrush* ob = (CBrush*)mem.SelectStockObject(NULL_BRUSH);
+        int y0 = W * 5 / 16, y1 = W * 11 / 16;
+        mem.Ellipse(CRect(baseX + W * 2 / 16, y0, baseX + W * 10 / 16, y1));
+        mem.Ellipse(CRect(baseX + W * 6 / 16, y0, baseX + W * 14 / 16, y1));
+        mem.SelectObject(op); mem.SelectObject(ob);
+    }
     static void DrawScriptEditorGlyph(CDC& mem, int baseX) {   // a simple page-with-text-lines icon, for the Scripts Editor button
         CBrush br(RGB(250, 250, 240)); CBrush* ob = mem.SelectObject(&br); CPen pn(PS_SOLID, 1, RGB(90, 90, 90)); CPen* op = mem.SelectObject(&pn);
         mem.Rectangle(baseX + 3, 1, baseX + 13, 16);   // the page
@@ -16457,13 +17101,15 @@ class CMainFrame : public CMDIFrameWnd {
         mem.SelectObject(op); mem.SelectObject(ob);
     }
     void BuildToolbar() {   // real icons from the optional resource bitmap; falls back to plain drawn glyphs if MiniIRC.rc wasn't linked in
-        const int N = 11;
+        const int N = 12;
         CBitmap resBmp;
         bool haveRes = resBmp.LoadBitmap(102) != 0;   // id 102 in MiniIRC.rc ("toolbar.bmp"); absent in the plain one-file build
         int W = haveRes ? 24 : 16, H = W; m_tbIcon = W;
+        int resCount = 0;   // how many W x H cells resBmp actually contains -- read back below once haveRes is known, so the hand-drawn URL List fallback (appended further down) is skipped once toolbar.bmp itself has grown a 12th icon
         m_tbImg.Create(W, H, ILC_COLOR24 | ILC_MASK, N, 0);
         if (haveRes) {
-            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, scripts editor, address book, online timer, colors (11 icons)
+            BITMAP bmInfo = {}; resBmp.GetBitmap(&bmInfo); resCount = W > 0 ? bmInfo.bmWidth / W : 0;
+            m_tbImg.Add(&resBmp, RGB(255, 0, 255));   // strip order: connect, disconnect, server list, cascade, tile, help, favorites, scripts editor, address book, online timer, colors, [url list if present] (11 or 12 icons)
         } else {
             CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
             CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W * N, H);
@@ -16498,6 +17144,17 @@ class CMainFrame : public CMDIFrameWnd {
             mem.SelectObject(oldBmp);
             m_tbImg.Add(&bmp, RGB(255, 0, 255));
         }
+        if (!haveRes || resCount < N) {   // 12th icon (index 11): URL List. Hand-drawn and appended here only when
+            // toolbar.bmp itself doesn't already supply it (resCount < N) -- once a real 24x24 icon is added as
+            // toolbar.bmp's 12th cell, resCount reaches N and this is skipped, so the real one isn't double-added.
+            CClientDC scr(this); CDC mem; mem.CreateCompatibleDC(&scr);
+            CBitmap bmp; bmp.CreateCompatibleBitmap(&scr, W, H);
+            CBitmap* oldBmp = mem.SelectObject(&bmp);
+            CBrush maskBg(RGB(255, 0, 255)); mem.FillRect(CRect(0, 0, W, H), &maskBg);
+            DrawUrlListGlyph(mem, 0, W);
+            mem.SelectObject(oldBmp);
+            m_tbImg.Add(&bmp, RGB(255, 0, 255));
+        }
         // Plain, non-docking creation -- MFC's native EnableDocking/DockControlBar was tried here and reverted: it
         // wraps the toolbar in an internal CDockBar container whose own size doesn't necessarily match the
         // toolbar's actual button layout, leaving a gap with the wrong background and intercepting right-clicks
@@ -16508,7 +17165,7 @@ class CMainFrame : public CMDIFrameWnd {
         m_tb.onDragMove = [this](CPoint sp) { if (!m_barsLocked) ShowDragGhost(ComputeGhostRect(true, DetermineEdge(sp))); };
         m_tb.onDragEnd = [this](CPoint sp) { HideDragGhost(); if (!m_barsLocked) SetTbPos(DetermineEdge(sp)); };
         m_tb.onDragCancel = [this] { HideDragGhost(); };
-        TBBUTTON b[15] = {};
+        TBBUTTON b[16] = {};
         b[0].iBitmap = 0; b[0].idCommand = IDM_CONNECT; b[0].fsState = TBSTATE_ENABLED; b[0].fsStyle = TBSTYLE_BUTTON;
         b[1].iBitmap = 1; b[1].idCommand = IDM_DISCONNECT; b[1].fsState = TBSTATE_ENABLED; b[1].fsStyle = TBSTYLE_BUTTON;
         b[2].fsStyle = TBSTYLE_SEP;
@@ -16518,13 +17175,14 @@ class CMainFrame : public CMDIFrameWnd {
         b[6].iBitmap = 8; b[6].idCommand = IDM_ABOOK; b[6].fsState = TBSTATE_ENABLED; b[6].fsStyle = TBSTYLE_BUTTON;   // address book
         b[7].iBitmap = 9; b[7].idCommand = IDM_ONLINETIMER; b[7].fsState = TBSTATE_ENABLED; b[7].fsStyle = TBSTYLE_BUTTON;   // online timer
         b[8].iBitmap = 10; b[8].idCommand = IDM_COLORS; b[8].fsState = TBSTATE_ENABLED; b[8].fsStyle = TBSTYLE_BUTTON;    // colors
-        b[9].fsStyle = TBSTYLE_SEP;
-        b[10].iBitmap = 3; b[10].idCommand = IDM_CASCADE; b[10].fsState = TBSTATE_ENABLED; b[10].fsStyle = TBSTYLE_BUTTON;
-        b[11].iBitmap = 4; b[11].idCommand = IDM_TILE; b[11].fsState = TBSTATE_ENABLED; b[11].fsStyle = TBSTYLE_BUTTON;
-        b[12].fsStyle = TBSTYLE_SEP;
-        b[13].iBitmap = 5; b[13].idCommand = IDM_ABOUT; b[13].fsState = TBSTATE_ENABLED; b[13].fsStyle = TBSTYLE_BUTTON;
-        b[14].fsStyle = TBSTYLE_SEP;
-        m_tb.GetToolBarCtrl().AddButtons(15, b);
+        b[9].iBitmap = 11; b[9].idCommand = IDM_URLLIST; b[9].fsState = TBSTATE_ENABLED; b[9].fsStyle = TBSTYLE_BUTTON;   // URL list -- right after colors
+        b[10].fsStyle = TBSTYLE_SEP;
+        b[11].iBitmap = 3; b[11].idCommand = IDM_CASCADE; b[11].fsState = TBSTATE_ENABLED; b[11].fsStyle = TBSTYLE_BUTTON;
+        b[12].iBitmap = 4; b[12].idCommand = IDM_TILE; b[12].fsState = TBSTATE_ENABLED; b[12].fsStyle = TBSTYLE_BUTTON;
+        b[13].fsStyle = TBSTYLE_SEP;
+        b[14].iBitmap = 5; b[14].idCommand = IDM_ABOUT; b[14].fsState = TBSTATE_ENABLED; b[14].fsStyle = TBSTYLE_BUTTON;
+        b[15].fsStyle = TBSTYLE_SEP;
+        m_tb.GetToolBarCtrl().AddButtons(16, b);
         m_tb.GetToolBarCtrl().SetButtonSize(haveRes ? CSize(36, 34) : CSize(28, 26));
         m_tb.GetToolBarCtrl().SendMessage(TB_SETINDENT, CDraggableToolBar::GRIP, 0);   // reserves a blank margin before the first button for the gripper dots (drawn in CDraggableToolBar::OnPaint) -- real toolbar-control geometry, not just a visual overlay, so hit-testing/GetItemRect already treat it as empty space
         m_tb.GetToolBarCtrl().AutoSize();
@@ -16799,6 +17457,7 @@ public:
 		if (m_identdEnabled && !m_identdOnlyConnecting) StartIdentd();
 		LoadAbook();
 		LoadNotify();
+		LoadUrls(CString());   // auto-restore the caught URL list from urls.ini at startup, same as real mIRC
 		LoadIgnore();
 		LoadAutoLists();
 		LoadCnick();
@@ -16835,6 +17494,7 @@ public:
         f.AppendMenu(MF_STRING, IDM_SCRIPTEDITOR, L"&Scripts Editor...");
         f.AppendMenu(MF_STRING, IDM_ALIASES, L"&Aliases...");
         f.AppendMenu(MF_STRING, IDM_COLORS, L"&Colors...");
+        f.AppendMenu(MF_STRING, IDM_URLLIST, L"&URL List");
         f.AppendMenu(MF_STRING, IDM_LOGGING, L"Lo&gging...");
         f.AppendMenu(MF_STRING, IDM_ONLINETIMER, L"&Online Timer...");
         f.AppendMenu(MF_STRING, IDM_IDENTD, L"&Identd Server...");
@@ -16994,7 +17654,7 @@ BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_COMMAND(IDM_CASCADE, OnCascade) 
     ON_COMMAND(IDM_TILE, OnTile) 
     ON_COMMAND(IDM_EXIT, OnExit) 
-    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_LOCALSETTINGS, OnLocalSettingsDialog) ON_COMMAND(IDM_DCCOPTIONS, OnDccOptionsDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
+    ON_COMMAND(IDM_FONT, OnFont) ON_COMMAND(IDM_SCRIPTEDITOR, OnScriptEditor) ON_COMMAND(IDM_ALIASES, OnAliasEditor) ON_COMMAND(IDM_COLORS, OnColorsDialog) ON_COMMAND(IDM_URLLIST, OnUrlListBtn) ON_COMMAND(IDM_LOGGING, OnLoggingDialog) ON_COMMAND(IDM_ONLINETIMER, OnOnlineTimerDialog) ON_COMMAND(IDM_IDENTD, OnIdentdDialog) ON_COMMAND(IDM_LOCALSETTINGS, OnLocalSettingsDialog) ON_COMMAND(IDM_DCCOPTIONS, OnDccOptionsDialog) ON_COMMAND(IDM_TRAY, OnTrayDialog) ON_COMMAND(IDM_TIPS, OnTipsDialog) ON_COMMAND(IDM_ABOOK, OnAbookMenu) ON_COMMAND_RANGE(IDM_POPEDIT0, IDM_POPEDIT4, OnPopupEditor) ON_COMMAND_RANGE(IDP_BAR, IDP_BAR + 999, OnMenubarPopup) 
     ON_COMMAND(IDM_SERVERS, OnServerList) 
     ON_COMMAND(IDM_CHANFAVS, OnChanFavs) 
 	ON_COMMAND(IDM_ABOUT, OnAbout)
