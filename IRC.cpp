@@ -1935,12 +1935,13 @@ public:
         CString portStr; portStr.Format(L"%u", port);
         PADDRINFOW result = nullptr;
         if (::GetAddrInfoW(host, portStr, &hints, &result) != 0 || !result) return false;
+        PADDRINFOW use = PreferIPv4(result);
         if (m_hSocket != INVALID_SOCKET) Close();
         bool ok = false;
-        SOCKET s = ::socket(result->ai_family, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET s = ::socket(use->ai_family, SOCK_STREAM, IPPROTO_TCP);
         if (s != INVALID_SOCKET) {
             if (Attach(s, FD_READ | FD_WRITE | FD_CONNECT | FD_CLOSE)) {
-                int rc = ::connect(m_hSocket, result->ai_addr, (int)result->ai_addrlen);
+                int rc = ::connect(m_hSocket, use->ai_addr, (int)use->ai_addrlen);
                 ok = (rc == 0) || (::WSAGetLastError() == WSAEWOULDBLOCK);
             } else ::closesocket(s);
         }
@@ -7354,6 +7355,17 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"hotline") { val = m_hlLine; return true; }   // deprecated (pre-7.23) -- "replaced by $hotlink", kept for old scripts: the full line an "on HOTLINK" event fired for
         if (name == L"hotlinepos") { val.Format(L"%d %d", m_hlLineNo, m_hlWordPos); return true; }   // deprecated -- "line-number word-position", space separated; also replaced by $hotlink
         if (name == L"url") { val = m_urlList.empty() ? CString() : m_urlList.back().addr; return true; }   // bare $url: "currently open URL in your main browser" -- this client has no embedded browser to ask, so the most recently caught/opened address stands in. (The parenthesized $url(N) form is handled in FuncValue, which is only reached when a "(" follows -- this bare path is never taken for that form.)
+        if (name == L"proxy") {   // $proxy[.proto/.host/.port/.user/.pass/.except/.connfor] -- see /proxy. Bare (no .prop): $true/$false, whether a proxy currently applies to ANY connection (Connection != none).
+            if (prop == L"proto") val = m_proxyProto == 0 ? L"socks4" : m_proxyProto == 1 ? L"socks5" : L"http";
+            else if (prop == L"host") val = m_proxyHost;
+            else if (prop == L"port") val.Format(L"%u", m_proxyPort);
+            else if (prop == L"user") val = m_proxyUser;
+            else if (prop == L"pass") val = m_proxyPass;
+            else if (prop == L"except") val = m_proxyExceptions;
+            else if (prop == L"connfor") val = m_proxyConnFor == 0 ? L"none" : m_proxyConnFor == 1 ? L"server" : m_proxyConnFor == 2 ? L"dcc" : L"both";
+            else val = m_proxyConnFor != 0 ? L"$true" : L"$false";
+            return true;
+        }
         if (name == L"sockname") { val = m_evSockName; return true; }   // the socket name a currently-running on SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN event fired for
         if (name == L"sockerr") { val = m_sockErr; return true; }       // non-empty only right after a failed /sockopen connect or /sockread; see m_sockErr's own comment
         if (name == L"sockbr") { val.Format(L"%d", m_sockBr); return true; }   // bytes read by the last /sockread call; see m_sockBr's own comment -- this is what a script's "if ($sockbr != 0) goto nextline" drain loop checks
@@ -12125,6 +12137,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (cmd == L"timers") { CmdTimers(w, arg); return; }   // reserved: "/timers" is always the list/off-all command, never a timer literally named "s"
         if (cmd == L"identd") { CmdIdentd(w, arg); return; }
+        if (cmd == L"proxy" || cmd == L"firewall") { CmdProxy(w, arg); return; }   // /firewall is real mIRC's older name for the exact same command -- see CmdProxy's own comment
         if (cmd == L"tray") { CmdTray(w, arg); return; }
         if (cmd == L"tips") { CmdTips(w, arg); return; }
         if (cmd == L"tip") { CmdTip(w, arg); return; }
@@ -15924,6 +15937,80 @@ class CMainFrame : public CMDIFrameWnd {
         if (modeL == L"on") { m_identdEnabled = true; if (!arg.IsEmpty()) m_identdUserId = arg; SaveIdentd(); if (!m_identdOnlyConnecting) StartIdentd(); Show(w, L"* Identd server on" + (arg.IsEmpty() ? CString() : L", user id: " + arg) + L".", cInfo); }
         else if (modeL == L"off") { m_identdEnabled = false; SaveIdentd(); StopIdentd(); Show(w, L"* Identd server off.", cInfo); }
         else { Show(w, L"* Usage: /identd [on|off] [userid]", cPart); return; }
+    }
+    // /proxy and /firewall (literal synonyms in real mIRC -- both dispatch here) -- real mIRC's own documented
+    // syntax, not an invented one:
+    //   /proxy [on|off]
+    //   /proxy [-cmN[+|-]d] <server> <port> <userid> <password>
+    //   /proxy [-cmN[+|-]d] <server:port> <userid> <password>
+    // -c clears the stored userid/password; -mN sets the connection type (N=4 Socks4, 5 Socks5, p HTTP "Proxy");
+    // +d/-d turns DCC-through-the-firewall on/off. Bare on/off only ever toggled the SERVER half historically --
+    // this client's own Connection setting (see the Proxy dialog's None/Server/DCC/Both combo, which this command
+    // also drives) keeps Server and DCC as two independent bits of m_proxyConnFor, so on/off and +d/-d each flip
+    // just their own bit, exactly like the two matching checkboxes a single 4-way combo was built from.
+    // "except" and "save" below aren't part of real mIRC's /proxy at all -- a small, harmless extension for the
+    // exception-mask list this client's Proxy dialog also has, which real mIRC's command-line /proxy has no syntax
+    // for at all.
+    void CmdProxy(CChatWnd* w, CString arg) {
+        arg.Trim();
+        if (arg.IsEmpty()) {
+            const wchar_t* conns[] = { L"none", L"server", L"dcc", L"both" };
+            const wchar_t* protos[] = { L"Socks4", L"Socks5", L"Proxy (HTTP)" };
+            CString status; status.Format(L"* Proxy: connection=%s, protocol=%s, %s:%u%s",
+                conns[(m_proxyConnFor >= 0 && m_proxyConnFor <= 3) ? m_proxyConnFor : 0],
+                protos[(m_proxyProto >= 0 && m_proxyProto <= 2) ? m_proxyProto : 1],
+                (LPCWSTR)m_proxyHost, m_proxyPort, m_proxyUser.IsEmpty() ? L"" : L" (authenticated)");
+            Show(w, status, cInfo);
+            return;
+        }
+        CString first = Word(arg); CString firstL = first; firstL.MakeLower();
+        if (firstL == L"except") {   // extension: /proxy except <mask> appends one; -c clears the list; bare shows it
+            CString m = arg; m.Trim();
+            if (m.CompareNoCase(L"-c") == 0) { m_proxyExceptions.Empty(); SaveProxySettings(); Show(w, L"* Proxy exception masks cleared.", cInfo); return; }
+            if (m.IsEmpty()) { Show(w, m_proxyExceptions.IsEmpty() ? CString(L"* No proxy exception masks set.") : (L"* Proxy exception masks: " + m_proxyExceptions), cInfo); return; }
+            if (!m_proxyExceptions.IsEmpty()) m_proxyExceptions += L"\r\n";
+            m_proxyExceptions += m;
+            SaveProxySettings(); Show(w, L"* Added proxy exception mask: " + m, cInfo); return;
+        }
+        if (firstL == L"save") { SaveProxySettings(); Show(w, L"* Proxy settings saved.", cInfo); return; }   // extension: forces a save (every form below already auto-saves, so this is rarely needed)
+        if (firstL == L"on" || firstL == L"off") {
+            if (firstL == L"on") m_proxyConnFor |= 1; else m_proxyConnFor &= ~1;
+            SaveProxySettings(); Show(w, L"* Proxy (server) turned " + firstL + L".", cInfo); return;
+        }
+        bool clearLogin = false; int newProto = -1, dccOn = -1;   // dccOn: -1 = unchanged, 0 = off, 1 = on
+        CString serverTok;
+        if (first.Left(1) == L"-" && first.GetLength() > 1) {
+            for (int i = 1; i < first.GetLength(); ) {
+                wchar_t c = first[i];
+                if (c == L'c') { clearLogin = true; i++; }
+                else if ((c == L'm' || c == L'M') && i + 1 < first.GetLength()) {
+                    wchar_t p = first[i + 1];
+                    if (p == L'4') newProto = 0; else if (p == L'5') newProto = 1; else if (p == L'p' || p == L'P') newProto = 2;
+                    i += 2;
+                }
+                else if ((c == L'+' || c == L'-') && i + 1 < first.GetLength() && (first[i + 1] == L'd' || first[i + 1] == L'D')) {
+                    dccOn = (c == L'+') ? 1 : 0; i += 2;
+                }
+                else i++;   // an unrecognized switch char -- skip rather than error, same spirit as this client's other switch parsers
+            }
+            serverTok = Word(arg);
+        } else {
+            serverTok = first;   // no "-...." switch cluster given -- 'first' IS the <server> or <server:port> token
+        }
+        if (clearLogin) { m_proxyUser.Empty(); m_proxyPass.Empty(); }
+        if (newProto >= 0) m_proxyProto = newProto;
+        if (dccOn >= 0) { if (dccOn) m_proxyConnFor |= 2; else m_proxyConnFor &= ~2; }
+        if (!serverTok.IsEmpty()) {
+            CString host, portS, user, pass; int colon = serverTok.Find(L':');
+            if (colon >= 0) { host = serverTok.Left(colon); portS = serverTok.Mid(colon + 1); user = Word(arg); pass = arg; pass.Trim(); }
+            else { host = serverTok; portS = Word(arg); user = Word(arg); pass = arg; pass.Trim(); }
+            m_proxyHost = host;
+            double nD; if (ParseNum(portS, nD) && nD > 0) m_proxyPort = (UINT)nD;
+            if (!user.IsEmpty()) m_proxyUser = user;
+            if (!pass.IsEmpty()) m_proxyPass = pass;
+        }
+        SaveProxySettings();
+        Show(w, L"* Proxy settings updated.", cInfo);
     }
     afx_msg LRESULT OnIdentdRequest(WPARAM, LPARAM lp) {
         std::unique_ptr<std::pair<std::wstring, std::wstring>> notice((std::pair<std::wstring, std::wstring>*)lp);
