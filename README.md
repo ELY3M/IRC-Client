@@ -26,7 +26,9 @@ you may get random bugs, glitches, or crashes.
 ~~popup system~~  
 ~~variables system~~  
 ~~load / unload scripts~~  
-support editing multi scripts in the script editor   
+~~support editing multi scripts in the script editor~~  
+~~proxy support for socks4/socks5/proxy~~    
+~~URL catcher/list~~  
 identifiers  
 ~~scripting support for making menu popups~~   
 ~~scripting support for making dialogs~~     
@@ -48,6 +50,7 @@ DCC server
 ~~logging of status and chat - it will have option to disable and enable logging and location of logs~~  
 ~~check update (check git commit rehash against version.h)~~  
 more commands  
+ircv3 support   
 many more.....  
 
 
