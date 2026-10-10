@@ -79,6 +79,7 @@ extern "C" {
 #include "mz_crypt.h"
 #include "mz_zip.h"
 #include "mz_zip_rw.h"
+#include <zlib.h>   // classic zlib buffer API (compress2/uncompress/compressBound) for $compress()/$decompress() -- minizip-ng (above) can't even build without zlib.h already on this same include path, so it's available here too
 }
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
@@ -337,6 +338,11 @@ static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
     for (HFONT v : variants) if (v) ::DeleteObject(v);
     dc->RestoreDC(saved);
 }
+// /tokenize's own sentinel -- see its comment and EvalIds' slice() lambda's comment for the full story: lets a
+// single tokenized value that legitimately contains a space (e.g. a chosen save path like "Pixed 173823883.bmp")
+// survive being stored into `params`, which $1/$2/$1- always re-split on literal spaces, token boundaries and all.
+// U+E000 is the first Private Use Area codepoint -- never produced by any real text, file path, or script content.
+static const wchar_t kTokenizeSpace = (wchar_t)0xE000;
 static CString Word(CString& s) {
     s.TrimLeft(); int i = s.Find(L' '); CString w;
     if (i < 0) { w = s; s.Empty(); } else { w = s.Left(i); s = s.Mid(i + 1); }
@@ -2245,13 +2251,22 @@ protected:
     afx_msg void OnPaint();              // defined after CChatWnd, which these four need the full definition of
     afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }   // OnPaint always fully repaints (either the canvas bitmap or a black fill)
     afx_msg void OnKeyDown(UINT vk, UINT rep, UINT flags);
-    afx_msg void OnLButtonDown(UINT flags, CPoint p);
-    afx_msg void OnLButtonUp(UINT flags, CPoint p);   // mIRC's "sclick" -- a left click anywhere on a custom @window's picture canvas; see CChatWnd::OnCanvasLClick
-    afx_msg void OnMouseMove(UINT flags, CPoint p);
+    afx_msg void OnLButtonDown(UINT flags, CPoint p);   // mIRC's "sclick" -- a left click (button DOWN) anywhere on a custom @window's picture canvas; see CChatWnd::FireCanvasEvent
+    afx_msg void OnLButtonUp(UINT flags, CPoint p);     // mIRC's "uclick" -- the matching button-UP/release
+    afx_msg void OnMouseMove(UINT flags, CPoint p);     // mIRC's "mouse" -- fires on every move, not just click; also arms WM_MOUSELEAVE for "leave"
+    afx_msg void OnMouseLeave();                        // mIRC's "leave" -- the pointer leaves the canvas, e.g. to end a drag that's still in progress
+    // Right-click on the picture canvas itself -- a custom @window's own popup.txt plus any script-defined
+    // "Menu @windowname { ... }" block (see CChatWnd::onLogMenu/ShowCustomPopup, already wired for the text-log
+    // control via CLogEdit::onContext at m_out's own creation). The canvas had no right-click handler of its own at
+    // all -- once ShowCanvas() swaps a custom window's display area over to the picture canvas, right-clicking
+    // anywhere on it reached nothing and no popup ever opened, which is exactly why PixelEditor.mrc's "Menu @Pixel"
+    // (Flip/Rotate/Resize/Add/Remove/Import/Export/Autosave/Close -- several of which have no keyboard shortcut at
+    // all) was completely unreachable in this client despite being fully implemented and working once it opens.
+    afx_msg void OnRButtonUp(UINT, CPoint p);   // defined after CChatWnd, like OnPaint/OnKeyDown/etc above -- it touches owner->onLogMenu, which needs CChatWnd's full definition
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CCanvasWnd, CWnd)
-    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE()
+    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE() ON_WM_MOUSELEAVE() ON_WM_RBUTTONUP()
 END_MESSAGE_MAP()
 
 class CChatWnd : public CMDIChildWnd {
@@ -2471,7 +2486,14 @@ public:
     int m_cwBmpW = 0, m_cwBmpH = 0;                                          // torn down and recreated at a new size often (every /window resize, every out-of-bounds draw), and doing that by hand with SelectObject/DeleteObject/DeleteDC is far less fiddly than fighting MFC's CGdiObject attach/detach semantics each time
     int m_mouseX = 0, m_mouseY = 0;                        // last canvas mouse position, for $mouse.x/$mouse.y
     std::function<void(CChatWnd*, UINT)> onCanvasKey;      // on KEYDOWN wiring, set by CMainFrame::OpenCustomWindow
-    std::function<void(CChatWnd*, CPoint)> onCanvasClick;  // left-click on the canvas -- mIRC's "sclick" (and dclick, below), wiring set by CMainFrame::OpenCustomWindow
+    // mIRC's reserved "Menu @window { ... }" mouse labels on the canvas -- "sclick" (button down), "uclick"
+    // (button up), "mouse" (every move), "leave" (pointer leaves the canvas); evt carries which one fired. Wiring
+    // set by CMainFrame::OpenCustomWindow. Used to be just a single-purpose "sclick on button-up" callback, which
+    // is backwards from real mIRC (sclick is the PRESS, uclick is the RELEASE) and left "mouse"/"leave" completely
+    // unwired -- fine for a plain single-click action, but any tool that needs to track a drag (PixelEditor.mrc's
+    // line/rectangle/ellipse/select tools all anchor on sclick, live-update via mouse, and commit on uclick/leave)
+    // never got the events it needed to do anything at all.
+    std::function<void(CChatWnd*, CPoint, const CString&)> onCanvasEvent;
     CDC* CanvasDC() { return m_cwDC ? CDC::FromHandle(m_cwDC) : nullptr; }
     void ResizeCanvasImpl(int nw, int nh) {   // common to SetCanvasSize/GrowCanvasFor: recreate at nw x nh, preserving whatever of the old content still fits, black-filling the rest
         HDC scr = ::GetDC(nullptr);
@@ -2511,7 +2533,7 @@ public:
     void RepaintCanvas() { if (m_canvasShown && m_canvas.m_hWnd) { m_canvas.Invalidate(); m_canvas.UpdateWindow(); } }
     void OnCanvasKeyDown(UINT vk) { if (onCanvasKey) onCanvasKey(this, vk); }
     void OnCanvasMouseMove(CPoint p) { m_mouseX = p.x; m_mouseY = p.y; }
-    void OnCanvasLClick(CPoint p) { OnCanvasMouseMove(p); if (onCanvasClick) onCanvasClick(this, p); }   // mIRC's "sclick" -- see CCanvasWnd::OnLButtonUp and CMainFrame::OpenCustomWindow's wiring of onCanvasClick
+    void FireCanvasEvent(CPoint p, const CString& evt) { OnCanvasMouseMove(p); if (onCanvasEvent) onCanvasEvent(this, p, evt); }   // "sclick"/"uclick"/"mouse"/"leave" -- see CCanvasWnd's handlers and CMainFrame::OpenCustomWindow's wiring of onCanvasEvent
 
 protected:
     long m_fontTwips = 200; wchar_t m_face[LF_FACESIZE] = DEFAULT_FONT; bool m_baseBold = false, m_baseItalic = false;
@@ -2677,9 +2699,21 @@ void CCanvasWnd::OnPaint() {
     } else dc.FillSolidRect(r, RGB(0, 0, 0));
 }
 void CCanvasWnd::OnKeyDown(UINT vk, UINT, UINT) { if (owner) owner->OnCanvasKeyDown(vk); }
-void CCanvasWnd::OnLButtonDown(UINT, CPoint p) { SetFocus(); if (owner) owner->OnCanvasMouseMove(p); }
-void CCanvasWnd::OnLButtonUp(UINT, CPoint p) { if (owner) owner->OnCanvasLClick(p); }   // mIRC's "sclick" fires on mouse-up, not mouse-down -- see CChatWnd::OnCanvasLClick
-void CCanvasWnd::OnMouseMove(UINT, CPoint p) { if (owner) owner->OnCanvasMouseMove(p); }
+void CCanvasWnd::OnRButtonUp(UINT, CPoint p) { if (owner && owner->onLogMenu) { CPoint sp = p; ClientToScreen(&sp); owner->onLogMenu(owner, sp); } }
+void CCanvasWnd::OnLButtonDown(UINT, CPoint p) { SetFocus(); if (owner) owner->FireCanvasEvent(p, L"sclick"); }   // "sclick" fires on button DOWN -- PixelEditor.mrc (and any other drag-to-draw tool) anchors its stroke here
+void CCanvasWnd::OnLButtonUp(UINT, CPoint p) { if (owner) owner->FireCanvasEvent(p, L"uclick"); }                 // "uclick" fires on button UP/release -- commits whatever sclick started
+void CCanvasWnd::OnMouseMove(UINT, CPoint p) {
+    if (owner) {
+        // Arm WM_MOUSELEAVE so "leave" fires once when the pointer actually exits the canvas -- TrackMouseEvent
+        // has to be re-armed on every WM_MOUSEMOVE (Windows disarms it the moment it fires, and there's no
+        // "enter" tracking needed here since plain mouse-move coverage already starts the moment the cursor is
+        // over the canvas at all).
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, m_hWnd, 0 };
+        ::TrackMouseEvent(&tme);
+        owner->FireCanvasEvent(p, L"mouse");
+    }
+}
+void CCanvasWnd::OnMouseLeave() { if (owner) owner->FireCanvasEvent(CPoint(owner->m_mouseX, owner->m_mouseY), L"leave"); }   // the pointer itself is already off the canvas by now, so keep reporting the last known in-canvas $mouse.x/$mouse.y rather than whatever (possibly negative/out-of-bounds) point the leave message carries
 
 // ---------------- Status bar: click a channel name in the "Channels:" pane to open it ----------------
 class CChanBar : public CStatusBar {
@@ -3618,22 +3652,33 @@ static int BraceDelta(const CString& s) { return SegmentAwareBraceDelta(s); }
 // lost by skipping them here -- they simply aren't runnable script content in the first place.
 static std::vector<CString> StripForeignBlocks(const std::vector<CString>& in) {
     std::vector<CString> out;
-    int skipDepth = 0; bool awaitingOpenBrace = false;
+    int skipDepth = 0;
     static const wchar_t* const kForeignKw[] = { L"menu ", L"menu\t", L"dialog ", L"dialog\t", L"xdialog ", L"xdialog\t" };
-    for (auto& raw : in) {
-        CString t = raw; t.Trim();
-        if (awaitingOpenBrace) {
-            if (t.Right(1) == L"{") { awaitingOpenBrace = false; skipDepth = 1; }
-            continue;
-        }
+    for (size_t i = 0; i < in.size(); i++) {
+        CString t = in[i]; t.Trim();
         if (skipDepth > 0) { skipDepth += LineStructuralBraceDelta(t); if (skipDepth < 0) skipDepth = 0; continue; }
         bool isForeignOpener = false;
         for (auto kw : kForeignKw) { int kwLen = (int)wcslen(kw); if (t.GetLength() >= kwLen && t.Left(kwLen).CompareNoCase(kw) == 0) { isForeignOpener = true; break; } }
         if (isForeignOpener) {
-            if (t.Right(1) == L"{") skipDepth = 1; else awaitingOpenBrace = true;
+            if (t.Right(1) == L"{") { skipDepth = 1; continue; }
+            // Not a block opener on this line -- but "menu "/"dialog "/"xdialog " is ALSO how the real /menu and
+            // /dialog COMMANDS start (e.g. "dialog -c pe.text" to close a dialog, with no block body at all), and
+            // those are indistinguishable from a table DEFINITION by keyword alone. mIRC itself resolves this
+            // structurally: a block's own "{" always sits either at the end of its header line (handled just
+            // above) or alone on the very next line -- never further down. So only treat this as a definition
+            // when the next non-empty line really is a bare "{"; otherwise it's a command line, pass it through
+            // untouched. The old code instead kept scanning indefinitely for ANY later line ending in "{" (even a
+            // totally unrelated alias or if-block several statements down) and silently dropped every real script
+            // line it passed along the way -- including, for a command like "dialog -c", that command's own
+            // enclosing block's real closing "}", which went missing and threw the whole rest of the file's brace
+            // accounting off by one from there on.
+            size_t j = i + 1; CString nt;
+            while (j < in.size()) { nt = in[j]; nt.Trim(); if (!nt.IsEmpty()) break; j++; }
+            if (j < in.size() && nt == L"{") { skipDepth = 1; i = j; continue; }
+            out.push_back(in[i]);
             continue;
         }
-        out.push_back(raw);
+        out.push_back(in[i]);
     }
     return out;
 }
@@ -4878,6 +4923,7 @@ struct RemoteEvent {
     CString whereSpec;              // JOIN/PART/KICK/TOPIC: channel list or bare # for "any channel"
                                      // TEXT/ACTION/NOTICE: #, ?, *, or a specific channel/wildcard
                                      // WALLOPS: no where field at all -- it's a server-wide broadcast, no channel/target concept
+    CString keySpec;                // KEYDOWN only: the key field as written (an ascii/vk code, a key name like "enter", or "*" for any key) -- see MatchesKeySpec
     std::vector<CString> lines;
     CString groupName;              // empty = not in any #group block, always active -- see IsGroupMarkerLine
 };
@@ -4915,14 +4961,21 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             // "*:{ ... }" -- the real source of the "*: " raw-send flood on every keypress -- and then, trying to
             // fix that, taking the whole "@Tetris:*" as one where-spec, which made MatchesWhereSpec wildcard-compare
             // it against the actual window name "@Tetris" and fail outright, since "@Tetris:*" requires a literal
-            // ":" in the window name that isn't there -- breaking KEYDOWN matching completely). This engine's
-            // FireWindowEvent has no per-key filtering (the key code is only ever handed to the event body via
-            // $keyval), so the key field just needs to be consumed here, not matched on.
+            // ":" in the window name that isn't there -- breaking KEYDOWN matching completely). The key field is
+            // now captured into ev.keySpec and actually matched by FireWindowEvent via MatchesKeySpec -- it used to
+            // be parsed and thrown away here, which meant EVERY on KEYDOWN handler for a window fired on EVERY
+            // keypress regardless of which key field it declared, since nothing ever filtered on it (the key code
+            // was only ever exposed to the body via $keyval, for a script to check itself -- scripts that instead
+            // rely, as real mIRC requires, on the key field in the "on" line itself to do the filtering, such as
+            // PixelEditor.mrc's "on *:keydown:@Pixel:90:if (%pe.ctrl) pe.undo" and "on *:keydown:@Pixel:83:if
+            // (%pe.ctrl) pe.exportimage", got BOTH handlers run together on every single keypress while %pe.ctrl was
+            // set -- e.g. Ctrl+Z firing pe.undo *and* pe.exportimage's Save-As file dialog in the same keystroke).
             int c4 = rest.Find(L':'); if (c4 < 0) continue;
             ev.whereSpec = rest.Left(c4); rest = rest.Mid(c4 + 1);
             if (ev.eventName == L"KEYDOWN") {
                 int c5 = rest.Find(L':'); if (c5 < 0) continue;
-                rest = rest.Mid(c5 + 1);   // key spec consumed and discarded -- see comment above
+                ev.keySpec = rest.Left(c5); ev.keySpec.Trim();
+                rest = rest.Mid(c5 + 1);
             }
         }
         CString cmdText = rest; cmdText.TrimLeft();
@@ -5174,6 +5227,30 @@ static bool MatchesWhereSpec(const CString& spec, const CString& chan) {   // JO
         pos = comma + 1;
     }
     return !any;   // an empty/missing where-spec matches anything, same as mIRC treating it as unrestricted
+}
+// KEYDOWN's key field: "*" (or empty) matches any key; a plain number matches that virtual-key code exactly (what
+// PixelEditor.mrc and most scripts use -- e.g. 90 for Z, 83 for S); otherwise it's one of mIRC's named keys, matched
+// case-insensitively. Only the common ones are mapped -- more than enough for real-world scripts, which overwhelmingly
+// use either a bare vk number or one of these names.
+static bool MatchesKeySpec(const CString& spec, int vk) {
+    CString s = spec; s.Trim();
+    if (s.IsEmpty() || s == L"*") return true;
+    double nD; wchar_t* endp = nullptr;
+    long n = wcstol(s, &endp, 10);
+    if (endp && *endp == 0 && endp != (LPCTSTR)s) return n == vk;   // a plain integer literal
+    CString kw = s; kw.MakeLower();
+    static const struct { const wchar_t* kw; int vk; } kNamed[] = {
+        { L"enter", VK_RETURN }, { L"return", VK_RETURN }, { L"esc", VK_ESCAPE }, { L"escape", VK_ESCAPE },
+        { L"tab", VK_TAB }, { L"space", VK_SPACE }, { L"backspace", VK_BACK }, { L"delete", VK_DELETE }, { L"del", VK_DELETE },
+        { L"insert", VK_INSERT }, { L"ins", VK_INSERT }, { L"home", VK_HOME }, { L"end", VK_END },
+        { L"pageup", VK_PRIOR }, { L"pgup", VK_PRIOR }, { L"pagedown", VK_NEXT }, { L"pgdn", VK_NEXT },
+        { L"up", VK_UP }, { L"down", VK_DOWN }, { L"left", VK_LEFT }, { L"right", VK_RIGHT },
+        { L"f1", VK_F1 }, { L"f2", VK_F2 }, { L"f3", VK_F3 }, { L"f4", VK_F4 }, { L"f5", VK_F5 }, { L"f6", VK_F6 },
+        { L"f7", VK_F7 }, { L"f8", VK_F8 }, { L"f9", VK_F9 }, { L"f10", VK_F10 }, { L"f11", VK_F11 }, { L"f12", VK_F12 },
+    };
+    for (auto& e : kNamed) if (kw == e.kw) return vk == e.vk;
+    if (kw.GetLength() == 1) { wchar_t c = kw[0]; if (c >= L'a' && c <= L'z') return vk == (int)(c - L'a' + L'A'); }   // a single letter: "z" matches VK 'Z'
+    return false;
 }
 static bool MatchesTextWhere(const CString& spec, bool isPriv, const CString& chanOrNick) {   // TEXT/ACTION/NOTICE
     CString s = spec; s.Trim();
@@ -6725,6 +6802,15 @@ class CMainFrame : public CMDIFrameWnd {
     int m_flinen = 0;                     // $flinen: the line number matched by the last $fline(), same spirit as $readn above
     CString m_dccGetDir;                  // $getdir: stored for compatibility, since this client has no DCC to actually save anything there
     CString m_sfstate;                    // $sfstate: "cancel" after the last $sfile/$sdir/$msfile was dismissed without a selection
+    CString m_v1;                         // $v1: real mIRC's general "extra return value" register -- several identifiers (like $sfile) are typically
+    // tested as a plain boolean inside an if() (e.g. "if ($sfile(...)) { ... }"), but still need to hand back their actual
+    // result (the chosen path) to the rest of the script; mIRC does that via $v1 rather than forcing every caller to
+    // re-invoke the identifier (which would pop the dialog a second time). PixelEditor.mrc's pe.exportimage relies on
+    // this directly ("if ($sfile(...)) { tokenize 1 $v1 ... }"), which is what exposed this being entirely unimplemented
+    // -- $v1 fell through to the generic "unknown identifier" fallback and was left as the literal text "$v1", so
+    // /tokenize was splitting that literal 4-character string instead of the real chosen filename, and every export
+    // ended up named after whatever $1 happened to become from THAT. Set this right after computing val for any
+    // identifier that hands back a real result alongside a boolean-style condition use (currently just $sfile).
     int m_finddirN = 0, m_findfileN = 0;  // $finddirn/$findfilen: the 1-based position of the match currently being processed inside a running $finddir/$findfile(...,command) loop; 0 outside one
     std::vector<CString> m_msfileResults; // $msfile(N): the file list from the most recent $msfile(dir,title,oktext) call
     // ---- Address Book Whois tab: captures structured WHOIS fields while a lookup is in progress for the dialog ----
@@ -6784,6 +6870,16 @@ class CMainFrame : public CMDIFrameWnd {
     struct HashTableEntry { CString name; int size = 100; std::vector<std::pair<CString, CString>> items; };
     std::vector<HashTableEntry> m_hashTables;
     HashTableEntry* FindHashTable(const CString& tname) { for (auto& t : m_hashTables) if (t.name.CompareNoCase(tname) == 0) return &t; return nullptr; }
+    // Binary variables (&name): /bset, /bwrite, /bread, /bunset, /btrunc, $bvar(), and the binary-flagged
+    // (-b) form of /hadd and $hget(table,item,&var). Stored as plain byte buffers, looked up case-insensitively
+    // by name (the leading '&' is part of the name, matching how scripts refer to them -- "&" alone, with no
+    // suffix, is itself a perfectly valid, commonly-used binvar name). A hadd -b item stores its payload packed
+    // into a CString (one wchar per byte, 0-255) purely as internal plumbing to reuse HashTableEntry's existing
+    // CString-keyed storage -- it's never shown to the script as text.
+    struct BinVarEntry { CString name; std::vector<BYTE> data; };
+    std::vector<BinVarEntry> m_binVars;
+    BinVarEntry* FindBinVar(const CString& vname) { for (auto& b : m_binVars) if (b.name.CompareNoCase(vname) == 0) return &b; return nullptr; }
+    BinVarEntry* GetOrMakeBinVar(const CString& vname) { BinVarEntry* b = FindBinVar(vname); if (!b) { BinVarEntry nb; nb.name = vname; m_binVars.push_back(nb); b = &m_binVars.back(); } return b; }
     // File handles (/fopen, /fclose, /fwrite, $fopen, $fread, $fgetc, $feof, $ferr). Each handle keeps its own
     // real, open CStdioFile so position tracking, writes, and reads all behave like a genuine file handle rather
     // than a snapshot read into memory once -- a script that /fwrite's then $fread's the same handle sees its
@@ -6799,6 +6895,31 @@ class CMainFrame : public CMDIFrameWnd {
     std::vector<AliasDef> m_aliases; std::vector<CString> m_runStack;   // aliases (aliases.ini) and the alias names currently running
     int m_depth = 0, m_steps = 0; bool m_halt = false; CString m_result, m_prop, m_lastPrompt;   // state of the running script: $result, $prop, $!
     ULONGLONG m_scriptStart = 0;   // GetTickCount64() when the current top-level script run began -- a wall-clock backstop alongside m_steps, since a runaway loop whose each "step" does real UI/GDI/network work can blow past several seconds long before it reaches the step cap
+    // Wrap any DoModal()/SHBrowseForFolderW() call reached from inside script execution (an identifier like $sfile,
+    // $sdir, $input, $? that pops a dialog and blocks until the person answers it) in one of these. A modal dialog
+    // can sit open for as long as the person takes to use it -- many seconds, routinely well past the 4-second
+    // watchdog window -- and the ENTIRE REST of the program keeps pumping messages while it's up, including any
+    // /timer that's still firing on schedule. A firing timer calls RunScript() same as anything else, and
+    // RunScript's "m_depth==0 -> fresh watchdog budget" reset (see its own comment) only fires at TRUE top level;
+    // here m_depth is NOT 0, because the script that opened the dialog is still on the C++ call stack, merely
+    // blocked inside DoModal() -- so the timer's run silently inherits that outer script's already-years-old (and,
+    // after a few seconds of the dialog being open, already-expired) watchdog budget instead of getting its own,
+    // and trips on its very first line. Worse, the halt that trip sets is a single global flag: once the dialog
+    // finally closes and the ORIGINAL script resumes right where DoModal() returned, it immediately sees that same
+    // m_halt already set and stops too -- so a script that pops a dialog and continues afterward (such as
+    // PixelEditor.mrc's pe.exportimage: show a Save dialog, THEN render and write the actual file) never reaches
+    // any of its own remaining lines once the person takes more than a few seconds to use the dialog, even though
+    // the script itself never did anything slow. This guard sidesteps both halves: for its lifetime it makes the
+    // current script's own call frame look like a fresh top level (m_depth = 0) so anything that runs WHILE the
+    // dialog is up -- a timer firing, basically -- gets ITS OWN clean watchdog budget via that same existing
+    // m_depth==0 check rather than borrowing (and tripping) this one; and on destruction (after DoModal() returns)
+    // it gives the resuming script a fresh budget of its own too, since time spent waiting on a human is not the
+    // script doing work and shouldn't count against it.
+    struct ModalWatchdogGuard {
+        CMainFrame* f; int savedDepth; bool savedHalt;
+        ModalWatchdogGuard(CMainFrame* p) : f(p), savedDepth(p->m_depth), savedHalt(p->m_halt) { f->m_depth = 0; }
+        ~ModalWatchdogGuard() { f->m_depth = savedDepth; f->m_halt = savedHalt; f->m_steps = 0; f->m_scriptStart = GetTickCount64(); }
+    };
     struct ExecCtx; ExecCtx* m_curCtx = nullptr;   // the currently-executing script line's ExecCtx, so /tokenize (handled deep inside Dispatch, which otherwise never sees ExecCtx) can replace $1../$1- for the rest of that script -- set/restored around each Dispatch() call from ExecCmd
     CString m_vhist[9];   // $v1..$v9: see EvalCond's own comment where these get filled in
     CString m_lastExecLine;   // the raw text of whatever script line most recently started executing -- surfaced by the watchdog message in ExecNodes so "taking too long" says WHAT it was stuck on, not just that it happened
@@ -6964,18 +7085,15 @@ class CMainFrame : public CMDIFrameWnd {
             CString params; params.Format(L"%d", (int)vk);
             FireWindowEvent(c, L"KEYDOWN", c->m_name, params);
         };
-        w->onCanvasClick = [this](CChatWnd* c, CPoint) {   // mIRC's "sclick" -- a left click anywhere in a custom @window's picture canvas runs that window's own popup.txt item literally titled "sclick:{...}" (same convention real mIRC uses: a reserved top-level label, not a real menu entry -- ShowCustomPopup filters it back out of the visible right-click menu for the same reason). Was entirely unwired before: a click on the canvas only ever updated $mouse.x/$mouse.y (via OnCanvasMouseMove), with nothing to actually run the window's sclick handler -- which is exactly why clicking @Tetris to pause/unpause (its "Menu @Tetris { sclick:{ ... } }") never did anything.
+        w->onCanvasEvent = [this](CChatWnd* c, CPoint, const CString& evt) {   // mIRC's canvas mouse labels -- "sclick"/"uclick"/"mouse"/"leave" -- run that window's own popup.txt (or, far more commonly, its "Menu @windowname { ... }" block) item literally titled that (same convention real mIRC uses: a reserved top-level label, not a real menu entry -- ShowCustomPopup filters these back out of the visible right-click menu for the same reason). Was entirely unwired before (and, for a while, wired ONLY for "sclick" and fired on the wrong edge, button-UP instead of button-DOWN) -- a click on the canvas only ever updated $mouse.x/$mouse.y, with nothing to actually run the window's own handler, which is exactly why clicking @Tetris to pause/unpause (its "Menu @Tetris { sclick:{ ... } }") never did anything, and why PixelEditor.mrc's drag-to-draw tools (anchored on sclick, live-updated via mouse, committed on uclick/leave) couldn't draw at all even once sclick alone was wired.
             // A script almost always defines its custom window's menu with "Menu @windowname { ... }" rather than
-            // an external popup.txt file -- that's the ONLY form Tetris uses ("Menu @Tetris { sclick:{ ... } }"),
-            // which lives in m_remoteMenus (via RemoteMenuItemsFor), not c->m_cwPopup (which stays empty unless a
-            // popupFile was explicitly supplied to OpenCustomWindow -- essentially never). Checking only
-            // m_cwPopup here, as this originally did, meant the sclick handler could never actually fire for a
-            // script-defined menu like Tetris's, which is exactly why clicking @Tetris to pause/unpause still did
-            // nothing even after this handler was wired up. Both sources are checked, same as ShowCustomPopup.
+            // an external popup.txt file -- that's the ONLY form Tetris uses, which lives in m_remoteMenus (via
+            // RemoteMenuItemsFor), not c->m_cwPopup (which stays empty unless a popupFile was explicitly supplied
+            // to OpenCustomWindow -- essentially never). Both sources are checked, same as ShowCustomPopup.
             std::vector<PopupItem> items = c->m_cwPopup.empty() ? std::vector<PopupItem>() : ParsePopupItems(c->m_cwPopup);
             std::vector<PopupItem> remote = RemoteMenuItemsFor(c->m_name);
             items.insert(items.end(), remote.begin(), remote.end());
-            for (auto& it : items) if (it.depth == 0 && it.cmd.empty() == false && it.title.CompareNoCase(L"sclick") == 0) { RunPopupLines(c, it.cmd, CString()); return; }
+            for (auto& it : items) if (it.depth == 0 && it.cmd.empty() == false && it.title.CompareNoCase(evt) == 0) { RunPopupLines(c, it.cmd, CString()); return; }
         };
         w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
         w->tsFormat = [this]() { return m_tsEventFmt; };
@@ -7150,6 +7268,7 @@ class CMainFrame : public CMDIFrameWnd {
             return false;
         }
         if (name == L"keyval") { val.Format(L"%d", m_lastKeyVal); return true; }   // the key code from the most recent on KEYDOWN (see m_lastKeyVal's own comment)
+        if (name == L"show") { val = m_silentCmd ? L"$false" : L"$true"; return true; }   // $true if the currently-running alias/command was NOT called with a silencing "." prefix (see SilentGuard/m_silentCmd) -- scripts commonly use this to tell an interactive call apart from a silent internal replay of the same alias, which is exactly how PixelEditor.mrc's pe.drawdot/pe.replacecolour (and similar) decide whether to push a new undo-stack entry (an interactive draw) or not (a ".pe.drawdot ..." replay triggered by undo/redo itself) -- unimplemented, this was being left as literal, always-truthy text by the unrecognized-identifier fallback, so "if ($show) iline @pe.undo 1 ..." always took the push branch even during an undo replay, corrupting the undo stack instead of consuming it (the net effect: Ctrl+Z redrew the same pixel instead of reverting it, so nothing visibly changed).
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
         if (name == L"ltimer") { val = m_ltimer; return true; }   // the id of the last timer started by /timer
@@ -7310,6 +7429,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"mididir") { val = m_soundDirMidi; return true; }
         if (name == L"logdir") { val = m_logFolder; return true; }
         if (name == L"sfstate") { val = m_sfstate; return true; }
+        if (name == L"v1") { val = m_v1; return true; }   // see m_v1's own comment -- the chosen path from the most recent $sfile() call used as a boolean condition
         if (name == L"tempfn") { val = MakeTempName(CString()); return true; }
         if (name == L"inwave" || name == L"inmidi" || name == L"insong") {   // $inwave.fname / .pos / .length / .pause (bare identifier, no parens -- see the EvalIds property-parsing fix above)
             SoundChannel& ch = name == L"inwave" ? m_waveChan : name == L"inmidi" ? m_midiChan : m_mp3Chan;
@@ -8271,12 +8391,43 @@ class CMainFrame : public CMDIFrameWnd {
             if (N < 1 || N > (int)it->second.size()) { val.Empty(); return true; }
             val = it->second[N - 1]; return true;
         }
-        if (name == L"encode" || name == L"decode") {   // $encode/$decode(text,flags[,key]) -- $encode's full real syntax covers Uuencode, Base32, Z85, and several encryption modes (CBC/ECB, salting, custom keys); this implements only its by-far most common real-world use, the 'm' (MIME/Base64) mode on plain text, via the Windows Crypto API's own base64 support rather than a hand-rolled codec. Any other flag combination isn't recognized.
+        if (name == L"encode" || name == L"decode") {   // $encode/$decode(text,flags[,key]) -- $encode's full real syntax covers Uuencode, Base32, Z85, and several encryption modes (CBC/ECB, salting, custom keys); this implements only its by-far most common real-world use, the 'm' (MIME/Base64) mode, via the Windows Crypto API's own base64 support rather than a hand-rolled codec. Any other flag combination isn't recognized.
             CString a = EvalIds(w, rawArgs, params);
             int c = a.Find(L','); if (c < 0) return false;
             CString text = a.Left(c); CString flags = a.Mid(c + 1);
             int c2 = flags.Find(L','); if (c2 >= 0) flags = flags.Left(c2);   // an optional trailing key parameter isn't used by plain 'm' mode
             if (flags.Find(L'm') < 0) return false;
+            CString firstTok = text; firstTok.Trim();
+            // &binvar form: when the first argument is a binary variable, the 'b' flag means operate in place on its
+            // raw bytes (base64<->binary of whatever's already stored there) rather than treating it as literal text,
+            // and the return value is 1/0 success/failure rather than the encoded/decoded text -- this is how
+            // PixelEditor.mrc's pe.createicon uses $decode(&,bm) (decode the base64 text already bset into &, replacing
+            // it with the decoded binary) and gates its success with "if ($decode(&,bm))".
+            if (!firstTok.IsEmpty() && firstTok[0] == L'&') {
+                BinVarEntry* bv = FindBinVar(firstTok);
+                if (!bv) { val = L"0"; return true; }
+                bool binMode = (flags.Find(L'b') >= 0);
+                if (name == L"encode") {
+                    DWORD outLen = 0;
+                    const BYTE* src = bv->data.empty() ? (const BYTE*)"" : bv->data.data();
+                    int srcLen = (int)bv->data.size();
+                    if (!CryptBinaryToStringA(src, srcLen, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &outLen)) { val = L"0"; return true; }
+                    std::vector<char> buf(outLen + 1);
+                    if (!CryptBinaryToStringA(src, srcLen, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf.data(), &outLen)) { val = L"0"; return true; }
+                    if (binMode) { bv->data.assign(buf.data(), buf.data() + strlen(buf.data())); val = L"1"; return true; }
+                    val = CString(buf.data()); return true;
+                } else {
+                    // base64 text is stored in the binvar as one byte (char code) per character
+                    CStringA ascii; for (BYTE b : bv->data) ascii += (char)b;
+                    DWORD outLen = 0;
+                    if (!CryptStringToBinaryA((LPCSTR)ascii, ascii.GetLength(), CRYPT_STRING_BASE64, nullptr, &outLen, nullptr, nullptr)) { val = L"0"; return true; }
+                    std::vector<BYTE> buf(outLen);
+                    if (outLen > 0 && !CryptStringToBinaryA((LPCSTR)ascii, ascii.GetLength(), CRYPT_STRING_BASE64, buf.data(), &outLen, nullptr, nullptr)) { val = L"0"; return true; }
+                    if (binMode) { bv->data.assign(buf.begin(), buf.begin() + outLen); val = L"1"; return true; }
+                    CStringA raw((LPCSTR)(buf.empty() ? (const BYTE*)"" : buf.data()), (int)outLen);
+                    val = CA2W(raw, CP_UTF8); return true;
+                }
+            }
             if (name == L"encode") {
                 CStringA utf8 = CW2A(text, CP_UTF8);
                 DWORD outLen = 0;
@@ -8294,9 +8445,64 @@ class CMainFrame : public CMDIFrameWnd {
                 val = CA2W(raw, CP_UTF8); return true;
             }
         }
-        if (name == L"sha1" || name == L"sha256" || name == L"sha384" || name == L"sha512") {   // $shaN(text) -- hex digest, via the same BCrypt sequence as $md5
+        if (name == L"compress" || name == L"decompress") {   // $compress(&var[,flags]) / $decompress(&var[,flags]) -- zlib-compresses/decompresses a binary variable's bytes in place, returning 1/0 success/failure. Built on zlib's raw deflate/inflate streaming calls rather than the compress2()/uncompress()/compressBound() convenience wrappers, because the vendored zlib sources that ship alongside minizip-ng (zipkit) only include the core deflate/inflate stream files minizip itself needs, not compress.c/uncompr.c -- so those wrapper symbols don't exist to link against here. Not a real mIRC wire format match for anyone else's files -- compress/decompress are only ever used as an inverse pair against data this same engine produced, so the 4-byte little-endian original-length header compress() writes ahead of the deflate stream is purely an internal implementation detail, not something scripts should rely on.
             CString a = EvalIds(w, rawArgs, params);
-            CStringA utf8 = CW2A(a, CP_UTF8);
+            int c = a.Find(L','); CString vname = (c < 0) ? a : a.Left(c);
+            vname.Trim();
+            if (vname.IsEmpty() || vname[0] != L'&') return false;
+            BinVarEntry* bv = FindBinVar(vname);
+            if (!bv) { val = L"0"; return true; }
+            if (name == L"compress") {
+                uLong srcLen = (uLong)bv->data.size();
+                z_stream zs; memset(&zs, 0, sizeof(zs));
+                if (deflateInit(&zs, Z_DEFAULT_COMPRESSION) != Z_OK) { val = L"0"; return true; }
+                uLong destLen = deflateBound(&zs, srcLen);
+                std::vector<BYTE> out(destLen ? destLen : 1);
+                zs.next_in = bv->data.empty() ? (Bytef*)"" : bv->data.data();
+                zs.avail_in = (uInt)srcLen;
+                zs.next_out = out.data();
+                zs.avail_out = (uInt)out.size();
+                int zr = deflate(&zs, Z_FINISH);
+                uLong producedLen = (uLong)zs.total_out;
+                deflateEnd(&zs);
+                if (zr != Z_STREAM_END) { val = L"0"; return true; }
+                std::vector<BYTE> packed(4 + producedLen);
+                packed[0] = (BYTE)(srcLen & 0xFF); packed[1] = (BYTE)((srcLen >> 8) & 0xFF);
+                packed[2] = (BYTE)((srcLen >> 16) & 0xFF); packed[3] = (BYTE)((srcLen >> 24) & 0xFF);
+                if (producedLen > 0) memcpy(packed.data() + 4, out.data(), producedLen);
+                bv->data = packed;
+                val = L"1"; return true;
+            } else {
+                if (bv->data.size() < 4) { val = L"0"; return true; }
+                uLong origLen = (uLong)bv->data[0] | ((uLong)bv->data[1] << 8) | ((uLong)bv->data[2] << 16) | ((uLong)bv->data[3] << 24);
+                if (origLen == 0) { bv->data.clear(); val = L"1"; return true; }
+                std::vector<BYTE> out(origLen);
+                z_stream zs; memset(&zs, 0, sizeof(zs));
+                if (inflateInit(&zs) != Z_OK) { val = L"0"; return true; }
+                zs.next_in = bv->data.data() + 4;
+                zs.avail_in = (uInt)(bv->data.size() - 4);
+                zs.next_out = out.data();
+                zs.avail_out = (uInt)out.size();
+                int zr = inflate(&zs, Z_FINISH);
+                uLong producedLen = (uLong)zs.total_out;
+                inflateEnd(&zs);
+                if (zr != Z_STREAM_END || producedLen != origLen) { val = L"0"; return true; }
+                bv->data.assign(out.begin(), out.begin() + producedLen);
+                val = L"1"; return true;
+            }
+        }
+        if (name == L"sha1" || name == L"sha256" || name == L"sha384" || name == L"sha512") {   // $shaN(text) -- hex digest, via the same BCrypt sequence as $md5; $shaN(&var,1) -- hex digest of a binary variable's raw bytes instead of text
+            CString a = EvalIds(w, rawArgs, params);
+            CStringA utf8;
+            CString firstTok = a; int fc = a.Find(L','); if (fc >= 0) firstTok = a.Left(fc);
+            firstTok.Trim();
+            if (!firstTok.IsEmpty() && firstTok[0] == L'&') {
+                BinVarEntry* bv = FindBinVar(firstTok);
+                if (!bv) return false;
+                utf8 = CStringA((const char*)(bv->data.empty() ? (const BYTE*)"" : bv->data.data()), (int)bv->data.size());
+            } else {
+                utf8 = CW2A(a, CP_UTF8);
+            }
             LPCWSTR algId = name == L"sha1" ? BCRYPT_SHA1_ALGORITHM : name == L"sha256" ? BCRYPT_SHA256_ALGORITHM : name == L"sha384" ? BCRYPT_SHA384_ALGORITHM : BCRYPT_SHA512_ALGORITHM;
             int digestLen = name == L"sha1" ? 20 : name == L"sha256" ? 32 : name == L"sha384" ? 48 : 64;
             BCRYPT_ALG_HANDLE hAlg = nullptr; if (BCryptOpenAlgorithmProvider(&hAlg, algId, nullptr, 0) != 0 || !hAlg) return false;
@@ -8405,7 +8611,8 @@ class CMainFrame : public CMDIFrameWnd {
             CString title = p.size() > 3 && !p[3].IsEmpty() ? p[3] : CString(L"Input");
             CString text = p.size() > 4 ? p[4] : CString();
             CPromptDlg dlg(text, title, p[0], this);
-            if (dlg.DoModal() == IDOK) val = text; else val.Empty();
+            int dr; { ModalWatchdogGuard mg(this); dr = dlg.DoModal(); }   // see ModalWatchdogGuard's own comment -- without this, a /timer firing while this dialog sits open can trip the watchdog and silently halt whatever script called $input right after this returns
+            if (dr == IDOK) val = text; else val.Empty();
             return true;
         }
         if (name == L"qt") {   // $qt(text) -- adds a double-quote at the start if one isn't already there, and likewise at the end, independently
@@ -8414,7 +8621,16 @@ class CMainFrame : public CMDIFrameWnd {
             if (a.IsEmpty() || a[a.GetLength() - 1] != L'"') a += L"\"";
             val = a; return true;
         }
-        if (name == L"rgb") {   // $rgb(R,G,B) -> single 24-bit number (mIRC packs it as B,G,R internally); $rgb(N) -> "R,G,B" text. System-color-name form isn't implemented.
+        if (name == L"rgb") {   // $rgb(R,G,B) -> single 24-bit number (mIRC packs it as B,G,R internally); $rgb(N) -> "R,G,B" text; $rgb(<system colour keyword>) -> a single packed number, same layout as the 3-arg form (see kSysColors just below).
+            // A brief experiment removed this single-arg system-colour-keyword form entirely, on the theory that
+            // real mIRC doesn't support it (based on one side-by-side echo test) and that PixelEditor.mrc's grid
+            // lines were SUPPOSED to end up invalid/black so Fill's flood could spread across them. That broke the
+            // toolbar outright: %pe.text/%pe.face/%pe.shadow/%pe.3dlight all go through this exact same mechanism
+            // (see $pe.validatecolour in PixelEditor.mrc), so removing it left every toolbar icon drawn with a
+            // literal garbage colour string too, not just the grid -- confirmed directly via this file's own
+            // /drawfill diagnostic logging literal "a=[$rgb(text) $rgb(text) ...]" instead of real numbers, and the
+            // toolbar going entirely invisible. Restored to the known-working, previously-confirmed version. The
+            // Fill-not-spreading-across-cells question is a separate, still-open issue -- not this.
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
             if (p.size() == 3) {
@@ -8422,10 +8638,78 @@ class CMainFrame : public CMDIFrameWnd {
                 int ri = (int)r & 0xFF, gi = (int)g & 0xFF, bi = (int)b & 0xFF;
                 val.Format(L"%d", bi << 16 | gi << 8 | ri); return true;
             } else if (p.size() == 1) {
-                double nD; if (!ParseNum(p[0], nD)) return false; unsigned long n = (unsigned long)nD;
-                val.Format(L"%d,%d,%d", (int)(n & 0xFF), (int)((n >> 8) & 0xFF), (int)((n >> 16) & 0xFF)); return true;
+                double nD;
+                if (ParseNum(p[0], nD)) {
+                    unsigned long n = (unsigned long)nD;
+                    val.Format(L"%d,%d,%d", (int)(n & 0xFF), (int)((n >> 8) & 0xFF), (int)((n >> 16) & 0xFF)); return true;
+                }
+                static const struct { const wchar_t* kw; int sc; } kSysColors[] = {
+                    { L"window", COLOR_WINDOW }, { L"text", COLOR_WINDOWTEXT }, { L"back", COLOR_BACKGROUND },
+                    { L"fore", COLOR_WINDOWTEXT }, { L"face", COLOR_BTNFACE }, { L"shadow", COLOR_BTNSHADOW },
+                    { L"light", COLOR_BTNHIGHLIGHT }, { L"dark", COLOR_3DDKSHADOW }, { L"highlight", COLOR_HIGHLIGHT },
+                    { L"highlighttext", COLOR_HIGHLIGHTTEXT }, { L"scroll", COLOR_SCROLLBAR }, { L"desktop", COLOR_DESKTOP },
+                    { L"title", COLOR_ACTIVECAPTION }, { L"titletext", COLOR_CAPTIONTEXT },
+                    { L"inactivetitle", COLOR_INACTIVECAPTION }, { L"inactivetitletext", COLOR_INACTIVECAPTIONTEXT },
+                    { L"menu", COLOR_MENU }, { L"menutext", COLOR_MENUTEXT }, { L"static", COLOR_BTNFACE },
+                    { L"3dface", COLOR_3DFACE }, { L"3dshadow", COLOR_3DSHADOW }, { L"3dhighlight", COLOR_3DHIGHLIGHT },
+                    { L"3ddkshadow", COLOR_3DDKSHADOW }, { L"3dlight", COLOR_3DLIGHT }, { L"btntext", COLOR_BTNTEXT },
+                    { L"infobk", COLOR_INFOBK }, { L"infotext", COLOR_INFOTEXT }, { L"hotlight", COLOR_HOTLIGHT },
+                    { L"gradientactivetitle", COLOR_GRADIENTACTIVECAPTION },
+                    { L"gradientinactivetitle", COLOR_GRADIENTINACTIVECAPTION },
+                    { L"menuhilight", COLOR_MENUHILIGHT }, { L"menubar", COLOR_MENUBAR }, { L"frame", COLOR_WINDOWFRAME },
+                };
+                CString kw = p[0]; kw.MakeLower(); kw.Trim();
+                for (auto& e : kSysColors) if (kw == e.kw) { val.Format(L"%d", (int)::GetSysColor(e.sc)); return true; }
+                return false;
             }
             return false;
+        }
+        if (name == L"color") {   // $color(N) -- the packed RGB of mIRC's numbered colour-palette entry N (0-98), in the same layout $rgb()/drawrect/$getdot all use, so round-tripping a colour through a hash table (as PixelEditor.mrc's pe.colours/pe.mirc tables do: hadd pe.colours $rgb($color(%c)) $color(%c)) comes back out consistently. A handful of UI scheme keywords are also recognized; anything else falls through unevaluated like any other unrecognized identifier.
+            CString a = EvalIds(w, rawArgs, params);
+            double nD;
+            if (ParseNum(a, nD)) {
+                val.Format(L"%d", (int)MircColor((int)nD));
+                #if DEBUGGING
+                { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* $color(%s) -> %s", (LPCWSTR)a, (LPCWSTR)val); Show(dw, diag, cPart); }
+                #endif
+                return true;
+            }
+            CString kw = a; kw.MakeLower(); kw.Trim();
+            static const struct { const wchar_t* kw; int sc; } kColorKw[] = {
+                { L"info", COLOR_INFOBK }, { L"infotext", COLOR_INFOTEXT }, { L"own", COLOR_WINDOWTEXT },
+                { L"text", COLOR_WINDOWTEXT }, { L"background", COLOR_WINDOW }, { L"window", COLOR_WINDOW },
+                { L"face", COLOR_BTNFACE }, { L"highlight", COLOR_HIGHLIGHT },
+            };
+            for (auto& e : kColorKw) if (kw == e.kw) { val.Format(L"%d", (int)::GetSysColor(e.sc)); return true; }
+            return false;
+        }
+        if (name == L"getdot") {   // $getdot(window,x,y) -- the packed colour (same format as $rgb()/$color()) of the pixel at (x,y) on a custom window's drawing canvas; -1 if the window, or that pixel, doesn't exist
+            CString a = EvalIds(w, rawArgs, params);
+            std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
+            if (p.size() != 3) return false;
+            CChatWnd* cw = FindDrawWin(p[0]);
+            double xD, yD;
+            if (!cw || !cw->m_cwDC || !ParseNum(p[1], xD) || !ParseNum(p[2], yD)) {
+                val = L"-1";
+                #if DEBUGGING
+                { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* $getdot(%s) -> -1 (no window/DC, or bad x/y)", (LPCWSTR)a); Show(dw, diag, cPart); }
+                #endif
+                return true;
+            }
+            int x = (int)xD, y = (int)yD;
+            if (x < 0 || y < 0 || x >= cw->m_cwBmpW || y >= cw->m_cwBmpH) {
+                val = L"-1";
+                #if DEBUGGING
+                { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* $getdot(%s) -> -1 (x,y=%d,%d out of bounds %dx%d)", (LPCWSTR)a, x, y, cw->m_cwBmpW, cw->m_cwBmpH); Show(dw, diag, cPart); }
+                #endif
+                return true;
+            }
+            COLORREF c = ::GetPixel(cw->m_cwDC, x, y);
+            val.Format(L"%d", (int)c);
+            #if DEBUGGING
+            { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* $getdot(%s) -> %s (win=%s %dx%d, pixel R=%d G=%d B=%d)", (LPCWSTR)a, (LPCWSTR)val, (LPCWSTR)p[0], cw->m_cwBmpW, cw->m_cwBmpH, GetRValue(c), GetGValue(c), GetBValue(c)); Show(dw, diag, cPart); }
+            #endif
+            return true;
         }
         if (name == L"eval") {   // $eval(text,N) -- evaluates text N times total. The common case is N=2, for deferring evaluation of a dynamically-built identifier/variable name by one extra pass.
             CString a = EvalIds(w, rawArgs, params);
@@ -8504,6 +8788,40 @@ class CMainFrame : public CMDIFrameWnd {
             }
             val = out; return true;
         }
+        if (name == L"bvar") {   // $bvar(&var)[.text] -- length, or decoded text; $bvar(&var,N)[.text] -- byte N (1-based), or that byte as a char; $bvar(&var,N,M)[.text] -- M bytes from N as a space-separated decimal list, or decoded text
+            CString a = EvalIds(w, rawArgs, params);
+            int c1 = a.Find(L',');
+            CString vname = (c1 < 0) ? a : a.Left(c1);
+            CString restArgs = (c1 < 0) ? CString() : a.Mid(c1 + 1);
+            BinVarEntry* bv = FindBinVar(vname);
+            bool wantText = (prop == L"text");
+            if (restArgs.IsEmpty()) {
+                if (!bv) { val.Empty(); return true; }
+                if (wantText) { CString t; for (BYTE b : bv->data) t += (wchar_t)b; val = t; return true; }
+                val.Format(L"%d", (int)bv->data.size()); return true;
+            }
+            int c2 = restArgs.Find(L',');
+            CString nStr = (c2 < 0) ? restArgs : restArgs.Left(c2);
+            CString mStr = (c2 < 0) ? CString() : restArgs.Mid(c2 + 1);
+            double nD; if (!ParseNum(nStr, nD)) { val.Empty(); return true; }
+            int N = (int)nD;
+            if (!bv) { val.Empty(); return true; }
+            if (N == 0 && mStr.IsEmpty()) { val.Format(L"%d", (int)bv->data.size()); return true; }
+            if (mStr.IsEmpty()) {
+                if (N < 1 || N > (int)bv->data.size()) { val.Empty(); return true; }
+                if (wantText) { val = CString((wchar_t)bv->data[N - 1]); return true; }
+                val.Format(L"%d", (int)bv->data[N - 1]); return true;
+            }
+            double mD; if (!ParseNum(mStr, mD)) { val.Empty(); return true; }
+            int M = (int)mD;
+            if (N < 1 || M < 0 || N > (int)bv->data.size()) { val.Empty(); return true; }
+            int avail = (int)bv->data.size() - (N - 1);
+            if (M > avail) M = avail;
+            if (M <= 0) { val.Empty(); return true; }
+            if (wantText) { CString t; for (int i = 0; i < M; i++) t += (wchar_t)bv->data[N - 1 + i]; val = t; return true; }
+            CString out; for (int i = 0; i < M; i++) { if (i) out += L" "; CString s; s.Format(L"%d", (int)bv->data[N - 1 + i]); out += s; }
+            val = out; return true;
+        }
         if (name == L"hget") {
             CString a = EvalIds(w, rawArgs, params);
             int c = a.Find(L',');
@@ -8525,15 +8843,28 @@ class CMainFrame : public CMDIFrameWnd {
             // not a position) -- except $hget(name,0), which returns the item count instead; with a .item
             // property and a positive N, the second argument is instead a 1-based POSITION, and the result is
             // that item's key name rather than its data (matches mIRC's own documented $hget(table,N).item form).
-            CString tname = a.Left(c); CString second = a.Mid(c + 1);
+            // A third argument that names a &binvar is the binary-retrieval form: $hget(name,item,&var) writes
+            // the item's raw bytes into &var and returns 1/0 for found/not-found, instead of returning text.
+            CString tname = a.Left(c); CString rest2 = a.Mid(c + 1);
+            int c2b = rest2.Find(L',');
+            CString second = (c2b < 0) ? rest2 : rest2.Left(c2b);
+            CString thirdArg = (c2b < 0) ? CString() : rest2.Mid(c2b + 1);
             HashTableEntry* t = FindHashTable(tname);
             if (!t) { val.Empty(); return true; }
             double nD; bool isNum = ParseNum(second, nD);
-            if (isNum && (int)nD == 0) { val.Format(L"%d", (int)t->items.size()); return true; }
+            if (isNum && (int)nD == 0 && thirdArg.IsEmpty()) { val.Format(L"%d", (int)t->items.size()); return true; }
             if (prop == L"item" && isNum) {
                 int N = (int)nD;
                 if (N < 1 || N > (int)t->items.size()) { val.Empty(); return true; }
                 val = t->items[N - 1].first; return true;
+            }
+            if (!thirdArg.IsEmpty() && thirdArg.Left(1) == L"&") {
+                for (auto& kv : t->items) if (kv.first.CompareNoCase(second) == 0) {
+                    BinVarEntry* bv = GetOrMakeBinVar(thirdArg);
+                    bv->data.clear(); for (int i = 0; i < kv.second.GetLength(); i++) bv->data.push_back((BYTE)(kv.second[i] & 0xFF));
+                    val = L"1"; return true;
+                }
+                val = L"0"; return true;
             }
             for (auto& kv : t->items) if (kv.first.CompareNoCase(second) == 0) { val = kv.second; return true; }
             val.Empty(); return true;
@@ -9450,15 +9781,88 @@ class CMainFrame : public CMDIFrameWnd {
             val.Format(L"%d", (int)matches.size());
             return true;
         }
-        if (name == L"sfile") {   // $sfile(dir,title,oktext): the standard file-open dialog
+        if (name == L"sfile") {   // $sfile(initial,title,oktext): the SAVE-AS dialog ("s" = save -- distinct from $file's plain open dialog). "initial" pre-fills BOTH the starting folder and the suggested filename -- real scripts build it as a directory concatenated with a proposed name (e.g. PixelEditor.mrc's own call: "$mircdir $+ Pixed $+ $ticks $+ .bmp"), not just a folder path the way $file's "initial" works.
+            // This was wrongly opening an OPEN dialog (bOpenFileDialog=TRUE, OFN_FILEMUSTEXIST) instead of a real
+            // Save-As one, and only ever used the "initial" argument as a directory, silently dropping the filename
+            // portion entirely -- so Ctrl+S's Pixel Editor export always showed a bare Explorer "Open" picker with
+            // no filename pre-filled and no way to type a new one that wasn't already an existing file, instead of
+            // the Save-As prompt mIRC shows with "PixedNNNNN.bmp" already suggested.
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
-            CString dir = parts.size() > 0 ? parts[0] : CString(); CString title = parts.size() > 1 ? parts[1] : CString(L"Select File");
+            CString initial = parts.size() > 0 ? parts[0] : CString(); CString title = parts.size() > 1 ? parts[1] : CString(L"Save As");
+            CString dir, fname = initial;
+            int slash = (std::max)(initial.ReverseFind(L'\\'), initial.ReverseFind(L'/'));
+            if (slash >= 0) { dir = initial.Left(slash); fname = initial.Mid(slash + 1); }
             m_sfstate.Empty();
-            CFileDialog fd(TRUE, nullptr, nullptr, OFN_FILEMUSTEXIST | OFN_HIDEREADONLY, L"All Files (*.*)|*.*||", this);
+            // Two earlier attempts at seeding the suggested filename both failed, and the user's own side-by-side
+            // real-mIRC screenshot settled which direction is actually right: real mIRC shows a completely normal
+            // modern (Vista-style) Save dialog with "Pixed 2498105687.bmp" -- space and all -- fully pre-filled and
+            // selected. So the modern dialog genuinely can do this correctly; forcing the classic pre-Vista dialog
+            // (bVistaStyle=FALSE, the previous attempt) was the wrong direction entirely, and broke the dialog outright
+            // in this environment (reported as "not saving anything" -- nothing even popped up). And poking
+            // m_ofn.lpstrFile directly before DoModal() (the attempt before that) doesn't work either, because for a
+            // Vista-style CFileDialog, MFC's internal shell-dialog setup only reads m_ofn.lpstrFile at COM-object
+            // creation time, which happens inside DoModal() itself, before our code gets another chance to run --
+            // whatever we poked into the buffer beforehand was already stale by the time the dialog actually read it,
+            // so it fell back to parsing OUR earlier constructor-based attempt's leftovers (truncated at the first
+            // space, same bug as before).
+            // The officially correct hook for this (and what real mIRC is presumably doing under the hood) is
+            // IFileDialog::SetFileName(), called from CFileDialog::OnInitDone() -- the one point MFC documents as
+            // safe to reach the live COM dialog object via GetIFileDialog() before the dialog is actually shown.
+            // SetFileName() just sets the File-name edit box's text verbatim, spaces and all -- no tokenizing.
+            class SFileDlg : public CFileDialog {
+            public:
+                CString m_presetName;
+                SFileDlg(CWnd* pParent) : CFileDialog(FALSE, nullptr, nullptr, OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY, L"All Files (*.*)|*.*||", pParent) {}
+                virtual void OnInitDone() {
+                    CFileDialog::OnInitDone();
+                    // GetIFileDialog() (the public accessor added in later MFC releases) isn't available in this
+                    // project's MFC version (C3861: identifier not found) -- but the live COM object it would have
+                    // returned is still sitting right there as CFileDialog's own protected m_pIFileDialog member,
+                    // which a derived class (this one) can reach directly.
+                    // m_pIFileDialog is declared as a plain void* in this MFC version's header (so afxdlgs.h doesn't
+                    // have to drag in shobjidl.h/IFileDialog's declaration for every single caller) -- needs an
+                    // explicit cast back to the real interface type to call through it.
+                    IFileDialog* pfd = (IFileDialog*)m_pIFileDialog;
+                    if (pfd && !m_presetName.IsEmpty()) pfd->SetFileName(m_presetName);
+                }
+            };
+            // m_ofn.lpstrFile is still seeded too (same writable-buffer approach as before) purely as a fallback for
+            // whatever edge case makes GetIFileDialog() come back null (pre-Vista OS, COM init failure, etc.) -- on
+            // any such fallback this reverts to the old truncate-at-space behavior, but that's strictly better than
+            // the alternative of an empty/untitled suggested name.
+            std::vector<wchar_t> fnameBuf(1024, 0);
+            if (!fname.IsEmpty()) wcsncpy_s(fnameBuf.data(), fnameBuf.size(), fname, _TRUNCATE);
+            SFileDlg fd(this);
+            fd.m_presetName = fname;
+            fd.m_ofn.lpstrFile = fnameBuf.data(); fd.m_ofn.nMaxFile = (DWORD)fnameBuf.size();
             if (!dir.IsEmpty()) fd.m_ofn.lpstrInitialDir = dir;
             fd.m_ofn.lpstrTitle = title;
-            if (fd.DoModal() == IDOK) val = fd.GetPathName(); else { m_sfstate = L"cancel"; val.Empty(); }
+            // DEBUGGING output below is deliberately sent to the *status* window (via dw, below), not w -- w is
+            // whatever window this script is actually running in, which for PixelEditor.mrc's Ctrl+S is the @Pixel
+            // custom window itself: a canvas+toolbar with no visible text area of its own, so anything Show(w,...)
+            // writes there was landing somewhere never actually seen on screen, regardless of what really happened.
+            CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w);
+#if DEBUGGING
+            Show(dw, L"* $sfile: about to open dialog", cPart);   // confirms execution actually reaches DoModal() at all -- if even this line doesn't show up, whatever's going wrong is happening before the dialog opens (SFileDlg construction, or the sfile identifier not even being reached), not inside/after DoModal()
+#endif
+            int dr = IDCANCEL; CString sfExc;
+            try {
+                ModalWatchdogGuard mg(this); dr = fd.DoModal();   // see ModalWatchdogGuard's own comment -- this is the exact bug behind PixelEditor.mrc's Ctrl+S appearing to do nothing: a /timer firing while this Save dialog sits open (routinely several seconds, however long picking a filename takes) could trip the watchdog and halt pe.exportimage the instant it resumed here, before it ever reached its own /drawsave call
+            } catch (CException* e) {   // leaving the suggested (SetFileName-preset) name untouched and clicking Save was reported as producing NO diagnostic output at all -- turned out the diagnostics were going to @Pixel's own (invisible) text area, not actually a thrown exception, but this stays as a real safety net regardless.
+                TCHAR buf[512] = {}; e->GetErrorMessage(buf, 512); sfExc = buf; e->Delete();
+            } catch (...) {
+                sfExc = L"(non-CException C++ exception)";
+            }
+            if (!sfExc.IsEmpty()) {
+                Show(dw, L"* $sfile: EXCEPTION during DoModal(): " + sfExc, cPart);
+                m_sfstate = L"cancel"; val.Empty(); m_v1.Empty();
+                return true;
+            }
+            if (dr == IDOK) { val = fd.GetPathName(); m_v1 = val; } else { m_sfstate = L"cancel"; val.Empty(); m_v1.Empty(); }
+#if DEBUGGING
+            { CString diag; diag.Format(L"* $sfile: dir=[%s] fname=[%s] -> dr=%d (IDOK=%d) path=[%s]", (LPCWSTR)dir, (LPCWSTR)fname, dr, IDOK, (LPCWSTR)val); Show(dw, diag, cPart); }
+#endif
             return true;
         }
         if (name == L"sdir") {   // $sdir(dir,title): the standard folder-browse dialog
@@ -9468,7 +9872,7 @@ class CMainFrame : public CMDIFrameWnd {
             m_sfstate.Empty();
             wchar_t path[MAX_PATH] = {};
             BROWSEINFOW bi = {}; bi.hwndOwner = m_hWnd; bi.pszDisplayName = path; bi.lpszTitle = title; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-            LPITEMIDLIST pidl = ::SHBrowseForFolderW(&bi);
+            LPITEMIDLIST pidl; { ModalWatchdogGuard mg(this); pidl = ::SHBrowseForFolderW(&bi); }   // see ModalWatchdogGuard's own comment -- same blocking-dialog/watchdog hazard as $sfile above
             if (pidl) { ::SHGetPathFromIDListW(pidl, path); ::CoTaskMemFree(pidl); val = path; } else { m_sfstate = L"cancel"; val.Empty(); }
             return true;
         }
@@ -9479,7 +9883,7 @@ class CMainFrame : public CMDIFrameWnd {
             m_sfstate.Empty();
             wchar_t path[MAX_PATH] = {};
             BROWSEINFOW bi = {}; bi.hwndOwner = m_hWnd; bi.pszDisplayName = path; bi.lpszTitle = title; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-            LPITEMIDLIST pidl2 = ::SHBrowseForFolderW(&bi);
+            LPITEMIDLIST pidl2; { ModalWatchdogGuard mg(this); pidl2 = ::SHBrowseForFolderW(&bi); }   // see ModalWatchdogGuard's own comment -- same blocking-dialog/watchdog hazard as $sfile above
             if (pidl2) { ::SHGetPathFromIDListW(pidl2, path); ::CoTaskMemFree(pidl2); val = path; } else { m_sfstate = L"cancel"; val.Empty(); }
             return true;
         }
@@ -9495,7 +9899,8 @@ class CMainFrame : public CMDIFrameWnd {
             fd.m_ofn.lpstrFile = buf.data(); fd.m_ofn.nMaxFile = (DWORD)buf.size();
             if (!dir.IsEmpty()) fd.m_ofn.lpstrInitialDir = dir;
             fd.m_ofn.lpstrTitle = title;
-            if (fd.DoModal() == IDOK) { POSITION pos = fd.GetStartPosition(); while (pos) m_msfileResults.push_back(fd.GetNextPathName(pos)); val.Format(L"%d", (int)m_msfileResults.size()); }
+            int dr; { ModalWatchdogGuard mg(this); dr = fd.DoModal(); }   // see ModalWatchdogGuard's own comment -- same blocking-dialog/watchdog hazard as $sfile above
+            if (dr == IDOK) { POSITION pos = fd.GetStartPosition(); while (pos) m_msfileResults.push_back(fd.GetNextPathName(pos)); val.Format(L"%d", (int)m_msfileResults.size()); }
             else { m_sfstate = L"cancel"; val = L"0"; }
             return true;
         }
@@ -10190,6 +10595,20 @@ class CMainFrame : public CMDIFrameWnd {
             CString wn = a.Left(c); wn.Trim();
             CString rest = a.Mid(c + 1); int c2 = rest.Find(L',');
             double nn; if (!ParseNum(c2 < 0 ? rest : rest.Left(c2), nn)) return false;
+            // T: when given and non-zero, N counts from the LAST line instead of the first -- mirrors /iline's and
+            // /dline's own -l switch (see CmdCwLine), and is what lets a script read the bottom of a window's line
+            // store without first querying $line(name,0) for the count. T was previously accepted but completely
+            // ignored, so $line(name,N,1) silently behaved exactly like $line(name,N) (always top-relative). That
+            // broke PixelEditor.mrc's redo stack outright: @pe.undo is used as a combined undo+redo deque (undo
+            // entries pushed/popped at the top via plain iline/dline, redo entries pushed/popped at the BOTTOM via
+            // the -l switch -- see CmdCwLine's own comment), and pe.redo reads its next entry with
+            // "$line(@pe.undo,1,1)" specifically to reach that bottom entry. With T ignored, pe.redo was reading
+            // line 1 from the TOP instead -- the same entry pe.undo itself had just put there -- so Ctrl+Y re-ran
+            // whatever Ctrl+Z had JUST undone (undoing it right back again) rather than ever reaching a genuine redo
+            // entry, which is exactly why it behaved just like one more Ctrl+Z instead of a real redo, and why only
+            // one step of it ever did anything (after that first mix-up there was nothing left at the top to redo).
+            bool fromLast = false;
+            if (c2 >= 0) { double tt; if (ParseNum(rest.Mid(c2 + 1), tt) && tt != 0) fromLast = true; }
             CChatWnd* cw = Find(nullptr, wn);
             if (!cw || !cw->m_custom) { val.Empty(); return true; }
             int idx = (int)nn;
@@ -10200,6 +10619,7 @@ class CMainFrame : public CMDIFrameWnd {
                 return true;
             }
             if (idx == 0) { val.Format(L"%d", (int)cw->m_cwLines.size()); return true; }
+            if (fromLast) idx = (int)cw->m_cwLines.size() - idx + 1;
             if (idx < 1 || idx > (int)cw->m_cwLines.size()) { val.Empty(); return true; }
             if (prop == L"state") val = cw->m_cwSelectedLine == idx ? L"1" : L"0";
             else if (prop == L"color") { COLORREF cr = (size_t)idx <= cw->m_cwColors.size() ? cw->m_cwColors[idx - 1] : cText; val.Format(L"%d", (int)cr); }
@@ -10302,7 +10722,15 @@ class CMainFrame : public CMDIFrameWnd {
             int cnt = (int)ts.size();
             if (b < 0 || b > cnt) b = cnt;
             if (a < 1 || a > b) return CString();
-            return params.Mid(ts[a - 1], te[b - 1] - ts[a - 1]);
+            CString s = params.Mid(ts[a - 1], te[b - 1] - ts[a - 1]);
+            // /tokenize (see its own comment) encodes a literal space that's genuinely PART of one token -- as
+            // opposed to a real separator between tokens -- using kTokenizeSpace, a private-use sentinel character
+            // that can't appear in real script text, specifically so this space-delimited token scan above still
+            // sees the right token BOUNDARIES while the token's own text comes back out whole. This is the one place
+            // that sentinel is ever meant to turn back into a real space -- every other $N/$N-/$parms read of
+            // `params` goes through this same slice() lambda, so putting the decode here covers all of them.
+            if (s.Find(kTokenizeSpace) >= 0) s.Replace(kTokenizeSpace, L' ');
+            return s;
         };
         CString out; int L = in.GetLength(); bool hashPending = false;
         for (int i = 0; i < L; i++) {
@@ -10340,7 +10768,32 @@ class CMainFrame : public CMDIFrameWnd {
             int j = i + 1; bool dbl = false;
             if (in[j] == L'$' && j + 1 < L) { dbl = true; j++; }
             CString val; bool ok = false; int endIdx = j;
-            if (in[j] == L'+' && !dbl) {   // $+ : drop the spaces on both sides
+            if (in[j] == L'+' && !dbl) {
+                if (j + 1 < L && in[j + 1] == L'(') {
+                    // $+(a,b,c,...) -- the function form of $+: concatenate every comma-separated
+                    // argument (each evaluated first) with NO separators at all, same result as
+                    // chaining "a $+ b $+ c" but in one call. This wasn't recognized at all before --
+                    // only the bare two-sided "text1 $+ text2" operator just below was handled, so
+                    // "$+(" fell through as unrecognized, leaving its parens and raw unevaluated
+                    // contents as literal trailing text. Worse, the bare-operator's own space-eating
+                    // logic still ran first and swallowed whatever space came right before "$+(" --
+                    // together mangling e.g. PixelEditor.mrc's own tooltip builder, "%type
+                    // $+(Replace colour,%c %c,...)", into "pe.imagetip(Replace colour,93 93,...)"
+                    // glued straight onto the alias name with no space, which then got dispatched
+                    // whole as one unrecognized command instead of "pe.imagetip" with its real args.
+                    int depth = 1, m = j + 2;
+                    for (; m < L; m++) { if (in[m] == L'(') depth++; else if (in[m] == L')') { if (--depth == 0) break; } }
+                    if (m < L) {
+                        CString inner = in.Mid(j + 2, m - j - 2);
+                        CString joined;
+                        for (auto& part : SplitTopLevelCommasParen(inner)) joined += EvalIds(w, part, params);
+                        if (hashPending) { hashPending = false; if (joined.IsEmpty() || !wcschr(L"#&+!", joined[0])) out += L'#'; }
+                        out += joined; i = m; continue;
+                    }
+                    // unterminated "$+(" -- no matching ')' anywhere -- falls through to the bare
+                    // two-sided operator below, same as real mIRC effectively does with a stray paren
+                }
+                // $+ : drop the spaces on both sides
                 if (hashPending) { out += L'#'; hashPending = false; }
                 while (out.GetLength() > 0 && out[out.GetLength() - 1] == L' ') out.Truncate(out.GetLength() - 1);
                 int e = j + 1; while (e < L && in[e] == L' ') e++;
@@ -10374,7 +10827,8 @@ class CMainFrame : public CMDIFrameWnd {
                 if (hasN && pnum >= 1 && pnum <= (int)ts.size()) val = slice(pnum, pnum);
                 else {
                     CString typed; CPromptDlg dlg(typed, L"Input", label, this);
-                    if (dlg.DoModal() == IDOK) { val = typed; m_lastPrompt = typed; } else m_halt = true;   // Cancel stops the script
+                    int dr; { ModalWatchdogGuard mg(this); dr = dlg.DoModal(); }   // see ModalWatchdogGuard's own comment -- without this, a /timer firing while this prompt sits open could trip the watchdog and halt the script right as it resumes here, before the Cancel-sets-m_halt line below even runs (which would then look like a normal Cancel, but for the wrong reason)
+                    if (dr == IDOK) { val = typed; m_lastPrompt = typed; } else m_halt = true;   // Cancel stops the script
                 }
                 ok = true; endIdx = k;
             }
@@ -10411,6 +10865,26 @@ class CMainFrame : public CMDIFrameWnd {
                     while (k2 < L && in[k2] == L':' && k2 + 1 < L && iswalnum(in[k2 + 1])) { k2++; while (k2 < L && iswalnum(in[k2])) k2++; }
                     if (k2 < L && in[k2] == L'(') k = k2;
                 }
+                // Same deal, but for a DOT-separated alias name ("pe.grid", "pe.checksize", ...) called as an
+                // identifier: "pe.grid(10,10)" -- an ordinary, valid mIRC alias name (see ParseAliases, which has
+                // always accepted dots in alias names; PixelEditor.mrc defines dozens of pe.* aliases this way).
+                // Without this, the plain alnum scan above stops at the first "." exactly like it used to stop at
+                // the first ":", and the very next block down (the bare ".property" check) swallows ".grid" as a
+                // PROPERTY of some unrelated identifier named "pe" instead -- here, disastrously, "pe" is itself a
+                // real alias (the main /pe alias that's already running), so "$pe.grid(10,10)" was being parsed as
+                // "$pe .grid(10,10)": a recursive, same-name call to the alias already on the run stack, which
+                // OnRunStack correctly refuses, leaving "$pe.grid(10,10)" entirely unevaluated as literal text.
+                // That's exactly what silently landed in %pe.grid instead of the grid's actual line-coordinate
+                // list, which is what left the whole pixel canvas blank with no grid drawn at all. Only extend the
+                // name across a dot when it's unambiguously part of an alias-style call -- more identifier
+                // characters follow the dot, AND the whole extended run is immediately followed by "(" -- so every
+                // ordinary bare "$identifier.prop" (no parens) form used throughout this file is completely
+                // unaffected and still splits at the first dot exactly as before.
+                if (k < L && in[k] == L'.' && k + 1 < L && iswalpha(in[k + 1])) {
+                    int k2 = k;
+                    while (k2 < L && in[k2] == L'.' && k2 + 1 < L && iswalpha(in[k2 + 1])) { k2++; while (k2 < L && iswalnum(in[k2])) k2++; }
+                    if (k2 < L && in[k2] == L'(') k = k2;
+                }
                 CString name = in.Mid(j, k - j); name.MakeLower();
                 bool done = false;
                 if (name == L"parms" || name == L"parmn") {   // $parms: documented as "the non-tokenize version of $1-, preserving spaces" -- which is already exactly what slice(1,-1) gives here, since it reads verbatim from the original params text instead of rejoining tokens with a single space. $parmn: the token count behind it (same count $0 reports). Both need THIS call's own params tokenization (ts/slice, just above), which IdentValue has no way to see, so they're handled right here instead of there.
@@ -10443,6 +10917,25 @@ class CMainFrame : public CMDIFrameWnd {
                     // text). Otherwise -- no parens at all -- pass the property straight through.
                     CString identProp = hasArgs ? CString() : prop;
                     if (IdentValue(w, name, identProp, val)) { done = true; endIdx = hasArgs ? k : afterProp; }
+                }
+                if (!done && !hasArgs && !prop.IsEmpty()) {
+                    // A dotted alias name used BARE, with no "()" at all ($pe.tools, not $pe.tools()) -- the same
+                    // valid alias-as-identifier call the "(" extension above handles, just with zero arguments.
+                    // Without this, a bare dotted call only ever split into name="pe" + prop="tools" (the ordinary
+                    // bare ".property" path just above), IdentValue("pe","tools") found no such built-in, and the
+                    // whole "$pe.tools" was left as literal, unevaluated text -- which is exactly what silently
+                    // emptied PixelEditor.mrc's tool list ($gettok($pe.tools,%i,124) iterating over the literal
+                    // string "$pe.tools" instead of the real pipe-delimited tool names), skipping the entire
+                    // tool-icon-drawing loop AND leaving every click handler that reads %pixed.tool against that
+                    // same empty list with nothing real to match -- "tools are missing, can't draw".
+                    CString dotted = name + L"." + prop;
+                    if (AliasDef* ad2 = FindAlias(dotted)) {
+                        if (!OnRunStack(ad2->name)) {
+                            m_result.Empty();
+                            RunAlias(w, *ad2, CString());
+                            val = m_result; done = true; endIdx = afterProp;
+                        }
+                    }
                 }
                 // Real mIRC matches a parens-less identifier against its known name table, not just "read every
                 // following alnum character" -- scripts routinely butt a bare identifier straight up against
@@ -11382,6 +11875,7 @@ class CMainFrame : public CMDIFrameWnd {
                 if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
                 if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesWhereSpec(ev.whereSpec, winName)) continue;
+                if (eventName == L"KEYDOWN" && !MatchesKeySpec(ev.keySpec, _wtoi(params))) continue;
                 m_evChan = winName; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, params);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
@@ -11969,14 +12463,19 @@ class CMainFrame : public CMDIFrameWnd {
         CString params; if (sec == 2) params = c->m_name;   // in a query window $1 is the person you're talking to
         return ShowContextPopup(c, sec, params, pt, c->LogHasSelection());
     }
-    bool ShowCustomPopup(CChatWnd* w, CPoint pt) {   // right-click in an @window: its own popup.txt (if any) plus any script-defined "Menu @windowname { ... }" block (m_remoteMenus) -- see onCanvasClick's own comment on why both sources matter
+    bool ShowCustomPopup(CChatWnd* w, CPoint pt) {   // right-click in an @window: its own popup.txt (if any) plus any script-defined "Menu @windowname { ... }" block (m_remoteMenus) -- see onCanvasEvent's own comment on why both sources matter
         std::vector<PopupItem> items = w->m_cwPopup.empty() ? std::vector<PopupItem>() : ParsePopupItems(w->m_cwPopup);
         { std::vector<PopupItem> remote = RemoteMenuItemsFor(w->m_name); items.insert(items.end(), remote.begin(), remote.end()); }
         if (items.empty()) return false;
-        // "sclick"/"dclick" are reserved top-level labels (see CChatWnd::onCanvasClick's wiring) -- real mIRC
-        // runs them directly on a left click/double-click rather than ever showing them as an actual entry in
-        // this right-click menu, so they're filtered back out here the same way.
-        items.erase(std::remove_if(items.begin(), items.end(), [](const PopupItem& it) { return it.depth == 0 && (it.title.CompareNoCase(L"sclick") == 0 || it.title.CompareNoCase(L"dclick") == 0); }), items.end());
+        // "sclick"/"uclick"/"dclick"/"mouse"/"leave" are reserved top-level labels (see CChatWnd::onCanvasEvent's
+        // wiring) -- real mIRC runs them directly on the matching mouse action rather than ever showing them as an
+        // actual entry in this right-click menu, so they're filtered back out here the same way.
+        static const wchar_t* const kReservedMouseLabels[] = { L"sclick", L"uclick", L"dclick", L"mouse", L"leave" };
+        items.erase(std::remove_if(items.begin(), items.end(), [](const PopupItem& it) {
+            if (it.depth != 0) return false;
+            for (auto lbl : kReservedMouseLabels) if (it.title.CompareNoCase(lbl) == 0) return true;
+            return false;
+        }), items.end());
         CMenu m; m.CreatePopupMenu(); std::vector<std::vector<CString>> acts; size_t i = 0;
         BuildPopupLevel(m, items, i, 0, IDP_CTX, acts, w, CString());
         if (m.GetMenuItemCount() == 0) return false;
@@ -12606,15 +13105,29 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"linesep") { CString a = arg; bool toStatus = a.Left(2).CompareNoCase(L"-s") == 0; CChatWnd* t = toStatus ? Status(net) : w; if (t) Show(t, L"-", cText); }
         else if (cmd == L"tokenize") {   // re-splits <text> on <charcode> and replaces $1../$1- with the result, for the rest of the
-            // currently-running script -- exactly like real mIRC. $1.. are always space-based regardless of the separator used
-            // here, so the split parts are rejoined with plain spaces; m_curCtx->params is the mutable CString that every
-            // subsequent line of this same script (including nested if/while blocks, since they share the same ExecCtx) reads
-            // $1../$1- back out of -- see ExecCtx/m_curCtx and RunScript's localParams.
+            // currently-running script -- exactly like real mIRC. $1.. are read back out of m_curCtx->params (the
+            // mutable CString that every subsequent line of this same script, including nested if/while blocks, since
+            // they share the same ExecCtx, reads $1../$1- back out of -- see ExecCtx/m_curCtx and RunScript's
+            // localParams) by splitting on literal spaces, token boundaries and all -- so a token that genuinely
+            // contains its own space (routine whenever the separator char isn't a space -- e.g. PixelEditor.mrc's own
+            // "tokenize 1 $v1" over a chosen save path like "Pixed 173823883.bmp") would otherwise come apart into
+            // two separate $N's the moment it's rejoined with plain spaces here: $1 ends up truncated at the first
+            // embedded space ("Pixed"), losing the rest of the path -- exactly what was happening to Ctrl+S's export.
+            // Fixed by protecting each token's OWN internal spaces with kTokenizeSpace (a sentinel no real text ever
+            // contains) before rejoining with the real, token-separating spaces this file's $1/$2/$1- scan expects --
+            // EvalIds' slice() lambda turns the sentinel back into a real space the moment a script actually reads
+            // $1/$2/etc, so nothing downstream of that ever sees anything but the original, whole, unmangled token.
             CString a = arg; CString chTok = Word(a);
             if (!IsAllDigits(chTok)) { Show(w, L"* Usage: /tokenize <charcode> <text>", cPart); return; }
             wchar_t sep = (wchar_t)_wtoi(chTok);
             std::vector<CString> parts; CString cur; for (int i = 0; i < a.GetLength(); i++) { if (a[i] == sep) { parts.push_back(cur); cur.Empty(); } else cur += a[i]; } parts.push_back(cur);
-            CString joined; for (size_t i = 0; i < parts.size(); i++) { if (i) joined += L" "; joined += parts[i]; }
+            CString joined;
+            for (size_t i = 0; i < parts.size(); i++) {
+                if (i) joined += L" ";
+                CString part = parts[i];
+                if (sep != L' ') part.Replace(L' ', kTokenizeSpace);   // only needed (and only safe) when the chosen delimiter isn't itself a space -- tokenizing ON a space never needs protecting, since in that case a token containing one would never have stayed one token in the first place
+                joined += part;
+            }
             if (m_curCtx && m_curCtx->params) *m_curCtx->params = joined;
             else Show(w, L"* /tokenize: nothing to tokenize outside a running script.", cPart);   // typed directly at the input box: no $1../$1- scope for it to affect
         }
@@ -12775,12 +13288,13 @@ class CMainFrame : public CMDIFrameWnd {
                 else { m_hashTables.erase(it); if (showMsg) Show(w, L"* /hfree: freed table '" + pat + L"'", cPart); }
             }
         }
-        else if (cmd == L"hadd") {   // /hadd [-m[N]] <name> <item> [data]
-            CString a = arg; bool makeIfMissing = false; int makeSize = 100;
+        else if (cmd == L"hadd") {   // /hadd [-m[N]] [-b] <name> <item> [data|&binvar]
+            CString a = arg; bool makeIfMissing = false; int makeSize = 100; bool isBinary = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) {
                 CString sw = Word(a); sw.MakeLower();
                 int mPos = sw.Find(L'm');
                 if (mPos >= 0) { makeIfMissing = true; CString numPart = sw.Mid(mPos + 1); double nD; if (!numPart.IsEmpty() && ParseNum(numPart, nD) && nD > 0) makeSize = (int)nD; }
+                if (sw.Find(L'b') >= 0) isBinary = true;
             }
             CString tname = Word(a); CString item = Word(a); CString data = a;   // whatever remains is the data, spaces and all
             if (tname.IsEmpty() || item.IsEmpty()) { Show(w, L"* /hadd: insufficient parameters", cPart); }
@@ -12789,6 +13303,16 @@ class CMainFrame : public CMDIFrameWnd {
                 if (!t) {
                     if (!makeIfMissing) { Show(w, L"* /hadd: table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
                     HashTableEntry nt; nt.name = tname; nt.size = makeSize; m_hashTables.push_back(nt); t = &m_hashTables.back();
+                }
+                // -b: <data> names a &binvar -- pack its raw bytes into the stored CString (one wchar per byte)
+                // instead of storing the literal "&var" text, so a later $hget(...,&var2) binary-retrieval hands
+                // the original bytes back out rather than the variable's name.
+                if (isBinary) {
+                    CString vn = data; vn.Trim();
+                    BinVarEntry* srcbv = FindBinVar(vn);
+                    CString packed;
+                    if (srcbv) for (BYTE b : srcbv->data) packed += (wchar_t)b;
+                    data = packed;
                 }
                 bool found = false;
                 for (auto& kv : t->items) if (kv.first.CompareNoCase(item) == 0) { kv.second = data; found = true; break; }
@@ -12889,6 +13413,84 @@ class CMainFrame : public CMDIFrameWnd {
                 }
             }
             if (showMsg) Show(w, L"* Loaded hash table '" + tname + L"' from '" + fname + L"'", cInfo);
+        }
+        else if (cmd == L"bset") {   // /bset [-t][-c] <&binvar> <N> <value1 value2 ...>|<text> -- without -t, each remaining token is a decimal byte value (0-255) written sequentially starting at position N (1-based); with -t, everything after N is literal text, written one byte per character; -c clears the binvar first; N=-1 appends at the current end instead of writing at a fixed position
+            CString a = arg; bool asText = false, clearFirst = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L't') >= 0) asText = true; if (sw.Find(L'c') >= 0) clearFirst = true; }
+            CString vname = Word(a); CString nStr = Word(a); CString rest = a;
+            double nD;
+            if (vname.IsEmpty() || vname.Left(1) != L"&" || nStr.IsEmpty() || !ParseNum(nStr, nD)) { Show(w, L"* /bset: insufficient parameters", cPart); return; }
+            int N = (int)nD;
+            BinVarEntry* bv = GetOrMakeBinVar(vname);
+            if (clearFirst) bv->data.clear();
+            std::vector<BYTE> bytes;
+            if (asText) { for (int ci = 0; ci < rest.GetLength(); ci++) bytes.push_back((BYTE)(rest[ci] & 0xFF)); }
+            else { CString r = rest; while (!r.IsEmpty()) { CString tok = Word(r); if (tok.IsEmpty()) break; double vD; if (ParseNum(tok, vD)) bytes.push_back((BYTE)(((int)vD) & 0xFF)); } }
+            size_t startIdx = (N < 0) ? bv->data.size() : (size_t)((N >= 1) ? (N - 1) : 0);
+            if (startIdx + bytes.size() > bv->data.size()) bv->data.resize(startIdx + bytes.size(), 0);
+            for (size_t i = 0; i < bytes.size(); i++) bv->data[startIdx + i] = bytes[i];
+        }
+        else if (cmd == L"bwrite") {   // /bwrite [-c] <file> <N> [<M>] <&binvar> -- writes M bytes (or all of the binvar, if M is omitted or -1) starting from the binvar's first byte, into <file> at byte position N (0-based). -c is accepted; this client always creates/truncates the target file fresh either way, which matches every call site actually seen (writing a brand-new file, or explicitly passing -c to overwrite one)
+            CString a = arg;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) Word(a);   // -c (or any other switch) -- consumed, no behavioral distinction needed (see comment above)
+            CString fname; a.TrimLeft();
+            if (a.Left(1) == L"\"") { int endq = a.Find(L'"', 1); if (endq > 0) { fname = a.Mid(1, endq - 1); a = a.Mid(endq + 1); a.TrimLeft(); } else fname = Word(a); }
+            else fname = Word(a);
+            CString nStr = Word(a);
+            CString rest = a; rest.Trim();
+            CString tok1 = Word(rest); CString tok2 = rest; tok2.Trim();
+            CString varName; int M = -1;
+            if (!tok2.IsEmpty() && tok2.Left(1) == L"&") { double mD; if (ParseNum(tok1, mD)) M = (int)mD; varName = tok2; }
+            else { varName = tok1; M = -1; }
+            double nD;
+            if (fname.IsEmpty() || !ParseNum(nStr, nD) || varName.IsEmpty() || varName.Left(1) != L"&") { Show(w, L"* /bwrite: insufficient parameters", cPart); return; }
+            int N = (int)nD;
+            BinVarEntry* bv = FindBinVar(varName);
+            static const std::vector<BYTE> kEmptyBytes;
+            const std::vector<BYTE>& src = bv ? bv->data : kEmptyBytes;
+            size_t count = (M < 0) ? src.size() : (size_t)M;
+            if (count > src.size()) count = src.size();
+            try {
+                CFile f;
+                if (!f.Open(fname, CFile::modeCreate | CFile::modeWrite | CFile::shareDenyNone)) { m_lastFileErr = true; Show(w, L"* /bwrite: unable to open '" + fname + L"'", cPart); return; }
+                f.Seek(N, CFile::begin);
+                if (count > 0) f.Write(src.data(), (UINT)count);
+                f.Close();
+            } catch (CFileException* fe) { fe->Delete(); m_lastFileErr = true; Show(w, L"* /bwrite: write error on '" + fname + L"'", cPart); }
+        }
+        else if (cmd == L"bread") {   // /bread <file> <N> <M> <&binvar> -- reads M bytes from file position N (0-based) into &binvar, replacing its content entirely; M=-1 reads to the end of the file
+            CString a = arg;
+            CString fname; a.TrimLeft();
+            if (a.Left(1) == L"\"") { int endq = a.Find(L'"', 1); if (endq > 0) { fname = a.Mid(1, endq - 1); a = a.Mid(endq + 1); a.TrimLeft(); } else fname = Word(a); }
+            else fname = Word(a);
+            CString nStr = Word(a); CString mStr = Word(a); CString varName = a; varName.Trim();
+            double nD, mD;
+            if (fname.IsEmpty() || !ParseNum(nStr, nD) || !ParseNum(mStr, mD) || varName.IsEmpty() || varName.Left(1) != L"&") { Show(w, L"* /bread: insufficient parameters", cPart); return; }
+            int N = (int)nD; int M = (int)mD;
+            BinVarEntry* bv = GetOrMakeBinVar(varName);
+            try {
+                CFile f;
+                if (!f.Open(fname, CFile::modeRead | CFile::shareDenyNone)) { m_lastFileErr = true; Show(w, L"* /bread: unable to open '" + fname + L"'", cPart); return; }
+                f.Seek(N, CFile::begin);
+                if (M < 0) { ULONGLONG len = f.GetLength(); M = (int)((len > (ULONGLONG)N) ? (len - (ULONGLONG)N) : 0); }
+                bv->data.assign((size_t)(M > 0 ? M : 0), 0);
+                if (M > 0) { UINT got = f.Read(bv->data.data(), (UINT)M); bv->data.resize(got); }
+                f.Close();
+            } catch (CFileException* fe) { fe->Delete(); m_lastFileErr = true; Show(w, L"* /bread: read error on '" + fname + L"'", cPart); }
+        }
+        else if (cmd == L"bunset") {   // /bunset <&var> [&var2 ...] -- each name may be a wildcard
+            CString a = arg;
+            while (!a.IsEmpty()) {
+                CString vn = Word(a); if (vn.IsEmpty()) break;
+                m_binVars.erase(std::remove_if(m_binVars.begin(), m_binVars.end(), [&](const BinVarEntry& b) { return GlobMatch(vn, b.name) != FALSE; }), m_binVars.end());
+            }
+        }
+        else if (cmd == L"btrunc") {   // /btrunc <&var> <N> -- truncates (or zero-extends) the binvar to exactly N bytes
+            CString a = arg; CString vn = Word(a); CString nStr = a; nStr.Trim(); double nD;
+            if (vn.IsEmpty() || vn.Left(1) != L"&" || !ParseNum(nStr, nD)) { Show(w, L"* /btrunc: insufficient parameters", cPart); return; }
+            BinVarEntry* bv = GetOrMakeBinVar(vn);
+            int newLen = (int)nD; if (newLen < 0) newLen = 0;
+            bv->data.resize((size_t)newLen, 0);
         }
         else if (cmd == L"fopen") {   // /fopen [-nox] <handle> <filename> -- -x (exclusive access) is accepted but not distinguished from the default (this app always opens shared read/write already)
             CString a = arg; bool createNew = false, overwrite = false;
@@ -16568,7 +17170,16 @@ class CMainFrame : public CMDIFrameWnd {
             // but wrong here: an explicit size was just given, and MoveWindow on a still-maximized window is
             // largely ignored by Windows until it's restored, which is what left @Tetris stuck full-screen with
             // its 360x454 canvas rendering in the corner instead of the window actually being that size.
-            if ((pw >= 0 || ph >= 0) && cw->IsZoomed()) cw->ShowWindow(SW_RESTORE);
+            // Un-maximizing an MDI CHILD can't go through the plain CWnd::ShowWindow(SW_RESTORE) -- that bypasses
+            // the MDI client's own bookkeeping of which child is maximized and what its restored rect should be
+            // (the same MDIRestore() wrapper Activate() already uses for exactly this reason), so the window LOOKS
+            // like it un-maximized but the MDI client still treats it as maximized for layout purposes: the very
+            // next GetWindowRect/MoveWindow pair below either reads back the still-maximized rect or gets silently
+            // overridden once the MDI client re-lays-out its children, leaving the window stuck full-screen with
+            // only whatever was drawn in the first few hundred pixels actually visible -- exactly Pixel Editor's
+            // "huge mostly-black window, color palette stuck in the corner" symptom, one call short of Tetris's
+            // own already-fixed version of this same bug.
+            if ((pw >= 0 || ph >= 0) && cw->IsZoomed()) MDIRestore(cw);
             CRect cur; cw->GetWindowRect(cur); ::MapWindowPoints(nullptr, m_hWndMDIClient, (LPPOINT)&cur, 2);
             CRect curClient; cw->GetClientRect(curClient);   // current chrome thickness (title bar + borders) -- constant for this window's style regardless of its current size, used below to convert the CLIENT size a script asks for into the OUTER size MoveWindow actually wants
             int chromeW = cur.Width() - curClient.Width(), chromeH = cur.Height() - curClient.Height();
@@ -16686,6 +17297,16 @@ class CMainFrame : public CMDIFrameWnd {
             }
             if (!swN) cw->RepaintCanvas();
         }
+        else if (cmd == L"drawsize") {   // /drawsize <win> <width> <height>: exact resize (unlike the draw* commands' own grow-only auto-expand) -- was previously unimplemented, so "draw*"'s prefix match in ExecCmd routed it into this function but no branch here ever matched "drawsize", silently swallowing it (never falling through to the raw-server catch-all, so no "unknown command" error either) -- any script explicitly sizing a canvas before drawing into it (PixelEditor.mrc's "drawsize @pe.mirror %pe.width %pe.height" on every new/resize) was a total no-op
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawsize: no such window: " + name, cPart); return; }
+            cw->ShowCanvas();
+            std::vector<CString> tok = PlayTokenize(a);
+            if (tok.size() < 2) return;
+            int nw = (std::max)(1, _wtoi(tok[0])), nh = (std::max)(1, _wtoi(tok[1]));
+            cw->SetCanvasSize(nw, nh);
+            if (!swN) cw->RepaintCanvas();
+        }
         else if (cmd == L"drawrect") {
             CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
             if (!cw) { Show(w, L"* /drawrect: no such window: " + name, cPart); return; }
@@ -16698,6 +17319,9 @@ class CMainFrame : public CMDIFrameWnd {
             int maxX = 0, maxY = 0;
             for (size_t k = i; k + 3 < tok.size(); k += 4) { maxX = (std::max)(maxX, _wtoi(tok[k]) + _wtoi(tok[k + 2])); maxY = (std::max)(maxY, _wtoi(tok[k + 1]) + _wtoi(tok[k + 3])); }
             cw->GrowCanvasFor(maxX + size + 1, maxY + size + 1);
+            #if DEBUGGING
+            { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* /drawrect: win=%s sw=[%s] swF=%d col=%06lX size=%d tokCount=%d a=[%s]", (LPCWSTR)name, (LPCWSTR)sw, swF ? 1 : 0, col, size, (int)tok.size(), (LPCWSTR)a); Show(dw, diag, cPart); }
+            #endif
             CDC* dc = cw->CanvasDC();
             if (dc) {
                 CPen pen(PS_SOLID, size, col); CPen* oldP = dc->SelectObject(&pen);
@@ -16720,6 +17344,9 @@ class CMainFrame : public CMDIFrameWnd {
             if (!cw) { Show(w, L"* /drawfill: no such window: " + name, cPart); return; }
             cw->ShowCanvas();
             std::vector<CString> tok = PlayTokenize(a);
+#if DEBUGGING
+            { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* /drawfill: win=%s sw=[%s] tokCount=%d a=[%s]", (LPCWSTR)name, (LPCWSTR)sw, (int)tok.size(), (LPCWSTR)a); Show(dw, diag, cPart); }
+#endif
             if (tok.size() < 4) return;
             COLORREF fillCol = DrawColorFromTok(tok[0], swR), edgeCol = DrawColorFromTok(tok[1], swR);
             CDC* dc = cw->CanvasDC();
@@ -16727,11 +17354,18 @@ class CMainFrame : public CMDIFrameWnd {
                 CBrush br(fillCol); CBrush* old = dc->SelectObject(&br);
                 size_t i = 2;
                 while (i + 1 < tok.size() && IsNumTok(tok[i]) && IsNumTok(tok[i + 1])) {
-                    dc->ExtFloodFill(_wtoi(tok[i]), _wtoi(tok[i + 1]), edgeCol, swS ? FLOODFILLSURFACE : FLOODFILLBORDER);
+                    int fx = _wtoi(tok[i]), fy = _wtoi(tok[i + 1]);
+                    BOOL fr = dc->ExtFloodFill(fx, fy, edgeCol, swS ? FLOODFILLSURFACE : FLOODFILLBORDER);
+#if DEBUGGING
+                    { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); CString diag; diag.Format(L"* /drawfill: ExtFloodFill(%d,%d, edge=%06lX, mode=%s) fillCol=%06lX -> %d (err=%lu)", fx, fy, edgeCol, swS ? L"SURFACE" : L"BORDER", fillCol, fr, fr ? 0 : ::GetLastError()); Show(dw, diag, cPart); }
+#endif
                     i += 2;
                 }
                 dc->SelectObject(old);
             }
+#if DEBUGGING
+            else { CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w); Show(dw, L"* /drawfill: CanvasDC() was null", cPart); }
+#endif
             if (!swN) cw->RepaintCanvas();
         }
         else if (cmd == L"drawtext") {
@@ -16818,7 +17452,17 @@ class CMainFrame : public CMDIFrameWnd {
             CString srcName = RunWord(a); CChatWnd* srcCw = FindDrawWin(srcName);
             if (!srcCw) { Show(w, L"* /drawcopy: no such window: " + srcName, cPart); return; }
             CString rest = a; rest.TrimLeft();
-            if (swT) Word(rest);
+            bool useKey = false; COLORREF keyCol = 0;
+            // The -t key colour is always a raw packed RGB value here, never a mirc palette index -- unlike
+            // drawrect/drawline/drawdot/drawfill (where 'r' in the switch string toggles raw-vs-index for their
+            // pen colour, and PixelEditor.mrc deliberately includes/omits it per call), drawcopy has no such
+            // switch of its own; 'r' only ever ends up in `sw` here by coincidence from an unrelated drawXXX call
+            // reusing this shared parser. Using swR (false for every "-nt"/"-n" call this script makes) wrongly
+            // routed the key through MircColor()'s index lookup, wrapping the large packed value down to a
+            // essentially-random low palette colour that could never actually match a real copied pixel -- so
+            // every "copy this overlay in, skipping the transparent colour" silently copied everything, including
+            // the overlay's blank/transparent background, as solid opaque pixels.
+            if (swT) { CString keyTok = Word(rest); keyCol = DrawColorFromTok(keyTok, true); useKey = true; }
             int sx = _wtoi(Word(rest)), sy = _wtoi(Word(rest)), srcW = _wtoi(Word(rest)), srcH = _wtoi(Word(rest));
             CString dstName = RunWord(rest); CChatWnd* dstCw = FindDrawWin(dstName);
             if (!dstCw) { Show(w, L"* /drawcopy: no such window: " + dstName, cPart); return; }
@@ -16831,9 +17475,54 @@ class CMainFrame : public CMDIFrameWnd {
             dstCw->GrowCanvasFor(dx + (dw > 0 ? dw : srcW), dy + (dh > 0 ? dh : srcH));
             CDC* sdc = srcCw->CanvasDC(); CDC* ddc = dstCw->CanvasDC();
             if (!sdc || !ddc) return;
-            if (dw > 0 && (dw != srcW || dh != srcH)) { ddc->SetStretchBltMode(HALFTONE); ddc->SetBrushOrg(0, 0); ddc->StretchBlt(dx, dy, dw, dh, sdc, sx, sy, srcW, srcH, SRCCOPY); }
+            if (useKey) {
+                // Plain BitBlt/StretchBlt (the else branch below) has no notion of a transparent colour key at
+                // all, so every "-t" copy was painting the key colour as solid opaque pixels instead of leaving
+                // the destination untouched there. PixelEditor's line/rectangle/ellipse/select tool previews all
+                // depend on exactly this: they clear a small overlay window to %pe.transparent, draw the live
+                // preview shape on top of that, then "drawcopy -nt" it onto the real picture so only the shape's
+                // own pixels land -- without real key-skipping, that overlay's blank background (the key colour
+                // itself, a packed deep blue in this script) flooded over the whole picture on every mouse move.
+                int outW = (dw > 0) ? dw : srcW, outH = (dh > 0) ? dh : srcH;
+                for (int oy = 0; oy < outH; oy++) {
+                    int syy = sy + (srcH == outH ? oy : (oy * srcH) / outH);
+                    for (int ox = 0; ox < outW; ox++) {
+                        int sxx = sx + (srcW == outW ? ox : (ox * srcW) / outW);
+                        COLORREF c = sdc->GetPixel(sxx, syy);
+                        if (c == keyCol) continue;
+                        ddc->SetPixel(dx + ox, dy + oy, c);
+                    }
+                }
+            }
+            else if (dw > 0 && (dw != srcW || dh != srcH)) { ddc->SetStretchBltMode(HALFTONE); ddc->SetBrushOrg(0, 0); ddc->StretchBlt(dx, dy, dw, dh, sdc, sx, sy, srcW, srcH, SRCCOPY); }
             else ddc->BitBlt(dx, dy, srcW, srcH, sdc, sx, sy, SRCCOPY);
             if (!swN) dstCw->RepaintCanvas();
+        }
+        else if (cmd == L"drawrot") {   // /drawrot [-n] <window> <angle> <x1> <y1> <x2> <y2> -- rotates the pixel rectangle (x1,y1)-(x2,y2) in place, clockwise for a positive angle. Was entirely unimplemented (an unrecognized command this dispatcher silently did nothing for), which is why PixelEditor.mrc's Ctrl+R / Edit > Rotate always left the picture un-rotated despite %pixed.width/%pixed.height getting swapped right afterward on the assumption it had worked -- the visible "blanks out, then comes back" is drawsize resizing the canvas to a bigger square working buffer (genuinely blank there) immediately before the no-op drawrot, followed by the normal repaint restoring the still-unrotated original content. Only exact multiples of 90 degrees are supported (all PixelEditor ever asks for -- 90/180/-90, via its rotate-right/180/rotate-left menu items and Ctrl+R); any other angle is left as a silent no-op rather than attempting a non-axis-aligned rotation this simple GetPixel/SetPixel approach can't represent.
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawrot: no such window: " + name, cPart); return; }
+            CString rest = a; rest.TrimLeft();
+            int angle = _wtoi(Word(rest));
+            int x1 = _wtoi(Word(rest)), y1 = _wtoi(Word(rest)), x2 = _wtoi(Word(rest)), y2 = _wtoi(Word(rest));
+            int rw = x2 - x1 + 1, rh = y2 - y1 + 1;
+            if (rw <= 0 || rh <= 0) return;
+            int a360 = ((angle % 360) + 360) % 360;
+            if (a360 != 90 && a360 != 180 && a360 != 270) return;   // not a multiple of 90 -- unsupported, no-op
+            cw->GrowCanvasFor(x1 + (std::max)(rw, rh), y1 + (std::max)(rw, rh));   // 90/270 swap the footprint to rh x rw within the same (x1,y1) origin -- make sure both orientations fit
+            CDC* dc = cw->CanvasDC();
+            if (!dc) return;
+            std::vector<COLORREF> buf((size_t)rw * rh);
+            for (int oy = 0; oy < rh; oy++) for (int ox = 0; ox < rw; ox++) buf[(size_t)oy * rw + ox] = dc->GetPixel(x1 + ox, y1 + oy);   // read the whole source rect first -- the destination positions overlap the source rect (180 stays exactly within it; 90/270 partially do when rw != rh), so writing pixel-by-pixel in place while still reading would corrupt later reads
+            for (int oy = 0; oy < rh; oy++) {
+                for (int ox = 0; ox < rw; ox++) {
+                    int nx, ny;
+                    if (a360 == 90) { nx = rh - 1 - oy; ny = ox; }            // clockwise: top-left corner -> top-right
+                    else if (a360 == 270) { nx = oy; ny = rw - 1 - ox; }      // counter-clockwise: top-left corner -> bottom-left
+                    else { nx = rw - 1 - ox; ny = rh - 1 - oy; }              // 180: top-left corner -> bottom-right
+                    dc->SetPixel(x1 + nx, y1 + ny, buf[(size_t)oy * rw + ox]);
+                }
+            }
+            if (!swN) cw->RepaintCanvas();
         }
         else if (cmd == L"drawsave") {
             CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
@@ -16855,7 +17544,12 @@ class CMainFrame : public CMDIFrameWnd {
             if (existsOnDisk) { WIN32_FILE_ATTRIBUTE_DATA fad; if (::GetFileAttributesExW(filename, GetFileExInfoStandard, &fad)) sizeOnDisk = ((__int64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow; }
             CString diag; diag.Format(L"* /drawsave: %s -> %s [Save()=%d, ok=%d, existsOnDisk=%d, size=%lld]",
                 (LPCWSTR)name, (LPCWSTR)filename, st, ok ? 1 : 0, existsOnDisk ? 1 : 0, sizeOnDisk);
-            Show(w, diag, cPart);
+            // Sent to the status window, not w -- w here is whatever window /drawsave was called from (@Pixel for
+            // PixelEditor.mrc's own export), which is a canvas+toolbar custom window with no visible text area, so
+            // this was never actually going to be seen there regardless of what it said. See $sfile's own identical
+            // fix/comment above for the full story.
+            CChatWnd* dw = (w && w->net) ? Status(w->net) : (!m_nets.empty() ? Status(m_nets.front().get()) : w);
+            Show(dw, diag, cPart);
 #else
             if (!ok) Show(w, L"* /drawsave: couldn't save " + filename, cPart);
 #endif
@@ -16874,10 +17568,10 @@ class CMainFrame : public CMDIFrameWnd {
     // op: 'a' append, 'c' recolor, 'd' delete, 'i' insert, 'r' replace, 's' select
     void CmdCwLine(CChatWnd* w, CString arg, wchar_t op) {
         CString a = arg; a.TrimLeft();
-        bool selAdd = false, selClear = false; int colorNum = -1;
-        while (a.Left(1) == L"-") {   // -s/-a (selection mode), -h, -p, -r, -i[N], -n, -m, -l: accepted, only -s/-a/-i are meaningfully used here
+        bool selAdd = false, selClear = false; bool fromLast = false; int colorNum = -1;
+        while (a.Left(1) == L"-") {   // -s/-a (selection mode), -h, -p, -r, -i[N], -n, -m: accepted but not meaningfully used here; -l IS meaningful -- see fromLast below
             CString swTok = Word(a);
-            for (int i = 1; i < swTok.GetLength(); i++) { wchar_t c = swTok[i]; if (c == L's') selClear = true; else if (c == L'a') selAdd = true; }
+            for (int i = 1; i < swTok.GetLength(); i++) { wchar_t c = swTok[i]; if (c == L's') selClear = true; else if (c == L'a') selAdd = true; else if (c == L'l') fromLast = true; }
             a.TrimLeft();
         }
         CString first = a; CString maybeColor = Word(first);
@@ -16895,7 +17589,40 @@ class CMainFrame : public CMDIFrameWnd {
         int n1 = 0, n2 = 0; CString rest = a; CString nTok = Word(rest);
         int dash = nTok.Find(L'-');
         if (dash > 0) { n1 = _wtoi(nTok.Left(dash)); n2 = _wtoi(nTok.Mid(dash + 1)); } else { n1 = n2 = _wtoi(nTok); }
-        if (n1 < 1 || n1 > (int)cw->m_cwLines.size()) { Show(w, L"* No such line.", cPart); return; }
+        // -l: N counts from the LAST line instead of the first -- e.g. "/dline -l @win 1" deletes the last line,
+        // "/iline -l @win 1 text" inserts a new LAST line (appends), mirroring plain (non -l) N=1 meaning "the first
+        // line"/"insert as the new first line". For an existing-line op (c/d/r/s), converting bottom-relative Nb to
+        // the usual top-relative N is N = size-Nb+1 (Nb=1 -> the current last line). For insert specifically it's
+        // N = size-Nb+2 (Nb=1 -> size+1, i.e. append after the current last line, same special-cased append slot
+        // the non -l insert-into-empty-window fix below already allows) -- insert has no existing line at the
+        // target position to measure from the way a delete/read does, so it's one further than the delete formula;
+        // using the delete formula for insert too would place the new line BEFORE the current last line (making it
+        // second-to-last) instead of appending it, which breaks LIFO push/pop pairing with a same-N "-l" delete.
+        // This is exactly the switch PixelEditor.mrc's pe.undo/pe.redo rely on to keep a combined undo+redo deque in
+        // a single @pe.undo window -- undo entries pushed/popped at the top (plain iline/dline @win 1), redo entries
+        // pushed/popped at the bottom (iline/dline -l @win 1). With -l silently ignored (treated as plain top-
+        // relative N=1 either way), an undo's redo-entry push landed back at the TOP instead of the bottom, where
+        // the very next line (a plain, non -l "dline @win 1") immediately deleted it again instead of the original
+        // remaining stack entry -- so the undo stack never actually shrank past its first pop, which is why only one
+        // block could ever be undone no matter how many times Ctrl+Z was pressed afterward.
+        if (fromLast) {
+            int S = (int)cw->m_cwLines.size();
+            if (op == L'i') { n1 = S - n1 + 2; }
+            else { int o1 = n1, o2 = n2; n1 = S - o2 + 1; n2 = S - o1 + 1; }
+        }
+        // /iline's N is "insert BEFORE this line", so N == size()+1 is a valid "insert at end" (same as /aline) and
+        // must be allowed even when the window has zero lines so far (N=1 into an empty window) -- every other op
+        // (c/d/r/s) addresses an EXISTING line, so N must stay within the current size for those. Before this, N
+        // was checked against size() for every op including 'i', so /iline @win 1 ... into an empty window always
+        // failed with "No such line." and never actually inserted anything -- which silently broke any script that
+        // builds a list by repeatedly /iline-ing at position 1 starting from empty, such as PixelEditor.mrc's
+        // pe.undo/pe.redo stack (@pe.undo starts out empty every time /pe opens): the very first undo-stack push
+        // always failed, leaving @pe.undo permanently empty forever after (each later push also computed N=1
+        // against a list that, because of this bug, could never grow past zero), so $line(@pe.undo,1) was always
+        // empty and Ctrl+Z's "if (...) && ($line(@pe.undo,1))" guard never once passed -- undo appeared to simply
+        // do nothing, no matter how many pixels had been drawn.
+        int maxN1 = (op == L'i') ? (int)cw->m_cwLines.size() + 1 : (int)cw->m_cwLines.size();
+        if (n1 < 1 || n1 > maxN1) { Show(w, L"* No such line.", cPart); return; }
         if (op == L'c') { if ((size_t)n1 > cw->m_cwColors.size()) cw->m_cwColors.resize(n1, cText); cw->m_cwColors[n1 - 1] = col; cw->CwRebuild(); }
         else if (op == L'd') {
             n2 = (std::min)(n2 < n1 ? n1 : n2, (int)cw->m_cwLines.size());
