@@ -6,7 +6,7 @@ menu menubar {
   .new map: { mariolikegame -f  }
   .-
   .lots of anim: { mariolikegame -f lotsofanim.obj }
-  .fucking huge map (but empty): { mariolikegame -f fhugemap.obj }
+  .fucking huge map: (but empty) { mariolikegame -f fhugemap.obj }
   .test big map: { mariolikegame -f testbigmap.obj }
 
 
@@ -813,7 +813,24 @@ alias -l msg_Kill {
 ; desc: 
 alias -l buffer_Redraw {
 
+  ; BUGFIX: "obj_clear ab" wipes every "ab" object's own definition (@ab.* keys in edig), but each animated
+  ; tile's OWN .animid tracking key (%map.id<x>.<y>.animid -- a totally separate key namespace, one per map
+  ; position rather than per object) is a completely different set of keys and is NOT touched by it. Without
+  ; clearing those too, buffer_RedrawTile's reuse-guard (see its own comment: "if there's already a non-empty
+  ; .animid here, assume an ab object already exists and skip creating a new one") sees every single one of
+  ; those now-stale, non-empty .animid values left over from the objects this call just deleted, and refuses to
+  ; recreate ANY of them -- so every previously-animated tile in the redrawn region goes permanently blank
+  ; (abcount visibly drops to 0 and never recovers except for brand-new tiles placed afterward, which have no
+  ; .animid yet). This is exactly the same class of bug engine_LoadMap already had and was fixed for (a saved
+  ; map's .animid pointing at ids from a session that no longer has them) -- buffer_Redraw needed the identical
+  ; fix, since it runs on every "G" editor toggle and every cam_MoveTo/cam_MoveToPlayer (teleport), not just a
+  ; file load.
   obj_clear ab
+  var %k = $hfind(edig,*.animid,1,w)
+  while (%k) {
+    hdel edig %k
+    var %k = $hfind(edig,*.animid,1,w)
+  }
 
   var %x = $calc(%buffer.x / %tile.w)
   var %w = $calc(%x + %win.xtile + 2)
@@ -1020,8 +1037,7 @@ alias -l engine_renderAllAnimBlocks {
       obj_ForEach ab engine_renderAnimBlocks %n1 %n2
     }
     else {
-
-      obj_ForEach ab engine_renderAnimBlocks 
+      obj_ForEach ab engine_renderAnimBlocks
     }
   }
 }
@@ -1057,27 +1073,37 @@ alias -l engine_RenderExplosions {
 ; desc: 
 alias -l engine_RenderAnimBlocks {
 
-  var %x = $obj_get(ab,$1).x
-  var %y = $obj_get(ab,$1).y
+  ; Loops over every id obj_ForEach hands this call (see obj_ForEach's own comment) instead of only ever
+  ; drawing $1 -- confirmed via log evidence that this now actually receives multi-id calls correctly
+  ; (e.g. "got 6 ids in ONE call -- ids=[ 7 8 9 10 11 12 ]") and draws all of them, not just the first.
+  var %i = 1
+  while (%i <= $0) {
+    var %id = $gettok($1-,%i,32)
 
-  ; TEMPORARY fix: a safety net at the actual draw call, on top of the upstream map_setTile/anim-init fixes --
-  ; if THIS frame's .imgcache<af> ever still comes up empty (any other data gap, now or in the future: a tile
-  ; whose .anim object itself was never fully authored, a map saved before one of those fixes existed, etc.),
-  ; fall back to .imgcache0 (the tile's base/static image) instead of handing drawcopy an empty value, which
-  ; silently shifted its sx/sy/srcW/srcH/window arguments and produced either the "no such window: 32" error
-  ; or, worse, a visually wrong/"random, flashing" source rectangle when the shift happened to still resolve to
-  ; a real window. If even .imgcache0 is missing there's genuinely nothing to draw for this tile, so skip the
-  ; drawcopy call entirely rather than feeding it garbage.
-  var %imgcache = $hget(edig,$+(%map.id,%x,.,%y,.imgcache,%game.af))
-  if (!%imgcache) %imgcache = $hget(edig,$+(%map.id,%x,.,%y,.imgcache0))
-  if (!%imgcache) return
+    var %x = $obj_get(ab,%id).x
+    var %y = $obj_get(ab,%id).y
 
-  drawcopy -tn @edt 16711935 %imgcache @edb0 $calc((%x - %buffer.x / %tile.w) * %tile.w) $calc((%y - %buffer.y / %tile.h) * %tile.h) %tile.w %tile.h
+    ; TEMPORARY fix: a safety net at the actual draw call, on top of the upstream map_setTile/anim-init fixes --
+    ; if THIS frame's .imgcache<af> ever still comes up empty (any other data gap, now or in the future: a tile
+    ; whose .anim object itself was never fully authored, a map saved before one of those fixes existed, etc.),
+    ; fall back to .imgcache0 (the tile's base/static image) instead of handing drawcopy an empty value, which
+    ; silently shifted its sx/sy/srcW/srcH/window arguments and produced either the "no such window: 32" error
+    ; or, worse, a visually wrong/"random, flashing" source rectangle when the shift happened to still resolve to
+    ; a real window. If even .imgcache0 is missing there's genuinely nothing to draw for this tile, so skip the
+    ; drawcopy call entirely rather than feeding it garbage.
+    var %imgcache = $hget(edig,$+(%map.id,%x,.,%y,.imgcache,%game.af))
+    if (!%imgcache) %imgcache = $hget(edig,$+(%map.id,%x,.,%y,.imgcache0))
+
+    if (%imgcache) {
+      drawcopy -tn @edt 16711935 %imgcache @edb0 $calc((%x - %buffer.x / %tile.w) * %tile.w) $calc((%y - %buffer.y / %tile.h) * %tile.h) %tile.w %tile.h
+    }
+
+    inc %i
+  }
 }
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-; param: 
-; desc: 
+; param:
+; desc:
 alias -l engine_RenderBombs {
 
   var %id = $obj_ReadFirst(bomb)
@@ -2249,14 +2275,29 @@ menu @edc {
           var %tx = $int($calc((%edit.selx + %tile.w / 2) / %tile.w))
           var %ty = $int($calc((%edit.sely + %tile.h / 2) / %tile.h))
 
-          if (%edit.lastkey != $+(%tx,.,%ty,.,%edit.selm)) {
-            map_SetTile %tx %ty %edit.selm
-            %edit.lastkey = $+(%tx,.,%ty,.,%edit.selm)
+          ; BUGFIX: this used to compare against %edit.lastkey (last tx/ty/tile placed) and, if different, place
+          ; ONLY the new single cell -- but a "mouse" event fires once per WM_MOUSEMOVE, and a fast drag easily
+          ; jumps several tiles between two consecutive messages (Windows coalesces mouse-move messages under
+          ; load, and nothing here was filling in what got skipped). That's what was producing a scattered trail
+          ; of isolated tiles with gaps instead of a solid line -- not random, just every skipped cell along the
+          ; path never getting a map_SetTile call at all. If this isn't the very first cell of the stroke (i.e.
+          ; %edit.lastx/%edit.lasty are set from a previous point in THIS drag), fill the whole straight segment
+          ; from there to here instead of just the new endpoint.
+          if ((%edit.lastx != $null) && ((%edit.lastx != %tx) || (%edit.lasty != %ty))) {
+            editor_lineTo %edit.lastx %edit.lasty %tx %ty %edit.selm
           }
+          elseif (%edit.lastkey != $+(%tx,.,%ty,.,%edit.selm)) {
+            map_SetTile %tx %ty %edit.selm
+          }
+          %edit.lastkey = $+(%tx,.,%ty,.,%edit.selm)
+          %edit.lastx = %tx
+          %edit.lasty = %ty
         }
       }
       else {
         %game.mousedown = 0
+        unset %edit.lastx
+        unset %edit.lasty
       }
     }
   }
@@ -2284,8 +2325,34 @@ menu @edc {
           map_SetTile %tx %ty %edit.selm
           %edit.lastkey = $+(%tx,.,%ty,.,%edit.selm)
         }
+        %edit.lastx = %tx
+        %edit.lasty = %ty
       }
     }
+  }
+}
+
+; param: x1 y1 x2 y2 tileid
+; desc: places tileid at every integer tile position along the straight line from (x1,y1) to (x2,y2), inclusive
+; of both ends -- standard Bresenham stepping. Used by the map editor's drag-to-paint (see the "mouse" handler's
+; own comment) so a fast drag that skips several tiles between two consecutive mouse-move events still fills a
+; solid line instead of leaving gaps.
+alias -l editor_lineTo {
+
+  var %x1 = $1, %y1 = $2, %x2 = $3, %y2 = $4, %t = $5
+  var %dx = $abs($calc(%x2 - %x1)), %dy = $abs($calc(%y2 - %y1))
+  var %sx = $iif(%x1 < %x2,1,-1), %sy = $iif(%y1 < %y2,1,-1)
+  var %err = $calc(%dx - %dy)
+  var %cx = %x1, %cy = %y1
+  var %guard = 0
+  while (1) {
+    map_SetTile %cx %cy %t
+    if ((%cx == %x2) && (%cy == %y2)) break
+    var %e2 = $calc(2 * %err)
+    if (%e2 > $calc(0 - %dy)) { dec %err %dy | inc %cx %sx }
+    if (%e2 < %dx) { inc %err %dx | inc %cy %sy }
+    inc %guard
+    if (%guard > 2000) break
   }
 }
 
@@ -2785,7 +2852,18 @@ alias -l obj_ForEach {
     tokenize 32 $hget(edig,$+(@,$1,.e))
   }
 
-  %cmd $*
+  ; BUGFIX: this used to end with "%cmd $*" -- textually equivalent to "%cmd $1-" per how $* is documented/
+  ; implemented, but logging proved the two are NOT equivalent in practice here: obj_ForEach's OWN debug read of
+  ; $0/$1- (captured into a plain %var first, see below) consistently showed the full, correct multi-id list
+  ; right after /tokenize (e.g. $0=6, $1-="7 8 9 10 11 12"), but the callee (engine_RenderAnimBlocks) receiving
+  ; "%cmd $*" directly never once saw more than a single id ($0 was always 0 or 1, never >1, across an entire
+  ; captured session covering hundreds of calls) -- something about evaluating "$*" as the LAST token of a
+  ; dynamically-named command line collapses it, even though the exact same underlying $1-/$0 read correctly one
+  ; statement earlier via a plain /echo. Capturing the value into an ordinary %variable FIRST, then passing that
+  ; %variable instead of $* itself, sidesteps whatever that is -- %variables are already proven reliable as
+  ; multi-token argument carriers everywhere else in this whole script.
+  var %args = $1-
+  %cmd %args
 }
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3061,27 +3139,55 @@ alias -l engine_clearOffScreenAnimBlocks {
 ; param: 
 alias -l engine_ClearOffScreenAnimBlocksInt {
 
-  var %id = $1
-  var %tx = $obj_get(ab,%id).x
-  var %ty = $obj_get(ab,%id).y
-  var %x = %tx * %tile.w
-  var %y = %ty * %tile.h
+  ; BUGFIX: obj_ForEach hands this ALL matching "ab" ids space-joined as $1 $2 $3 ... in one call (see
+  ; obj_ForEach's own comment on why it now captures that into a %var before dispatching) -- this used to
+  ; read only $1, so out of however many "ab" objects scrolled off-screen in a given tick, at most one ever
+  ; actually got culled (and its .animid cleared) per call. Looping over every id this call received, exactly
+  ; like engine_RenderAnimBlocks now does, culls all of them. Deleting mid-loop is safe here because the id
+  ; list being iterated is the one /tokenize already captured before this alias ever ran -- obj_delete's own
+  ; edit to @ab.e doesn't retroactively change what $1- holds in THIS call.
+  var %i = 1
+  while (%i <= $0) {
+    var %id = $gettok($1-,%i,32)
 
-  if (!$inrect(%x,%y,$calc(%cam.x - 36),$calc(%cam.y - 36),$calc(%win.w + 72),$calc(%win.h + 72))) {
+    var %tx = $obj_get(ab,%id).x
+    var %ty = $obj_get(ab,%id).y
+    var %x = %tx * %tile.w
+    var %y = %ty * %tile.h
 
-    obj_delete ab %id
+    ; BUGFIX: this margin used to be a flat 36px, smaller than how far AHEAD of the viewport the scrolling
+    ; tile buffer itself already draws (see cam_ScrollTo/buffer_RedrawCol/buffer_RedrawRow): %buffer.w is
+    ; %win.w + %tile.w*2, and the newly-exposed edge column/row buffer_RedrawCol/Row draws on each scroll
+    ; step sits up to ~2 tiles past the visible viewport edge, not just past %win.w itself. Since this cull
+    ; check ran with a SMALLER margin than that lookahead distance, an animated tile drawn into that lookahead
+    ; strip (buffer_RedrawTile creating its "ab" object the moment it enters the buffer) was immediately culled
+    ; again right after -- before ever scrolling into the visible viewport -- because it was already outside
+    ; this too-small margin the instant it was created. buffer_RedrawCol/Row only ever fires again for that
+    ; exact column/row when it re-enters the buffer from scratch (scrolls fully off, then back on), so once
+    ; culled this early it just stayed blank even once the camera scrolled back over it -- exactly the "pan
+    ; right, pan back left, some blocks are now missing" symptom. Matching this margin to the buffer's own
+    ; lookahead distance (3 tiles of slack, a bit more than the ~2 tiles buffer_RedrawCol/Row actually uses)
+    ; keeps anything the buffer has already drawn exempt from culling until it's genuinely off the buffer too.
+    var %marginx = $calc(%tile.w * 3)
+    var %marginy = $calc(%tile.h * 3)
+    if (!$inrect(%x,%y,$calc(%cam.x - %marginx),$calc(%cam.y - %marginy),$calc(%win.w + %marginx * 2),$calc(%win.h + %marginy * 2))) {
 
-    ; TEMPORARY fix: this deletes the "ab" runtime object when it scrolls off-screen, but was NOT clearing
-    ; the .animid tracking key in edig that points to it -- unlike map_destroyTile, which deletes the object
-    ; AND clears the tracking key together. Without this, a stale non-empty .animid is left behind after an
-    ; off-screen cull, pointing at a now-deleted object. buffer_RedrawTile's reuse-guard (checking for an
-    ; existing .animid before creating a new "ab" object) then sees that stale id as "still valid" and skips
-    ; recreating the animated block when the tile scrolls back on-screen -- leaving that tile permanently
-    ; un-animated (e.g. missing grass) and leaving a dangling id that can surface as empty imgcache lookups
-    ; elsewhere (the "/drawcopy: no such window: 32" errors). Clear .animid here so a later buffer_RedrawTile
-    ; call correctly sees no live object and creates a fresh one. The .m/.imgcache* keys are left alone --
-    ; the tile itself hasn't changed, only its animated-block object was culled.
-    hdel edig $+(%map.id,%tx,.,%ty,.animid)
+      obj_delete ab %id
+
+      ; TEMPORARY fix: this deletes the "ab" runtime object when it scrolls off-screen, but was NOT clearing
+      ; the .animid tracking key in edig that points to it -- unlike map_destroyTile, which deletes the object
+      ; AND clears the tracking key together. Without this, a stale non-empty .animid is left behind after an
+      ; off-screen cull, pointing at a now-deleted object. buffer_RedrawTile's reuse-guard (checking for an
+      ; existing .animid before creating a new "ab" object) then sees that stale id as "still valid" and skips
+      ; recreating the animated block when the tile scrolls back on-screen -- leaving that tile permanently
+      ; un-animated (e.g. missing grass) and leaving a dangling id that can surface as empty imgcache lookups
+      ; elsewhere (the "/drawcopy: no such window: 32" errors). Clear .animid here so a later buffer_RedrawTile
+      ; call correctly sees no live object and creates a fresh one. The .m/.imgcache* keys are left alone --
+      ; the tile itself hasn't changed, only its animated-block object was culled.
+      hdel edig $+(%map.id,%tx,.,%ty,.animid)
+    }
+
+    inc %i
   }
 }
 
