@@ -15,6 +15,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://gnu.org>.
 */
 #include <regex>
+#include <malloc.h>    // _resetstkoflw -- see ExecNodesSEH's own comment on why a caught stack overflow needs this
 #include <afxinet.h>
 #include <afxwin.h>
 #include <afxcmn.h>
@@ -58,6 +59,8 @@ along with this program.  If not, see <https://gnu.org>.
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")     // MCI (sound playback) -- see /splay, /vol, $vol, $inwave/$inmidi/$insong
 #pragma comment(lib, "ole32.lib")     // Core Audio (master volume/mute) -- see /vol -
+#include <wingdi.h>
+#pragma comment(lib, "msimg32.lib")   // ::TransparentBlt -- the fast, single-call way to do drawcopy's "-t" key-colour copy (see CmdDraw's drawcopy branch); far faster than the old per-pixel GetPixel/SetPixel loop it replaces, which was the actual cause of mariolike.mrc's game loop running at ~0.5s/tick instead of the ~15ms the timer interval alone would otherwise allow
 #include <wininet.h>
 #pragma comment(lib, "wininet.lib")   // About dialog's "Check for Update" button -- a single blocking HTTPS GET to the GitHub API, nothing more
 #pragma comment(lib, "oleaut32.lib")  // $ctime(text): COleDateTime::ParseDateTime()'s flexible date-text parsing (January 1 1970, 3rd August 1987 3:46pm, 21/4/72, etc.)
@@ -83,6 +86,20 @@ extern "C" {
 }
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")           // prevents a console window regardless of the /link command used
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")   // Unicode MFC entry point (VS sets this automatically)
+// The script engine's "alias called as $identifier(args)" mechanism (EvalIds -> RunAlias -> RunScript ->
+// ExecNodesSEH -> ExecNodes -> ExecCmd -> EvalCmdLine -> back into EvalIds for the NEXT nested $identifier(...) it
+// finds) re-enters this whole chain of C++ frames once per level of script-side alias nesting -- and real mIRC
+// scripts nest this way constantly (MarioMSL's own obj_Count, called from inside a $calc(...) argument, inside a
+// while-loop line, inside an alias, inside another alias...). Each level isn't cheap: RunScript alone re-tokenizes
+// and re-parses that alias's entire body from scratch into a fresh std::vector<SNode> tree every single call, and
+// ExecNodesSEH's __try/__except adds its own exception-registration overhead on top. The default 1MB thread stack
+// genuinely runs out partway through an otherwise completely ordinary, finite call chain like
+// mariolikegame -> game_Launch -> engine_Init -> engine_LoadObjectsFile -> $obj_count(...) -- confirmed live: the
+// very first-ever $obj_count(...) call overflowed the stack (0xC00000FD) deep inside evaluating its own one-line
+// body's $hget(...) call, with nothing resembling real runaway/infinite recursion anywhere in the script. 8MB
+// (8x the default) gives this chain enough headroom without the app's normal memory footprint even being
+// noticeable at that size.
+#pragma comment(linker, "/STACK:8388608")
 
 
 #include "version.h"
@@ -343,6 +360,17 @@ static void DrawMircText(CDC* dc, CRect r, const CString& s, COLORREF base) {
 // survive being stored into `params`, which $1/$2/$1- always re-split on literal spaces, token boundaries and all.
 // U+E000 is the first Private Use Area codepoint -- never produced by any real text, file path, or script content.
 static const wchar_t kTokenizeSpace = (wchar_t)0xE000;
+// A sibling sentinel, same Private Use Area trick: `params` (the "$1 $2 $3 ..." string every alias call builds)
+// has no way to represent a genuinely EMPTY positional argument -- a plain space-joined string can't tell "two
+// adjacent separators" apart from "one separator", so an empty middle argument silently vanished instead of
+// leaving an empty $N slot, shifting every argument after it back by one position. That's exactly what turned
+// $game_Launch(%file,22,16) (MarioMSL's own, perfectly ordinary call for a brand-new map, with %file deliberately
+// left empty) into $1=22 $2=16 $3=<empty> inside game_Launch instead of $1=<empty> $2=22 $3=16 -- silently handing
+// engine_Init a window WIDTH where it expected a map filename, and so on down the chain. Used only at the one call
+// site that builds `params` from a comma-separated argument list (the alias-as-identifier $name(a,b,c) mechanism);
+// occupies the empty slot's token position with this one placeholder character so the plain-space tokenizer still
+// sees a token there, then slice() strips it back out to a true empty string wherever a resulting $N is read.
+static const wchar_t kEmptyParamSentinel = (wchar_t)0xE001;
 static CString Word(CString& s) {
     s.TrimLeft(); int i = s.Find(L' '); CString w;
     if (i < 0) { w = s; s.Empty(); } else { w = s.Left(i); s = s.Mid(i + 1); }
@@ -2251,6 +2279,21 @@ protected:
     afx_msg void OnPaint();              // defined after CChatWnd, which these four need the full definition of
     afx_msg BOOL OnEraseBkgnd(CDC*) { return TRUE; }   // OnPaint always fully repaints (either the canvas bitmap or a black fill)
     afx_msg void OnKeyDown(UINT vk, UINT rep, UINT flags);
+    // mIRC's "on KEYUP" -- the matching release for OnKeyDown/"on KEYDOWN" just above. This genuinely didn't exist
+    // at all before (no WM_KEYUP handler on this control, no "KEYUP" event type recognized by ParseRemoteEvents or
+    // fired by FireWindowEvent) -- so a script's "on *:keyup:@window:*:{ ... }" handler, written to clear its own
+    // key-held tracking (MarioMSL's own on keyup clears %keydown[N]/%keypress[N], e.g.), simply never ran, no
+    // matter how long or how many times a key was released. Once %keypress[N] got set by a single real keydown, it
+    // had no way back to 0 except a script's own one-shot "consumed this frame" cleanup (if it has one at all) --
+    // MarioMSL's engine_GameLoop does have exactly that cleanup, gated on %game.clearkeypress, but a key held down
+    // (producing OS key-repeat KEYDOWN messages) keeps re-arming that same flag every repeat, and with no KEYUP
+    // ever landing to zero %keydown[N] first, "held" and "stuck" become indistinguishable to the script -- which is
+    // what was reopening its Ctrl+S-equivalent Save-As dialog over and over, once per game tick, with the user not
+    // even touching the keyboard: a single earlier 's' keystroke (debounced into one %keypress[83]=1) never got
+    // cleared by a keyup that could never arrive, and $sfile(...)'s own modal dialog pumps the same WM_TIMER
+    // messages that re-enter engine_GameLoop while it's up, each re-entry finding %keypress[83] still set and
+    // popping another one on top.
+    afx_msg void OnKeyUp(UINT vk, UINT rep, UINT flags);
     afx_msg void OnLButtonDown(UINT flags, CPoint p);   // mIRC's "sclick" -- a left click (button DOWN) anywhere on a custom @window's picture canvas; see CChatWnd::FireCanvasEvent
     afx_msg void OnLButtonUp(UINT flags, CPoint p);     // mIRC's "uclick" -- the matching button-UP/release
     afx_msg void OnMouseMove(UINT flags, CPoint p);     // mIRC's "mouse" -- fires on every move, not just click; also arms WM_MOUSELEAVE for "leave"
@@ -2266,7 +2309,7 @@ protected:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CCanvasWnd, CWnd)
-    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE() ON_WM_MOUSELEAVE() ON_WM_RBUTTONUP()
+    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_KEYUP() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE() ON_WM_MOUSELEAVE() ON_WM_RBUTTONUP()
 END_MESSAGE_MAP()
 
 class CChatWnd : public CMDIChildWnd {
@@ -2485,7 +2528,8 @@ public:
     HDC m_cwDC = nullptr; HBITMAP m_cwBmp = nullptr, m_cwOldBmp = nullptr;   // raw GDI, not CDC/CBitmap wrappers -- this gets
     int m_cwBmpW = 0, m_cwBmpH = 0;                                          // torn down and recreated at a new size often (every /window resize, every out-of-bounds draw), and doing that by hand with SelectObject/DeleteObject/DeleteDC is far less fiddly than fighting MFC's CGdiObject attach/detach semantics each time
     int m_mouseX = 0, m_mouseY = 0;                        // last canvas mouse position, for $mouse.x/$mouse.y
-    std::function<void(CChatWnd*, UINT)> onCanvasKey;      // on KEYDOWN wiring, set by CMainFrame::OpenCustomWindow
+    std::function<void(CChatWnd*, UINT, bool)> onCanvasKey;   // on KEYDOWN wiring, set by CMainFrame::OpenCustomWindow -- bool: OS auto-repeat (key already held), for $keyrpt
+    std::function<void(CChatWnd*, UINT)> onCanvasKeyUp;    // on KEYUP wiring, set by CMainFrame::OpenCustomWindow -- see CCanvasWnd::OnKeyUp's own comment for why this needed to exist
     // mIRC's reserved "Menu @window { ... }" mouse labels on the canvas -- "sclick" (button down), "uclick"
     // (button up), "mouse" (every move), "leave" (pointer leaves the canvas); evt carries which one fired. Wiring
     // set by CMainFrame::OpenCustomWindow. Used to be just a single-purpose "sclick on button-up" callback, which
@@ -2531,7 +2575,8 @@ public:
         }
     }
     void RepaintCanvas() { if (m_canvasShown && m_canvas.m_hWnd) { m_canvas.Invalidate(); m_canvas.UpdateWindow(); } }
-    void OnCanvasKeyDown(UINT vk) { if (onCanvasKey) onCanvasKey(this, vk); }
+    void OnCanvasKeyDown(UINT vk, bool isRepeat) { if (onCanvasKey) onCanvasKey(this, vk, isRepeat); }
+    void OnCanvasKeyUp(UINT vk) { if (onCanvasKeyUp) onCanvasKeyUp(this, vk); }
     void OnCanvasMouseMove(CPoint p) { m_mouseX = p.x; m_mouseY = p.y; }
     void FireCanvasEvent(CPoint p, const CString& evt) { OnCanvasMouseMove(p); if (onCanvasEvent) onCanvasEvent(this, p, evt); }   // "sclick"/"uclick"/"mouse"/"leave" -- see CCanvasWnd's handlers and CMainFrame::OpenCustomWindow's wiring of onCanvasEvent
 
@@ -2698,7 +2743,20 @@ void CCanvasWnd::OnPaint() {
         if (r.Height() > bh) dc.FillSolidRect(0, bh, r.Width(), r.Height() - bh, RGB(0, 0, 0));
     } else dc.FillSolidRect(r, RGB(0, 0, 0));
 }
-void CCanvasWnd::OnKeyDown(UINT vk, UINT, UINT) { if (owner) owner->OnCanvasKeyDown(vk); }
+// flags' bit 14 (KF_REPEAT, 0x4000) is Windows' own "this key was already down" bit -- set on every repeat
+// WM_KEYDOWN generated by the key being held, clear on the genuine first press. $keyrpt (below) is just this bit
+// surfaced to script; without it, a script's own "if ($keyrpt) {...} else { set %keypress[x] 1 }" idiom for telling
+// a fresh press from a hold (MarioMSL's on KEYDOWN handler does exactly this) had no implemented $keyrpt identifier
+// to call at all -- it fell through to the generic "unknown identifier left as literal text" fallback, and the
+// literal text "$keyrpt" is itself a non-empty, non-"0" string, so the bare "if ($keyrpt)" condition was
+// unconditionally TRUE on every single keydown, real first-press or OS auto-repeat alike. That made the script
+// take the $keyrpt branch (set %keypress[x] 0) every time and never the else branch (set %keypress[x] 1) -- so
+// %keypress[x] could never become 1 from a keydown, period. Every single-press action gated on %keypress[...]
+// (jump, pause, G to enter/exit the map editor, Save/Load, tile-palette prev/next, place-entity 1-4, the camera
+// and big-mario cheat keys) was silently dead from the very first keystroke, while %keydown[...] (used only for
+// continuous-hold movement) kept working fine since it's set unconditionally regardless of that branch.
+void CCanvasWnd::OnKeyDown(UINT vk, UINT, UINT flags) { if (owner) owner->OnCanvasKeyDown(vk, (flags & 0x4000) != 0); }
+void CCanvasWnd::OnKeyUp(UINT vk, UINT, UINT) { if (owner) owner->OnCanvasKeyUp(vk); }
 void CCanvasWnd::OnRButtonUp(UINT, CPoint p) { if (owner && owner->onLogMenu) { CPoint sp = p; ClientToScreen(&sp); owner->onLogMenu(owner, sp); } }
 void CCanvasWnd::OnLButtonDown(UINT, CPoint p) { SetFocus(); if (owner) owner->FireCanvasEvent(p, L"sclick"); }   // "sclick" fires on button DOWN -- PixelEditor.mrc (and any other drag-to-draw tool) anchors its stroke here
 void CCanvasWnd::OnLButtonUp(UINT, CPoint p) { if (owner) owner->FireCanvasEvent(p, L"uclick"); }                 // "uclick" fires on button UP/release -- commits whatever sclick started
@@ -3493,8 +3551,15 @@ struct CalcParser {   // $calc(): + - * / % ^ , unary minus and parentheses, wit
     }
 };
 static bool CalcExpr(const CString& s, double& out) {
+    // Trailing text left over after a fully-valid expression is tolerated, not an error -- matching real mIRC's
+    // own lenient $calc (mariolike.mrc itself relies on exactly this: "$calc(%tile.w * -1 0)", a genuine typo in
+    // the original script with a stray trailing "0" and no operator before it, is still expected to evaluate to
+    // "%tile.w * -1" in real mIRC rather than failing outright -- cam_ScrollTo's rightward-scroll /drawscroll
+    // call passes this as its dx argument). Only a parse failure WITHIN the expression itself (hitting a
+    // character that isn't a number, operator, or parenthesis before anything usable was parsed) is a real
+    // error; anything successfully parsed up to that point still returns its value.
     CString t = s; CalcParser cp; cp.p = t; out = cp.expr(); cp.ws();
-    return cp.ok && *cp.p == 0;
+    return cp.ok;
 }
 static bool GlobMatch(const wchar_t* pat, const wchar_t* s, bool cs) {   // * and ?; case-insensitive unless cs -- default arg is on the forward declaration near the top of the file instead, since it must be visible there too
     const wchar_t* star = nullptr; const wchar_t* ss = s;
@@ -3516,8 +3581,19 @@ typedef std::map<CString, VarEntry> VarMap;   // key: lowercase name including t
 struct VarScope { VarMap locals; std::vector<CString> unsetAtEnd; };   // one per script run
 
 // ---------------- Aliases and scripts: file format, block parsing, syntax tree ----------------
-struct AliasDef { CString name; std::vector<CString> lines; CString groupName; };   // one alias: its name, body, and (remote-script-defined ones only) which #group it's in, if any -- empty for every aliases.ini-sourced alias, which have no group concept at all
 struct SNode { int kind = 0; CString text; std::vector<SNode> a, b; };   // 0 command, 1 if (text = condition, a = then, b = else), 2 while, 3 label
+struct AliasDef {
+    CString name; std::vector<CString> lines; CString groupName; CString sourceFile;   // one alias: its name, body, (remote-script-defined ones only) which #group it's in, if any -- empty for every aliases.ini-sourced alias, which have no group concept at all -- and which script file (a path from m_rfiles) it was defined in, empty for an aliases.ini-sourced one. sourceFile exists so $scriptdir, while this alias is running, can report ITS OWN file's folder rather than always m_rfiles[0]'s -- see m_aliasFileStack.
+    // Cache of `lines` already tokenized+parsed into a node tree (see RunAlias), so a repeatedly-called alias
+    // doesn't pay ScriptTokens()+ParseNodes()'s full text-scanning cost on every single call -- only the first
+    // one after this AliasDef was (re)defined. A shared_ptr so copying this AliasDef (RunAlias takes one BY
+    // VALUE) is cheap and shares the same cached tree rather than re-copying or re-parsing it; nullptr until
+    // first built. Any code that mutates `lines` on an AliasDef already in m_aliases/m_remoteAliases/
+    // m_extraAliases (currently just SetAlias) must also clear this, or RunAlias would keep running the OLD
+    // body forever -- a brand new AliasDef (the normal case: reload, /load, parsing a fresh aliases.ini) needs
+    // no such care since it default-constructs to nullptr here already.
+    mutable std::shared_ptr<std::vector<SNode>> cachedNodes;
+};
 
 static std::vector<CString> SplitPipes(const CString& s) {   // "a | b | c" -> commands; a '|' inside parentheses is left alone
     // A '|' only counts as a command separator when it has whitespace on both sides (or sits right at the start/
@@ -3725,7 +3801,7 @@ static std::vector<GroupDecl> ParseGroupDeclarations(const std::vector<CString>&
     return out;
 }
 // The lines of aliases.ini (or the alias editor) -> aliases.   "/name body"   or   "/name {" ... "}"   ;comments and /* */ are skipped.
-static std::vector<AliasDef> ParseAliases(const std::vector<CString>& in) {
+static std::vector<AliasDef> ParseAliases(const std::vector<CString>& in, const CString& sourceFile = CString()) {
     std::vector<AliasDef> out; bool comment = false; CString curGroup;
     for (size_t i = 0; i < in.size(); i++) {
         CString t = in[i];
@@ -3739,7 +3815,7 @@ static std::vector<AliasDef> ParseAliases(const std::vector<CString>& in) {
         int k = 0; while (k < t.GetLength() && t[k] != L' ' && t[k] != L'{') k++;
         CString name = t.Left(k), rest = t.Mid(k); rest.Trim();
         if (name.IsEmpty()) continue;
-        AliasDef ad; ad.name = name; ad.groupName = curGroup;
+        AliasDef ad; ad.name = name; ad.groupName = curGroup; ad.sourceFile = sourceFile;
         int depth = BraceDelta(rest);
         if (depth <= 0) {
             if (rest.Left(1) == L"{" && rest.Right(1) == L"}") { rest = rest.Mid(1, rest.GetLength() - 2); rest.Trim(); }   // "{ cmd | cmd }" on one line
@@ -3750,7 +3826,16 @@ static std::vector<AliasDef> ParseAliases(const std::vector<CString>& in) {
             if (!rest.IsEmpty()) ad.lines.push_back(rest);
             while (depth > 0 && i + 1 < in.size()) {
                 CString l = in[++i]; l.Trim();
-                depth += BraceDelta(l);
+                // A ';' comment line's braces are never structural -- same reasoning as IsFreeformTextLine's
+                // say/echo/etc carve-out above, just for comments: a line like "; check for end brackets \"}\""
+                // (a real line from a real user script) has a literal, decorative '}' in its own text with no
+                // bearing on block nesting at all. Counting it anyway throws every brace-depth count for the rest
+                // of this alias (and every alias after it in the same block-reading pass) off by one, which then
+                // misattributes later lines to the wrong alias entirely -- exactly the kind of silent, cascading
+                // corruption that's nearly impossible to spot from the resulting symptom (a script "doing nothing"
+                // or running the wrong code) without comparing this parse against the raw file line by line.
+                bool isCommentLine = l.GetLength() > 0 && l[0] == L';';
+                if (!isCommentLine) depth += BraceDelta(l);
                 if (depth <= 0) {
                     if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ad.lines.push_back(head); }
                     else ad.lines.push_back(l);
@@ -4474,11 +4559,27 @@ static std::vector<CString> SplitTopLevelCommas(const CString& s) {
 // piece like "$chr(32)" on its own, not starting with %, and tripping /var's "variable names start with %" check
 // on input that's actually entirely valid mIRC. [ ] (eval brackets) are tracked the same way, for the same reason.
 static std::vector<CString> SplitTopLevelCommasParen(const CString& s) {
+    // Only '(' / ')' create a nesting level that protects a comma from being split -- that's what a nested
+    // function call needs (the comma inside "$+($iif(1,a,b),c)"'s own $iif(...) call must NOT split $+'s own
+    // argument list). '[' / ']' used to get the exact same treatment, which broke the single most common
+    // mIRC array-name idiom there is: "$+(%,keypress[,71,])" -- MarioMSL's (and basically every mIRC script's)
+    // standard way to build a pseudo-array name like "%keypress[71]" at runtime. Read as 4 comma-separated
+    // arguments ("%", "keypress[", "71", "]"), that lone unmatched '[' used to make this function think it was
+    // now "inside a nested call" and refuse to split on the next two commas until it saw a ']' to close it --
+    // so instead of 4 pieces, it produced only 2 ("%" and "keypress[,71,]"), and $+ concatenated those into
+    // "%keypress[,71,]" (commas and all) instead of the intended "%keypress[71]". That silently wrong, comma-
+    // laden text is what every "set $+(%,keypress[,...]) 1" / "set $+(%,keydown[,...]) 1" line in the whole
+    // key-input system was actually storing the value under -- a DIFFERENT variable than the plain, literal
+    // "%keypress[71]" every "if (%keypress[71])" check elsewhere in the script was reading, so every single
+    // one of those checks saw an always-empty variable no matter what was really pressed. '[' and ']' have no
+    // "this comma belongs to a nested call" meaning the way '(' and ')' do -- they're just two ordinary
+    // characters a script is entitled to pass as their own separate, literal arguments -- so they must NOT
+    // affect comma-splitting here at all.
     std::vector<CString> out; CString cur; int depth = 0;
     for (int i = 0; i < s.GetLength(); i++) {
         wchar_t c = s[i];
-        if (c == L'(' || c == L'[') depth++;
-        else if (c == L')' || c == L']') { if (depth > 0) depth--; }
+        if (c == L'(') depth++;
+        else if (c == L')') { if (depth > 0) depth--; }
         if (c == L',' && depth == 0) { out.push_back(cur); cur.Empty(); } else cur += c;
     }
     out.push_back(cur);
@@ -4491,11 +4592,14 @@ static std::vector<CString> SplitTopLevelCommasParen(const CString& s) {
 // by: a comma only starts a NEW declaration when, after it, the next thing is actually "%name" -- so only split
 // there, not on every top-level comma.
 static std::vector<CString> SplitVarDecls(const CString& s) {
+    // Same fix as SplitTopLevelCommasParen just above, for the same reason: '[' / ']' are ordinary characters a
+    // declaration's name or value is entitled to contain (e.g. a dynamically-built array name), not a nesting
+    // construct whose commas need protecting -- only '(' / ')' (an actual nested function call) do.
     std::vector<CString> out; CString cur; int depth = 0; int n = s.GetLength();
     for (int i = 0; i < n; i++) {
         wchar_t c = s[i];
-        if (c == L'(' || c == L'[') depth++;
-        else if (c == L')' || c == L']') { if (depth > 0) depth--; }
+        if (c == L'(') depth++;
+        else if (c == L')') { if (depth > 0) depth--; }
         if (c == L',' && depth == 0) {
             int k = i + 1; while (k < n && s[k] == L' ') k++;
             bool startsNewDecl = (k < n && s[k] == L'%' && k + 1 < n && (iswalnum(s[k + 1]) || s[k + 1] == L'_'));
@@ -4923,13 +5027,14 @@ struct RemoteEvent {
     CString whereSpec;              // JOIN/PART/KICK/TOPIC: channel list or bare # for "any channel"
                                      // TEXT/ACTION/NOTICE: #, ?, *, or a specific channel/wildcard
                                      // WALLOPS: no where field at all -- it's a server-wide broadcast, no channel/target concept
-    CString keySpec;                // KEYDOWN only: the key field as written (an ascii/vk code, a key name like "enter", or "*" for any key) -- see MatchesKeySpec
+    CString keySpec;                // KEYDOWN/KEYUP only: the key field as written (an ascii/vk code, a key name like "enter", or "*" for any key) -- see MatchesKeySpec
     std::vector<CString> lines;
     CString groupName;              // empty = not in any #group block, always active -- see IsGroupMarkerLine
+    CString sourceFile;             // which script-kind file (a path from m_rfiles) this event came from -- empty if parsed from a source with no single file of its own. Exists so on LOAD/on UNLOAD (see FireScriptLoadEvent) can fire only the handlers belonging to the one script file actually being loaded/unloaded, not every other already-loaded script's on LOAD handler too.
 };
-static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in) {
+static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in, const CString& sourceFile = CString()) {
     static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL", L"HOTLINK" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal; HOTLINK's against the hovered/clicked word (control codes stripped), same as $1
-    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"SOCKOPEN", L"SOCKREAD", L"SOCKCLOSE", L"SOCKLISTEN", L"HOTLINK" };   // CLOSE/KEYDOWN: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal, but matched against the /sockopen-given socket name instead of a window name. HOTLINK's where-spec is the window-type code (*,#,?,=,!,@), matched by MatchesHotlinkWhere.
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"KEYUP", L"SOCKOPEN", L"SOCKREAD", L"SOCKCLOSE", L"SOCKLISTEN", L"HOTLINK" };   // CLOSE/KEYDOWN/KEYUP: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal, but matched against the /sockopen-given socket name instead of a window name. HOTLINK's where-spec is the window-type code (*,#,?,=,!,@), matched by MatchesHotlinkWhere.
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
     CString curGroup;
@@ -4941,7 +5046,7 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
         CString rest = t.Mid(3); rest.TrimLeft();
         int c1 = rest.Find(L':'); if (c1 < 0) continue;
         CString level = rest.Left(c1); rest = rest.Mid(c1 + 1);
-        RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0; ev.groupName = curGroup;
+        RemoteEvent ev; ev.haltDefaultPrefix = level.Find(L'^') >= 0; ev.groupName = curGroup; ev.sourceFile = sourceFile;
         { CString levelNum = level; levelNum.Remove(L'^'); levelNum.Remove(L'*'); ev.level = _wtoi(levelNum); }   // "*" (any level) parses to 0, same as a bare level field would
         int c2 = rest.Find(L':'); if (c2 < 0) continue;
         ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
@@ -4972,7 +5077,7 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             // set -- e.g. Ctrl+Z firing pe.undo *and* pe.exportimage's Save-As file dialog in the same keystroke).
             int c4 = rest.Find(L':'); if (c4 < 0) continue;
             ev.whereSpec = rest.Left(c4); rest = rest.Mid(c4 + 1);
-            if (ev.eventName == L"KEYDOWN") {
+            if (ev.eventName == L"KEYDOWN" || ev.eventName == L"KEYUP") {
                 int c5 = rest.Find(L':'); if (c5 < 0) continue;
                 ev.keySpec = rest.Left(c5); ev.keySpec.Trim();
                 rest = rest.Mid(c5 + 1);
@@ -4988,7 +5093,8 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
             if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
             while (db > 0 && i + 1 < in.size()) {
-                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                CString l = in[++i]; l.Trim();
+                if (l.GetLength() == 0 || l[0] != L';') db += BraceDelta(l);   // a ';' comment line's own braces (e.g. a decorative "}") are never structural -- see ParseAliases' matching fix for the full reasoning
                 if (db <= 0) {
                     if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ev.lines.push_back(head); }
                     else ev.lines.push_back(l);
@@ -5066,7 +5172,8 @@ static std::vector<RawEvent> ParseRawEvents(const std::vector<CString>& in) {
             if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
             if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
             while (db > 0 && i + 1 < in.size()) {
-                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                CString l = in[++i]; l.Trim();
+                if (l.GetLength() == 0 || l[0] != L';') db += BraceDelta(l);   // a ';' comment line's own braces (e.g. a decorative "}") are never structural -- see ParseAliases' matching fix for the full reasoning
                 if (db <= 0) {
                     if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ev.lines.push_back(head); }
                     else ev.lines.push_back(l);
@@ -5144,7 +5251,8 @@ static std::vector<CtcpEvent> ParseCtcpEvents(const std::vector<CString>& in) {
             if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
             if (!cmdText.IsEmpty()) ev.lines.push_back(cmdText);
             while (db > 0 && i + 1 < in.size()) {
-                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                CString l = in[++i]; l.Trim();
+                if (l.GetLength() == 0 || l[0] != L';') db += BraceDelta(l);   // a ';' comment line's own braces (e.g. a decorative "}") are never structural -- see ParseAliases' matching fix for the full reasoning
                 if (db <= 0) {
                     if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) ev.lines.push_back(head); }
                     else ev.lines.push_back(l);
@@ -5204,7 +5312,8 @@ static std::vector<DialogEventDef> ParseDialogEvents(const std::vector<CString>&
             if (outer) { cmdText = cmdText.Mid(1); cmdText.TrimLeft(); }
             if (!cmdText.IsEmpty()) de.lines.push_back(cmdText);
             while (db > 0 && i + 1 < in.size()) {
-                CString l = in[++i]; l.Trim(); db += BraceDelta(l);
+                CString l = in[++i]; l.Trim();
+                if (l.GetLength() == 0 || l[0] != L';') db += BraceDelta(l);   // a ';' comment line's own braces (e.g. a decorative "}") are never structural -- see ParseAliases' matching fix for the full reasoning
                 if (db <= 0) {
                     if (outer) { int cb = l.ReverseFind(L'}'); CString head = cb > 0 ? l.Left(cb) : CString(); head.Trim(); if (!head.IsEmpty()) de.lines.push_back(head); }
                     else de.lines.push_back(l);
@@ -6863,11 +6972,43 @@ class CMainFrame : public CMDIFrameWnd {
     // Hash tables (/hmake, /hadd, /hdel, /hfree, $hget, $hfind). Items are a plain vector of key/data pairs, kept
     // in insertion order -- this matters because $hget(table,N).item iterates items by that order, and because
     // mIRC's own hash tables are documented as using chaining to resolve collisions (which is itself effectively
-    // a linked list per bucket), a plain ordered list with linear lookup is a faithful-enough match in behavior
-    // for realistic table sizes, without needing to actually implement bucket hashing. "size" (bucket count) is
-    // accepted and reported back via $hget(table).size for script compatibility, but doesn't affect anything --
-    // there's no real bucket array underneath it to size.
-    struct HashTableEntry { CString name; int size = 100; std::vector<std::pair<CString, CString>> items; };
+    // a linked list per bucket), a plain ordered list looked like a faithful-enough match in behavior for
+    // realistic table sizes. It wasn't: a by-name lookup originally walked the whole vector doing a CompareNoCase
+    // against every entry, and a real-world script (mariolike.mrc) was found to build its entire custom object
+    // system (obj_get/obj_set) AND its whole per-tile map cache on top of hget/hadd against one such table, which
+    // grows into the thousands of entries for a modestly-sized map. Every obj_get/obj_set call -- and there are
+    // many per on-screen character per frame -- was therefore a full linear scan, which is what was actually
+    // behind that game's main loop taking ~470ms to execute per tick (a completely separate, much larger problem
+    // than either the earlier 15ms SetTimer-interval fix or the drawcopy -t GetPixel/SetPixel slowness fixed
+    // just above -- fixing those two barely moved the number, because this was the real cost). `idx` is a
+    // lowercased-name -> position index kept in step with `items` by Find()/Set()/Erase() below, turning a
+    // by-name lookup into an O(log n) map lookup instead of an O(n) linear scan with a string comparison per
+    // entry; `items` itself is untouched otherwise, so insertion order (and $hget(table,N).item) still works
+    // exactly as before.
+    struct HashTableEntry {
+        CString name; int size = 100;
+        std::vector<std::pair<CString, CString>> items;
+        std::map<CString, size_t> idx;
+        static CString NKey(CString s) { s.MakeLower(); return s; }   // same lowercase-key convention as VKey() for script variables
+        void RebuildIndex() { idx.clear(); for (size_t i = 0; i < items.size(); i++) idx[NKey(items[i].first)] = i; }
+        std::pair<CString, CString>* Find(const CString& key) {
+            auto it = idx.find(NKey(key));
+            return (it == idx.end()) ? nullptr : &items[it->second];
+        }
+        void Set(const CString& keyName, const CString& val) {
+            auto* p = Find(keyName);
+            if (p) { p->second = val; return; }
+            items.push_back({ keyName, val });
+            idx[NKey(keyName)] = items.size() - 1;
+        }
+        bool Erase(const CString& keyName) {
+            auto it = idx.find(NKey(keyName));
+            if (it == idx.end()) return false;
+            items.erase(items.begin() + it->second);
+            RebuildIndex();   // not called every game-loop tick like Find()/Set() are, so the O(n) rebuild here isn't worth optimizing further
+            return true;
+        }
+    };
     std::vector<HashTableEntry> m_hashTables;
     HashTableEntry* FindHashTable(const CString& tname) { for (auto& t : m_hashTables) if (t.name.CompareNoCase(tname) == 0) return &t; return nullptr; }
     // Binary variables (&name): /bset, /bwrite, /bread, /bunset, /btrunc, $bvar(), and the binary-flagged
@@ -6893,6 +7034,7 @@ class CMainFrame : public CMDIFrameWnd {
     void CloseFileHandle(FileHandleEntry& h) { if (h.file) { h.file->Close(); delete h.file; h.file = nullptr; } }
     std::vector<DialogTableDef> m_dialogTables;       // every "dialog name { ... }" block found across every script-kind file in m_rfiles, same spirit as m_remoteMenus
     std::vector<AliasDef> m_aliases; std::vector<CString> m_runStack;   // aliases (aliases.ini) and the alias names currently running
+    std::vector<CString> m_aliasFileStack;   // parallel to m_runStack: the sourceFile of whichever alias each stack entry is, "" for an aliases.ini one -- $scriptdir reads the top non-empty entry so it reports the CURRENTLY RUNNING script's own folder, not always m_rfiles[0]'s (which broke $scriptdir($game_Path(...)) for any script that wasn't the very first one in the Remote file list, e.g. MarioMSL's objects.txt resolving one folder too high when another script had been loaded first)
     int m_depth = 0, m_steps = 0; bool m_halt = false; CString m_result, m_prop, m_lastPrompt;   // state of the running script: $result, $prop, $!
     ULONGLONG m_scriptStart = 0;   // GetTickCount64() when the current top-level script run began -- a wall-clock backstop alongside m_steps, since a runaway loop whose each "step" does real UI/GDI/network work can blow past several seconds long before it reaches the step cap
     // Wrap any DoModal()/SHBrowseForFolderW() call reached from inside script execution (an identifier like $sfile,
@@ -6917,15 +7059,32 @@ class CMainFrame : public CMDIFrameWnd {
     // script doing work and shouldn't count against it.
     struct ModalWatchdogGuard {
         CMainFrame* f; int savedDepth; bool savedHalt;
-        ModalWatchdogGuard(CMainFrame* p) : f(p), savedDepth(p->m_depth), savedHalt(p->m_halt) { f->m_depth = 0; }
-        ~ModalWatchdogGuard() { f->m_depth = savedDepth; f->m_halt = savedHalt; f->m_steps = 0; f->m_scriptStart = GetTickCount64(); }
+        // m_modalNestLevel: DoModal() (and SHBrowseForFolderW) pumps the FULL thread message queue while it blocks,
+        // not just messages for its own dialog -- which includes WM_TIMER id 2002, the one TimerTick() (a /timer's
+        // actual firing mechanism) hangs off. A ".timered -om 0 0 engine_GameLoop" tick that calls $sfile() (e.g.
+        // MarioMSL's edit-mode Save-As binding) blocks inside THIS dialog's DoModal() for however long picking a
+        // file takes -- routinely well over the 100ms polling interval -- so TimerTick() fires AGAIN, reentrantly,
+        // while the first engine_GameLoop call is still sitting on the C++ stack inside DoModal(). That second tick
+        // re-runs the exact same %keypress[83]-still-true check (nothing downstream of the blocked $sfile() call
+        // has had a chance to clear it yet) and opens a SECOND Save-As dialog on top of the first -- then a third
+        // once THAT one blocks for a tick too, cascading for as long as the user keeps closing dialogs faster than
+        // new ones stack up. This is exactly the "so many windows... had to force close" symptom: not a stuck key
+        // state (KEYUP firing correctly doesn't help, since the very first dialog already reopens before any keyup
+        // could ever reach the script) but unguarded timer reentrancy through a blocking native dialog's own message
+        // pump. TimerTick() checks this counter and skips firing new timer ticks entirely while it's nonzero,
+        // matching how real mIRC scripts experience a modal prompt: script timers simply don't advance while one is
+        // up, and resume normally once DoModal() returns and this guard's destructor decrements back to 0.
+        ModalWatchdogGuard(CMainFrame* p) : f(p), savedDepth(p->m_depth), savedHalt(p->m_halt) { f->m_depth = 0; f->m_modalNestLevel++; }
+        ~ModalWatchdogGuard() { f->m_depth = savedDepth; f->m_halt = savedHalt; f->m_steps = 0; f->m_scriptStart = GetTickCount64(); f->m_modalNestLevel--; }
     };
+    int m_modalNestLevel = 0;
     struct ExecCtx; ExecCtx* m_curCtx = nullptr;   // the currently-executing script line's ExecCtx, so /tokenize (handled deep inside Dispatch, which otherwise never sees ExecCtx) can replace $1../$1- for the rest of that script -- set/restored around each Dispatch() call from ExecCmd
     CString m_vhist[9];   // $v1..$v9: see EvalCond's own comment where these get filled in
     CString m_lastExecLine;   // the raw text of whatever script line most recently started executing -- surfaced by the watchdog message in ExecNodes so "taking too long" says WHAT it was stuck on, not just that it happened
     bool m_silentCmd = false;   // true while running a "."-prefixed command -- see Dispatch's SilentGuard; individual command handlers that show their own confirmation/status line (CmdTimer's "activated", etc.) check this and skip it
     struct SilentGuard { CMainFrame* f; bool saved; SilentGuard(CMainFrame* p, bool v) : f(p), saved(p->m_silentCmd) { f->m_silentCmd = v; } ~SilentGuard() { f->m_silentCmd = saved; } };
     int m_lastKeyVal = 0;   // $keyval: the key code from the most recent on KEYDOWN, across every custom window (mIRC keeps this as a single global, not per-window) -- see CChatWnd::onCanvasKey
+    bool m_lastKeyRepeat = false;   // $keyrpt: whether that most recent on KEYDOWN was an OS auto-repeat (key held) rather than a genuine first press -- see CCanvasWnd::OnKeyDown's comment
     VarMap m_vars; std::vector<VarScope> m_scopes; bool m_varsDirty = false;   // global variables (vars.ini) and the stack of per-script local scopes
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
@@ -7080,10 +7239,15 @@ class CMainFrame : public CMDIFrameWnd {
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
         w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return m_hlMenuSet ? ShowHotlinkPopup(c, pt) : ShowCustomPopup(c, pt); };
         w->onHotlinkFire = [this](CChatWnd* c, const CString& word, const CString& line, int lineNo, int wordPos, int charPos, const CString& evt) { FireHotlinkEvent(c, word, line, lineNo, wordPos, charPos, evt); };
-        w->onCanvasKey = [this](CChatWnd* c, UINT vk) {   // on KEYDOWN: fired for whichever custom window currently has keyboard focus -- see CCanvasWnd/ShowCanvas
-            m_lastKeyVal = (int)vk;
+        w->onCanvasKey = [this](CChatWnd* c, UINT vk, bool isRepeat) {   // on KEYDOWN: fired for whichever custom window currently has keyboard focus -- see CCanvasWnd/ShowCanvas
+            m_lastKeyVal = (int)vk; m_lastKeyRepeat = isRepeat;
             CString params; params.Format(L"%d", (int)vk);
             FireWindowEvent(c, L"KEYDOWN", c->m_name, params);
+        };
+        w->onCanvasKeyUp = [this](CChatWnd* c, UINT vk) {   // on KEYUP: the matching release -- see CCanvasWnd::OnKeyUp's own comment for why this needed to exist at all
+            m_lastKeyVal = (int)vk;
+            CString params; params.Format(L"%d", (int)vk);
+            FireWindowEvent(c, L"KEYUP", c->m_name, params);
         };
         w->onCanvasEvent = [this](CChatWnd* c, CPoint, const CString& evt) {   // mIRC's canvas mouse labels -- "sclick"/"uclick"/"mouse"/"leave" -- run that window's own popup.txt (or, far more commonly, its "Menu @windowname { ... }" block) item literally titled that (same convention real mIRC uses: a reserved top-level label, not a real menu entry -- ShowCustomPopup filters these back out of the visible right-click menu for the same reason). Was entirely unwired before (and, for a while, wired ONLY for "sclick" and fired on the wrong edge, button-UP instead of button-DOWN) -- a click on the canvas only ever updated $mouse.x/$mouse.y, with nothing to actually run the window's own handler, which is exactly why clicking @Tetris to pause/unpause (its "Menu @Tetris { sclick:{ ... } }") never did anything, and why PixelEditor.mrc's drag-to-draw tools (anchored on sclick, live-updated via mouse, committed on uclick/leave) couldn't draw at all even once sclick alone was wired.
             // A script almost always defines its custom window's menu with "Menu @windowname { ... }" rather than
@@ -7262,12 +7426,64 @@ class CMainFrame : public CMDIFrameWnd {
         Net* net = w ? w->net : nullptr;
         CTime now = CTime::GetCurrentTime();
         if (name.GetLength() == 2 && name[0] == L'v' && name[1] >= L'1' && name[1] <= L'9') { val = m_vhist[name[1] - L'1']; return true; }   // $v1..$v9 -- see EvalCond's comment on m_vhist
-        if (name == L"mouse") {   // $mouse.x / $mouse.y -- last known mouse position within the current window's picture canvas (see CChatWnd::OnCanvasMouseMove)
-            if (prop == L"x") { val.Format(L"%d", w ? w->m_mouseX : 0); return true; }
-            if (prop == L"y") { val.Format(L"%d", w ? w->m_mouseY : 0); return true; }
+        if (name == L"mouse") {
+            // $mouse.x / $mouse.y -- real mIRC documents these as "relative to the active window", meaning
+            // whatever window currently has UI focus -- NOT whatever window happens to be the calling script's
+            // own execution context ("w" here). Those are usually the same window for a script that runs in
+            // direct response to something happening IN that window (a click, a keypress), but NOT for a script
+            // that runs from a timer: a timer's command always re-runs in whichever window was active back when
+            // the timer was first created (see TimerInfo::winName/CmdTimer), which for mariolike.mrc's
+            // ".timered -om 0 0 engine_GameLoop" is whatever window was active during the game's one-time launch
+            // sequence -- not necessarily @edc, the window the player is actually looking at and moving the
+            // mouse over every subsequent frame. Reading m_mouseX/m_mouseY off "w" in that case was reading a
+            // window that may never receive a single canvas mouse-move event again, so $mouse.x/$mouse.y stayed
+            // permanently 0 -- which is exactly "near the top-left corner" to mariolike.mrc's own edge-of-screen
+            // camera-pan check, so it kept panning up and left every single frame, pinning the camera at (0,0)
+            // no matter where the mouse actually was. Using the live active window instead (same lookup $active
+            // already uses) matches real mIRC's documented behaviour and fixes this.
+            CChatWnd* aw = dynamic_cast<CChatWnd*>(MDIGetActive()); if (!aw) aw = w;
+            if (prop == L"x") { val.Format(L"%d", aw ? aw->m_mouseX : 0); return true; }
+            if (prop == L"y") { val.Format(L"%d", aw ? aw->m_mouseY : 0); return true; }
+            if (prop == L"key") {
+                // $mouse.key -- a live bitmask of whichever mouse buttons and modifier keys are currently held,
+                // per real mIRC's own documented bit values (NOT the raw Win32 MK_* constants, which use
+                // different numbers): 1=left button, 16=right button, 32=middle button, 2=either Ctrl, 4=either
+                // Shift, 8=either Alt, 4096/8192/16384=left Shift/Ctrl/Alt, 64/128/256=right Shift/Ctrl/Alt,
+                // 512/1024/2048=Caps/Scroll/Num Lock. Queried live via ::GetKeyState (the same call OnClose
+                // already uses for its own Shift-key check) rather than tracked through window messages -- simpler,
+                // and can't drift out of sync with Windows' own idea of what's currently held.
+                //
+                // This identifier was entirely unimplemented before -- it fell through to the generic
+                // "unrecognized identifier left as literal text" fallback -- which, combined with "&" not being a
+                // recognized "if (...)" condition operator at all (see EvalCond's own fix, right next to this
+                // one), made "if ($mouse.key & 1)" -- the standard mIRC idiom for "is the left button still held,
+                // i.e. the user is dragging" -- unconditionally true no matter what was actually held. mariolike.
+                // mrc's map editor uses exactly that idiom to paint a tile while dragging across the map; with
+                // both bugs in play, every single mouse MOVE painted a tile, not just an actual click-and-drag.
+                auto held = [](int vk) { return (::GetKeyState(vk) & 0x8000) != 0; };
+                long k = 0;
+                if (held(VK_LBUTTON)) k |= 1;
+                if (held(VK_CONTROL)) k |= 2;
+                if (held(VK_SHIFT)) k |= 4;
+                if (held(VK_MENU)) k |= 8;
+                if (held(VK_RBUTTON)) k |= 16;
+                if (held(VK_MBUTTON)) k |= 32;
+                if (::GetKeyState(VK_CAPITAL) & 1) k |= 512;
+                if (::GetKeyState(VK_SCROLL) & 1) k |= 1024;
+                if (::GetKeyState(VK_NUMLOCK) & 1) k |= 2048;
+                if (held(VK_RSHIFT)) k |= 64;
+                if (held(VK_RCONTROL)) k |= 128;
+                if (held(VK_RMENU)) k |= 256;
+                if (held(VK_LSHIFT)) k |= 4096;
+                if (held(VK_LCONTROL)) k |= 8192;
+                if (held(VK_LMENU)) k |= 16384;
+                val.Format(L"%ld", k);
+                return true;
+            }
             return false;
         }
         if (name == L"keyval") { val.Format(L"%d", m_lastKeyVal); return true; }   // the key code from the most recent on KEYDOWN (see m_lastKeyVal's own comment)
+        if (name == L"keyrpt") { val = m_lastKeyRepeat ? L"$true" : L"$false"; return true; }   // was the most recent on KEYDOWN an OS auto-repeat (key held) rather than a fresh press -- see m_lastKeyRepeat's own comment for why this being missing broke every single-press key action in the game
         if (name == L"show") { val = m_silentCmd ? L"$false" : L"$true"; return true; }   // $true if the currently-running alias/command was NOT called with a silencing "." prefix (see SilentGuard/m_silentCmd) -- scripts commonly use this to tell an interactive call apart from a silent internal replay of the same alias, which is exactly how PixelEditor.mrc's pe.drawdot/pe.replacecolour (and similar) decide whether to push a new undo-stack entry (an interactive draw) or not (a ".pe.drawdot ..." replay triggered by undo/redo itself) -- unimplemented, this was being left as literal, always-truthy text by the unrecognized-identifier fallback, so "if ($show) iline @pe.undo 1 ..." always took the push branch even during an undo replay, corrupting the undo stack instead of consuming it (the net effect: Ctrl+Z redrew the same pixel instead of reverting it, so nothing visibly changed).
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
@@ -7422,7 +7638,12 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"mircexe") { val = ExePath(); return true; }
         if (name == L"mircini") { val = ExeDir() + L"IRC.ini"; return true; }
         if (name == L"script") { val = m_rfiles.empty() ? CString() : m_rfiles[0]; return true; }   // this client has no per-line "which loaded file is this command actually running from" tracking, so this reports the primary script file as a reasonable approximation, not necessarily the exact file a specific alias/event came from when multiple script files are loaded
-        if (name == L"scriptdir") { CString path = m_rfiles.empty() ? CString() : m_rfiles[0]; int s = path.ReverseFind(L'\\'); val = s >= 0 ? path.Left(s + 1) : path; return true; }
+        if (name == L"scriptdir") {   // the folder of the CURRENTLY RUNNING script, not always m_rfiles[0]'s -- see m_aliasFileStack
+            CString path;
+            for (auto it = m_aliasFileStack.rbegin(); it != m_aliasFileStack.rend(); ++it) if (!it->IsEmpty()) { path = *it; break; }
+            if (path.IsEmpty()) path = m_rfiles.empty() ? CString() : m_rfiles[0];   // not running inside any alias from a known file (a raw //command, an aliases.ini alias, ...) -- fall back to the old default
+            int s = path.ReverseFind(L'\\'); val = s >= 0 ? path.Left(s + 1) : path; return true;
+        }
         if (name == L"filtered") { val = L"0"; return true; }   // /filter isn't implemented in this client
         if (name == L"readn") { val.Format(L"%d", m_readn); return true; }
         if (name == L"getdir") { val = m_dccGetDir; return true; }   // stored for compatibility; nothing actually saves here, since there's no DCC in this client
@@ -7465,6 +7686,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"true") { val = L"1"; return true; }
         if (name == L"false") { val = L"0"; return true; }
         if (name == L"ticks") { val.Format(L"%I64u", (unsigned __int64)GetTickCount64()); return true; }
+        if (name == L"dbgsteps") { val.Format(L"%d", m_steps); return true; }   // TEMPORARY perf-diagnostic identifier: m_steps is the watchdog's own count of executed command nodes across the WHOLE nested call tree since the current top-level script run began (reset at m_depth==0) -- sampling it gives a hard count of how many statements one engine_GameLoop frame actually executes, to tell apart "many cheap calls, high fixed per-call overhead" from "few calls doing genuinely expensive work". Remove once the slowdown is diagnosed.
         if (name == L"maxlenl") { val = L"10240"; return true; }   // the safe per-statement character limit this client enforces nowhere else yet -- these three are just the reported constants real mIRC v7.62+ uses
         if (name == L"maxlenm") { val = L"2048"; return true; }
         if (name == L"maxlens") { val = L"512"; return true; }
@@ -7532,7 +7754,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"fulldate") { val = now.Format(L"%a %b %d %H:%M:%S %Y"); return true; }
         if (name == L"time") { val = now.Format(L"%H:%M:%S"); return true; }
         if (name == L"gmt") { val.Format(L"%I64d", (__int64)now.GetTime()); return true; }   // seconds since 1970, UTC-based
-        if (name == L"version") { val.Format(VERSION); return true; }
+        if (name == L"ver") { val.Format(VERSION); return true; }
+        if (name == L"version") { val = L"7.79"; return true; }   // real mIRC's $version is just the numeric version string (e.g. "7.79"), used by countless scripts as "if ($version > N) ..." -- NOT the VERSION macro above (that's this client's own descriptive name/URL string, right for a QUIT message or a CTCP VERSION reply, but not a number "if ($version > 6.0)" can compare against; returning it here used to make every version-gated script block ($version > 6/6.1/etc, almost universal in mIRC scripts from the v6-v7 era) silently evaluate false and skip its whole body
         if (name == L"daylight") {
             TIME_ZONE_INFORMATION tz = {}; DWORD id = GetTimeZoneInformation(&tz);
             val.Format(L"%ld", id == TIME_ZONE_ID_DAYLIGHT ? -tz.DaylightBias * 60 : 0L);   // seconds of DST offset, 0 when not in effect
@@ -7577,8 +7800,21 @@ class CMainFrame : public CMDIFrameWnd {
     void PopScope() {
         VarScope sc = std::move(m_scopes.back()); m_scopes.pop_back();
         for (auto& k : sc.unsetAtEnd) if (m_vars.erase(k)) m_varsDirty = true;   // /set -u0 globals go away when the script ends
-        FlushVars();
+        // PERF: no eager FlushVars() here -- PopScope() runs at the end of EVERY alias call (ScopeGuard's
+        // destructor), so a per-frame script loop that calls hundreds of aliases was triggering hundreds of
+        // potential SaveVars() disk writes per frame. See FlushVars()'s own comment below.
     }
+    // PERF: FlushVars() itself is deliberately NOT called from any hot per-statement/per-alias-return path
+    // anymore (CmdSet, CmdVar, CmdUnset, CmdIncDec, PopScope all used to call it eagerly). SaveVars() does
+    // synchronous WritePrivateProfileStringW disk I/O that rewrites mIRC's entire global-variable table from
+    // scratch on every call, so calling it once per /set, /inc, /dec, or alias return was turning every one of
+    // those into a full-table disk rewrite -- the dominant cost behind mariolike.mrc's game loop being 20-50x
+    // slower than real mIRC despite having only a handful of statements per frame. m_varsDirty still gets set
+    // immediately by StoreVar()/UnsetMatching() the moment a variable changes, so nothing here is incorrect --
+    // it's just debounced: the periodic ~300-500ms UI timer tick (CMainFrame::OnTimer's fallback branch) now
+    // calls FlushVars() once per tick, and OnClose() calls it once more on exit so nothing is lost even if the
+    // app is closed between ticks. ApplyVarsText() (the Scripts Editor's Variables tab) still flushes
+    // immediately too, since that's a rare, human-paced action, not a per-frame one.
     void FlushVars() { if (m_varsDirty) { m_varsDirty = false; SaveVars(); } }
     CString PrimaryVarsFilePath() { return m_cachedVarsPath.IsEmpty() ? IniPath(L"vars.ini") : m_cachedVarsPath; }   // set by RebuildFromRFiles' own scan; falls back to the conventional default name if no vars file is registered yet
     void LoadVars() {   // m_vars is populated by RebuildFromRFiles (called from LoadRemote, which always runs first at startup) -- this just guards LoadVars() being called on its own, with m_rfiles not loaded yet
@@ -7748,7 +7984,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name.IsEmpty()) { ListVars(w); return; }
         if (name[0] != L'%') { Show(w, L"* /set: variable names start with %  (e.g. /set %test 1)", cPart); return; }
         CString v; if (!FinalValue(w, L"set", arg, sw, v)) return;
-        StoreVar(name, v, sw, false); FlushVars();
+        StoreVar(name, v, sw, false);   // PERF: no eager FlushVars() here -- see note at FlushVars()'s definition
     }
     void CmdVar(CChatWnd* w, CString arg) {   // /var %x = hello, %y, %z = $me   (local to this script run)
         VarSw sw; if (!ParseVarSw(w, L"var", arg, sw, L"snzeglkipu")) return;
@@ -7762,16 +7998,15 @@ class CMainFrame : public CMDIFrameWnd {
             // "%x" with nothing after it at all means "declare it empty".
             if (tail.Left(1) == L"=") { if (!FinalValue(w, L"var", StripOneLeadingSpace(tail.Mid(1)), sw, val)) return; }
             else if (!tail.IsEmpty()) { if (!FinalValue(w, L"var", tail, sw, val)) return; }
-            StoreVar(name, val, sw, true);
+            StoreVar(name, val, sw, true);   // PERF: no eager FlushVars() -- see note at FlushVars()'s definition
         }
-        FlushVars();
     }
     void CmdUnset(CChatWnd* w, CString arg) {
         VarSw sw; if (!ParseVarSw(w, L"unset", arg, sw, L"sgl")) return;
         bool g = sw.g || !sw.l, l = sw.l || !sw.g;   // neither switch: both scopes; -g: global only; -l: local only
         int pos = 0;
         for (CString n = arg.Tokenize(L" ", pos); !n.IsEmpty(); n = arg.Tokenize(L" ", pos)) UnsetMatching(n, g, l);
-        FlushVars();
+        // PERF: no eager FlushVars() -- see note at FlushVars()'s definition
     }
     void CmdIncDec(CChatWnd* w, const CString& cmd, CString arg, int sign) {
         VarSw sw; if (!ParseVarSw(w, cmd, arg, sw, L"cszeu")) return;
@@ -7783,7 +8018,15 @@ class CMainFrame : public CMDIFrameWnd {
         VarSw st = sw; st.k = true;   // an existing -uN timer keeps running through /inc and /dec unless a new -uN replaces it
         VarEntry* e = StoreVar(name, FmtNum(cur + sign * amt), st, false);
         if (e && sw.c) { e->step = sign * amt; e->nextStep = GetTickCount64() + 1000; }   // -c: keep stepping once a second
-        FlushVars();
+        // PERF: no eager FlushVars() here -- /inc and /dec are the hottest variable-write path in any per-frame
+        // script loop (mariolike.mrc alone does ~15-20 of these per game tick on global %game./%player./%collision.*
+        // vars), and FlushVars() -> SaveVars() does synchronous WritePrivateProfileStringW disk I/O that rewrites
+        // the ENTIRE m_vars table from scratch -- O(total global var count) real file I/O, once per call. That
+        // was costing tens of milliseconds per /inc once enough script globals existed, which is why the sections
+        // of engine_RenderPlayers that write the most global vars (phys/coll/key/tail) were each disproportionately
+        // slow regardless of their statement count. The dirty flag (m_varsDirty) is still set by StoreVar(), so
+        // nothing is lost -- it's just no longer flushed to disk on every single write. See FlushVars()'s own
+        // comment for where the deferred flush actually happens now.
     }
     // Shared engine behind /hinc and /hdec -- same shape as /hadd (table/item lookup, -m[N] creates the table if
     // missing), except this adjusts the item's existing numeric value instead of replacing it outright. A
@@ -7812,17 +8055,17 @@ class CMainFrame : public CMDIFrameWnd {
             HashTableEntry nt; nt.name = tname; nt.size = makeSize; m_hashTables.push_back(nt); t = &m_hashTables.back();
         }
         double cur = 0;
-        auto it = std::find_if(t->items.begin(), t->items.end(), [&](const std::pair<CString, CString>& kv) { return kv.first.CompareNoCase(item) == 0; });
-        if (it != t->items.end()) ParseNum(it->second, cur);
+        auto* kv = t->Find(item);
+        if (kv) ParseNum(kv->second, cur);
         CString newVal = FmtNum(cur + sign * amt);
-        if (it != t->items.end()) it->second = newVal; else t->items.push_back({ item, newVal });
+        t->Set(item, newVal);
         if (showMsg) Show(w, L"* /" + cmd + L": " + tname + L"." + item + L" = " + newVal, cPart);
     }
     void CmdAssign(CChatWnd* w, const CString& name, CString arg) {   // "%x = 5 + 1"  (arg starts at the '=')
         arg.TrimLeft();
         if (arg.Left(1) != L"=") { Show(w, L"* Expected:  " + name + L" = value", cPart); return; }
         VarSw sw; CString v; if (!FinalValue(w, L"set", StripOneLeadingSpace(arg.Mid(1)), sw, v)) return;
-        StoreVar(name, v, sw, false); FlushVars();
+        StoreVar(name, v, sw, false);   // PERF: no eager FlushVars() -- "%x = value" is as hot as /set in script code; see note at FlushVars()'s definition
     }
 
     // Shared engine behind $nick and its four deprecated, narrower variants ($nhnick/$nopnick/$nvnick/$rnick --
@@ -7932,12 +8175,28 @@ class CMainFrame : public CMDIFrameWnd {
             if (N < 1 || N > (int)lines.size()) { val.Empty(); return true; }
             val = lines[N - 1]; return true;
         }
-        if (name == L"inrect") {   // $inrect(x1,y1,x2,y2) -- whether the current window's last known mouse position (see $mouse.x/$mouse.y) falls within the given rectangle
+        if (name == L"inrect") {
+            // $inrect(x1,y1,x,y,w,h) -- whether the point (x1,y1) falls within the rectangle whose top-left corner
+            // is (x,y) and whose size is w by h. Real mIRC's own documented signature (confirmed via WikiChip's
+            // identifier reference) takes the test point AND the rectangle explicitly -- six args total, with the
+            // rectangle given as a corner plus a WIDTH/HEIGHT, never a second corner, and there is no implicit-
+            // current-mouse-position shorthand at all. The previous implementation here invented a 4-arg
+            // "(x1,y1,x2,y2), tested against $mouse.x/$mouse.y implicitly" signature instead, which was simply
+            // wrong. mariolike.mrc's map editor calls this as $inrect($mouse.x,$mouse.y,%edit.tool.x,%edit.tool.y,
+            // $calc(16*%edit.tool.w),$calc(16*%edit.tool.h)) -- six args, matching the real signature. Against the
+            // old 4-arg code, those six args got silently read as if they WERE (x1,y1,x2,y2) -- i.e. the mouse
+            // position itself became one "corner" and the palette's top-left became the other, with the actual
+            // width/height args discarded entirely -- a rectangle that always contains its own corner, so the
+            // check was unconditionally $true no matter where the mouse actually was. That made every click
+            // anywhere on the map get treated as a tool-palette click (editor_isMouseInEditor always true), so
+            // clicking "block" to place it instead ran the tile-picker formula against the click's actual (large)
+            // map coordinates, almost always landing outside the palette's real tile range and returning 0 --
+            // which the script displays as "Tool : Eraser" -- instead of ever reaching the actual place-tile code.
             std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
-            if (p.size() < 4) return false;
-            double x1, y1, x2, y2; if (!ParseNum(p[0], x1) || !ParseNum(p[1], y1) || !ParseNum(p[2], x2) || !ParseNum(p[3], y2)) return false;
-            int mx = w ? w->m_mouseX : 0, my = w ? w->m_mouseY : 0;
-            bool inside = mx >= (std::min)(x1, x2) && mx <= (std::max)(x1, x2) && my >= (std::min)(y1, y2) && my <= (std::max)(y1, y2);
+            if (p.size() < 6) return false;
+            double px, py, rx, ry, rw, rh;
+            if (!ParseNum(p[0], px) || !ParseNum(p[1], py) || !ParseNum(p[2], rx) || !ParseNum(p[3], ry) || !ParseNum(p[4], rw) || !ParseNum(p[5], rh)) return false;
+            bool inside = px >= rx && px <= rx + rw && py >= ry && py <= ry + rh;
             val = inside ? L"$true" : L"$false";
             return true;
         }
@@ -8722,6 +8981,30 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"pi") { val = FmtNum(3.14159265358979323846); return true; }
         // $mircexe/$mircdir/$mircini/$script/$scriptdir are bare (no-parens) identifiers in real mIRC, so they
         // belong in IdentValue, not here -- see the ones right next to $ircdir/$ircexe/$ircini there.
+        //
+        // $feof/$ferr, however, are DIFFERENT: real mIRC documents both as callable either bare ("$feof") or with
+        // a handle argument ("$feof(obj)", as MarioMSL's own engine_LoadObjectsFile does on every single line of
+        // objects.txt -- "while (!$feof(obj) && %ok)"). The bare form is still handled in IdentValue (right next
+        // to $ircdir etc.), for when a script calls them with no parens at all -- but IdentValue is only reached
+        // AFTER this FuncValue dispatch has been given first refusal, and ONLY when hasArgs is false OR FuncValue
+        // returns false for a hasArgs==true call; when hasArgs is true and FuncValue doesn't claim the name,
+        // EvalIds's caller falls back to IdentValue but POINTEDLY DOES NOT advance past the closing ')' (endIdx is
+        // rewound to right before the opening paren) -- that's the correct, intentional behavior for a genuinely
+        // argument-less identifier like $me, where "(foo)" after it is just unrelated literal text, but it was
+        // silently applied to $feof(obj)/$ferr(obj) too, which DOES support that argument in real mIRC. The
+        // result: "$feof(obj)" evaluated to "0" via IdentValue's bare $feof, but the "(obj)" immediately after
+        // was left completely unconsumed, literal text -- so the whole expression came out as "0(obj)", a
+        // non-empty string that is NOT literally "0", which an enclosing bare "if (!$feof(obj) && ...)" (no
+        // comparison operator, just truthiness) reads as non-zero/true -- negated by the leading "!" to FALSE,
+        // every single time, regardless of the file's real EOF state. That's what made
+        // engine_LoadObjectsFile's own line-reading while loop run exactly zero iterations on every file no
+        // matter its contents: the loop condition itself was permanently false from its very first check, despite
+        // $fopen succeeding and the handle existing. Explicitly handling the with-parens form here (still global,
+        // last-operation state, matching the bare form and real mIRC's own documented behavior -- the argument is
+        // evaluated, for side effects/consistency, but intentionally not used to select a specific handle's own
+        // state) lets EvalIds's normal hasArgs-success path advance endIdx past the ')' correctly.
+        if (name == L"feof") { EvalIds(w, rawArgs, params); val = m_lastFileEof ? L"1" : L"0"; return true; }
+        if (name == L"ferr") { EvalIds(w, rawArgs, params); val = m_lastFileErr ? L"1" : L"0"; return true; }
         if (name == L"fopen") {   // $fopen(name/N)[.fname/.pos/.eof/.err] -- .bom (encoding detection) isn't implemented; .eof/.err report the same last-global-operation state as the bare $feof/$ferr, not anything specific to this one handle
             CString a = EvalIds(w, rawArgs, params);
             FileHandleEntry* h = nullptr; double nD;
@@ -8859,14 +9142,15 @@ class CMainFrame : public CMDIFrameWnd {
                 val = t->items[N - 1].first; return true;
             }
             if (!thirdArg.IsEmpty() && thirdArg.Left(1) == L"&") {
-                for (auto& kv : t->items) if (kv.first.CompareNoCase(second) == 0) {
+                auto* kv = t->Find(second);
+                if (kv) {
                     BinVarEntry* bv = GetOrMakeBinVar(thirdArg);
-                    bv->data.clear(); for (int i = 0; i < kv.second.GetLength(); i++) bv->data.push_back((BYTE)(kv.second[i] & 0xFF));
+                    bv->data.clear(); for (int i = 0; i < kv->second.GetLength(); i++) bv->data.push_back((BYTE)(kv->second[i] & 0xFF));
                     val = L"1"; return true;
                 }
                 val = L"0"; return true;
             }
-            for (auto& kv : t->items) if (kv.first.CompareNoCase(second) == 0) { val = kv.second; return true; }
+            { auto* kv = t->Find(second); if (kv) { val = kv->second; return true; } }
             val.Empty(); return true;
         }
         if (name == L"hfind") {   // $hfind(name,text,N[,type]) -- type: w=wildcard match (default), s=plain substring match; searches item NAMES; N=0 returns the match count, N>0 returns the Nth matching item's name
@@ -9573,6 +9857,14 @@ class CMainFrame : public CMDIFrameWnd {
         // ---- File and directory identifiers ----
         if (name == L"exists") { val = PathExistsFn(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
         if (name == L"isfile") { val = IsFilePathFn(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
+        if (name == L"pic") {   // $pic(filename)[.width/.height] -- an image file's pixel dimensions, read via GDI+ the same way /drawpic itself loads a picture. Only .width/.height are implemented (not mIRC's own .type/.colors/.id); empty for either property means the file couldn't be loaded as an image at all.
+            CString path = EvalIds(w, rawArgs, params);
+            Gdiplus::Bitmap bmp(path);
+            if (bmp.GetLastStatus() != Gdiplus::Ok) { val.Empty(); return true; }
+            if (prop == L"height") val.Format(L"%u", bmp.GetHeight());
+            else val.Format(L"%u", bmp.GetWidth());   // .width, or no property at all -- same default mIRC itself uses for a bare $pic(file)
+            return true;
+        }
         if (name == L"isdir") { val = IsDirPath(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
         if (name == L"nofile") { val = NoFilePart(EvalIds(w, rawArgs, params)); return true; }
         if (name == L"nopath") { val = NoPathPart(EvalIds(w, rawArgs, params)); return true; }
@@ -10695,8 +10987,28 @@ class CMainFrame : public CMDIFrameWnd {
         if (!w && FindAlias(name)) return false;   // no window to run a script in (the menu bar being built): leave it as typed
         if (AliasDef* ad = FindAlias(name)) {   // a user alias used as an identifier: $add(1,2) runs /add with $1=1 $2=2 and gives its "return" value
             if (OnRunStack(ad->name)) return false;
-            CString a = EvalIds(w, rawArgs, params), plist; int pos = 0;
-            for (CString piece = a.Tokenize(L",", pos); !piece.IsEmpty(); piece = a.Tokenize(L",", pos)) { piece.Trim(); plist += (plist.IsEmpty() ? CString() : CString(L" ")) + piece; }
+            // BUGFIX: this used to evaluate rawArgs as ONE blob first (CString a = EvalIds(w, rawArgs, params))
+            // and only THEN split that already-evaluated string by comma to build $1/$2/... -- so a call with a
+            // single top-level argument (by the RAW, pre-evaluation comma count) whose evaluated VALUE happened
+            // to contain a comma got mis-split into extra params. Concretely: $myalias($obj_get(anim,id).k0)
+            // has exactly one raw argument (the comma inside "anim,id" is already closed by $obj_get's own
+            // parens), but if that property evaluates to "mario.tile(24,10)", the OLD code split THAT text on
+            // its comma too, handing the alias $1="mario.tile(24" and $2="10)" instead of $1="mario.tile(24,10)"
+            // -- exactly the "Y always computes as 0" symptom traced through mariolike.mrc's
+            // engine_parseTileCache (every nested-argument call losing its row value), while a hardcoded
+            // literal of the same text (no nested evaluation involved) worked fine. The correct split point is
+            // the RAW argument list's OWN top-level commas (paren-depth aware, same helper every other
+            // identifier's argument list above already uses), not the text that comes out of evaluating it.
+            // Manual non-Tokenize handling of each piece is preserved for the same reason as before: an empty
+            // piece between two commas must still occupy a token (see kEmptyParamSentinel's own comment).
+            CString plist;
+            if (!rawArgs.IsEmpty()) {
+                for (auto& raw : SplitTopLevelCommasParen(rawArgs)) {
+                    CString piece = EvalIds(w, raw, params);
+                    piece.Trim(); if (piece.IsEmpty()) piece = kEmptyParamSentinel;
+                    plist += (plist.IsEmpty() ? CString() : CString(L" ")) + piece;
+                }
+            }
             m_result.Empty();
             RunAlias(w, *ad, plist, prop);
             val = m_result; return true;
@@ -10730,6 +11042,7 @@ class CMainFrame : public CMDIFrameWnd {
             // that sentinel is ever meant to turn back into a real space -- every other $N/$N-/$parms read of
             // `params` goes through this same slice() lambda, so putting the decode here covers all of them.
             if (s.Find(kTokenizeSpace) >= 0) s.Replace(kTokenizeSpace, L' ');
+            if (s.Find(kEmptyParamSentinel) >= 0) s.Remove(kEmptyParamSentinel);   // see kEmptyParamSentinel's own comment -- a placeholder for a genuinely empty argument, removed (not replaced with a space) so it reads back as truly empty
             return s;
         };
         CString out; int L = in.GetLength(); bool hashPending = false;
@@ -10760,6 +11073,27 @@ class CMainFrame : public CMDIFrameWnd {
                     // ("echo %nick: welcome!" must still mean %nick followed by literal ": welcome!", not a lookup for
                     // a variable actually named "nick:").
                     if (k < L && in[k] == L':' && k + 1 < L && (iswalnum(in[k + 1]) || in[k + 1] == L'_')) { k += 2; continue; }
+                    // '[...]' is likewise just ordinary text inside an mIRC variable name -- scripts routinely build
+                    // pseudo-arrays this way (MarioMSL's own %keypress[83], %keydown[39], %edit.selx and friends;
+                    // Tetris-style code does the same with %nX[N] grid cells), always via "set $+(%,name,[,%key,])"
+                    // or equivalent concatenation so that by the time a plain "%keypress[83]" is READ back here,
+                    // it's already concrete literal text naming one specific flat variable -- there is no separate
+                    // "array" concept to evaluate inside the brackets. Without this, the name-scan stopped dead at
+                    // '[' (it was never in the allowed set below, unlike '.', '-', '+' and ':', which got exactly
+                    // this same fix for exactly this same reason), so "%keypress[83]" expanded to %keypress's own
+                    // (almost always empty, since nothing ever sets the bare %keypress itself) value followed by
+                    // the literal trailing text "[83]" -- and a non-empty string is always truthy in an if(), so
+                    // "if (%keypress[83])" silently evaluated to "if ([83])": unconditionally true on EVERY tick,
+                    // with no actual 'S' keypress involved at all. That's what was really behind the Save-As dialog
+                    // popping immediately on a brand new map -- and, far more broadly, every bracket-indexed
+                    // %keydown[N]/%keypress[N] check throughout this script's whole movement/jump/crouch/edit-tool
+                    // system was reading the same way, firing every single frame regardless of actual key state.
+                    if (k < L && in[k] == L'[') {
+                        int depth = 1, k2 = k + 1;
+                        while (k2 < L && depth > 0) { if (in[k2] == L'[') depth++; else if (in[k2] == L']') depth--; k2++; }
+                        if (depth == 0) { k = k2; continue; }   // matched '[...]' -- part of the name; keep scanning after it for a further '.'/'-'/'+'/':'/'[' segment
+                        break;   // unmatched '[' with no closing ']' anywhere in the rest of the text -- leave it as literal trailing text rather than guessing
+                    }
                     break;
                 }
                 out += GetVar(in.Mid(i, k - i)); i = k - 1; continue;
@@ -10808,13 +11142,36 @@ class CMainFrame : public CMDIFrameWnd {
                 // (Tetris's whole collision-check loop walks $3/$4/$5.../$10 this way, via a %x it increments) -- without
                 // this, "$(" was left as literal, inert text (nothing earlier matches '(' right after '$'), which fed
                 // garbage non-numeric strings into the rest of that loop's arithmetic and comparisons.
+                // real mIRC's $(text,N) -- a SEPARATE trailing-comma form from the leading-comma indirect-access
+                // trick just below: "evaluate text, then evaluate the result N-1 more times" (identical in effect
+                // to $eval(text,N), just mIRC's older/shorter syntax for the same thing). Found by scanning for the
+                // LAST top-level comma (same paren-depth-0 rule any other multi-arg split here uses) and checking
+                // that everything after it is a plain integer -- so a comma that's actually inside a nested call,
+                // like $gettok($3-,1,59)'s own argument commas, is correctly NOT mistaken for this trailing ",N".
+                // Without this, MarioMSL's objects.txt/.obj parser -- which reads every single property via exactly
+                // this idiom, "$($gettok($3-,1,59),2)" -- got back the literal text "<value>,2" for every property
+                // (tile_w, tile_h, starting_map, ...) instead of the real value, corrupting $calc() calls built on
+                // them into inert unevaluated text and leaving $obj_FindByProp's starting-map lookup unable to ever
+                // match, looping forever until the script watchdog finally killed it -- exactly why nothing ever
+                // appeared to happen: the game window never got past engine_Init.
                 int depth = 1, m = j + 1;
                 for (; m < L; m++) { if (in[m] == L'(') depth++; else if (in[m] == L')') { if (--depth == 0) break; } }
                 if (m < L) {
                     CString inner = in.Mid(j + 1, m - j - 1);
-                    CString pass1 = EvalIds(w, inner, params, evalVars);
-                    if (pass1.Left(1) == L',') val = EvalIds(w, pass1.Mid(1), params, evalVars);   // the leading-comma marker: double-evaluate (indirect access)
-                    else val = pass1;   // no marker: a plain grouping, already fully evaluated by the one pass above
+                    int lastComma = -1, d2 = 0;
+                    for (int p = 0; p < inner.GetLength(); p++) { wchar_t c = inner[p]; if (c == L'(') d2++; else if (c == L')') d2--; else if (c == L',' && d2 == 0) lastComma = p; }
+                    CString nTail = (lastComma >= 0) ? inner.Mid(lastComma + 1) : CString(); nTail.Trim();
+                    bool trailingN = lastComma > 0 && !nTail.IsEmpty() && IsAllDigits(nTail);
+                    if (trailingN) {
+                        CString head = inner.Left(lastComma);
+                        int N = _wtoi(nTail);
+                        val = EvalIds(w, head, params, evalVars);
+                        for (int rep = 1; rep < N && rep < 20; ++rep) val = EvalIds(w, val, params, evalVars);   // same cap as $eval's own extra-pass loop
+                    } else {
+                        CString pass1 = EvalIds(w, inner, params, evalVars);
+                        if (pass1.Left(1) == L',') val = EvalIds(w, pass1.Mid(1), params, evalVars);   // the leading-comma marker: double-evaluate (indirect access)
+                        else val = pass1;   // no marker: a plain grouping, already fully evaluated by the one pass above
+                    }
                     ok = true; endIdx = m + 1;
                 }
             }
@@ -10832,6 +11189,18 @@ class CMainFrame : public CMDIFrameWnd {
                 }
                 ok = true; endIdx = k;
             }
+            else if (in[j] == L'*' && !dbl) {   // $* -- "all parameters from $1 on", evaluated in THIS call's own scope -- same text as $1-, just under
+                // its other spelling. Real mIRC scripts routinely forward their own params on to a dynamically-
+                // named alias call this way: MarioMSL's "obj_ForEach" does exactly "%cmd $*" (tokenize sets $1.. to
+                // the enumerated object ids, then %cmd -- e.g. engine_RenderPlayers -- gets called with $* standing
+                // in for "whatever those are"). $* was never implemented here AT ALL -- not a digit, not alpha, it
+                // matched no branch in this whole identifier dispatch and fell through to the generic "unknown
+                // identifier left as literal text" case, so "%cmd $*" ran the callee with the single literal
+                // argument text "$*" (not evaluated) as $1 instead of the real id -- which is exactly why
+                // engine_RenderPlayers's own $1 (id) came back as the literal string "$*", never a real cp object
+                // id, and so never looked up or drew the player sprite at all, every single frame.
+                val = slice(1, -1); ok = true; endIdx = j + 1;
+            }
             else if (iswdigit(in[j])) {   // $0  $N  $N-  $N-M
                 int a = 0; while (j < L && iswdigit(in[j])) { if (a < 100000) a = a * 10 + (in[j] - L'0'); j++; }
                 if (a == 0) val.Format(L"%d", (int)ts.size());
@@ -10844,7 +11213,17 @@ class CMainFrame : public CMDIFrameWnd {
                 ok = true; endIdx = j;
             }
             else if (iswalpha(in[j])) {   // named identifier or function; matching is case-insensitive ($ME == $me)
-                int k = j; while (k < L && iswalnum(in[k])) k++;
+                // iswalnum alone excludes '_', which is an entirely ordinary character in a real mIRC alias name
+                // (game_IsRunning, engine_Init, obj_get, phys_InitConst, ... -- MarioMSL alone defines dozens of
+                // these). The %variable scanner elsewhere in this same function already explicitly allows '_' for
+                // exactly this reason; this one didn't, so the scan stopped at the first underscore and "name"
+                // came out as just the leading fragment ("game" instead of "game_IsRunning") -- which then never
+                // matches any built-in identifier OR any alias name via FindAlias, silently leaving the WHOLE
+                // original "$game_IsRunning()" text completely unevaluated (not even partially substituted) rather
+                // than erroring, so a condition built on it reads as permanently non-empty/true with no sign
+                // anything is wrong. Confirmed live: $game_IsRunning() came back as literal unevaluated text even
+                // standing completely alone with nothing else on the call stack, immediately after a fresh restart.
+                int k = j; while (k < L && (iswalnum(in[k]) || in[k] == L'_')) k++;
                 // A custom alias's own name may itself contain colons ("Tetris:Check" is the standard mIRC way to
                 // namespace a private helper alias), and calling such an alias AS AN IDENTIFIER ($Tetris:Check(...),
                 // to use its /return value in an expression) is just as valid as calling a colon-free one. The
@@ -10860,9 +11239,9 @@ class CMainFrame : public CMDIFrameWnd {
                 // "(" -- so an ordinary "$nick: hello" (colon as plain punctuation right after a short bare
                 // identifier, no parens following) is completely unaffected and still ends the name at "nick"
                 // exactly as before.
-                if (k < L && in[k] == L':' && k + 1 < L && iswalnum(in[k + 1])) {
+                if (k < L && in[k] == L':' && k + 1 < L && (iswalnum(in[k + 1]) || in[k + 1] == L'_')) {
                     int k2 = k;
-                    while (k2 < L && in[k2] == L':' && k2 + 1 < L && iswalnum(in[k2 + 1])) { k2++; while (k2 < L && iswalnum(in[k2])) k2++; }
+                    while (k2 < L && in[k2] == L':' && k2 + 1 < L && (iswalnum(in[k2 + 1]) || in[k2 + 1] == L'_')) { k2++; while (k2 < L && (iswalnum(in[k2]) || in[k2] == L'_')) k2++; }
                     if (k2 < L && in[k2] == L'(') k = k2;
                 }
                 // Same deal, but for a DOT-separated alias name ("pe.grid", "pe.checksize", ...) called as an
@@ -10882,7 +11261,7 @@ class CMainFrame : public CMDIFrameWnd {
                 // unaffected and still splits at the first dot exactly as before.
                 if (k < L && in[k] == L'.' && k + 1 < L && iswalpha(in[k + 1])) {
                     int k2 = k;
-                    while (k2 < L && in[k2] == L'.' && k2 + 1 < L && iswalpha(in[k2 + 1])) { k2++; while (k2 < L && iswalnum(in[k2])) k2++; }
+                    while (k2 < L && in[k2] == L'.' && k2 + 1 < L && iswalpha(in[k2 + 1])) { k2++; while (k2 < L && (iswalnum(in[k2]) || in[k2] == L'_')) k2++; }
                     if (k2 < L && in[k2] == L'(') k = k2;
                 }
                 CString name = in.Mid(j, k - j); name.MakeLower();
@@ -10907,7 +11286,13 @@ class CMainFrame : public CMDIFrameWnd {
                 // parentheses at all, e.g. $inwave.fname.
                 CString prop; int afterProp = afterArgs;
                 if (afterArgs + 1 < L && in[afterArgs] == L'.' && iswalpha(in[afterArgs + 1])) {
-                    int pe = afterArgs + 1; while (pe < L && iswalnum(in[pe])) pe++;
+                    // Same '_' gap as the identifier-name scan above (see its comment) -- a property name with an
+                    // underscore in it (.tile_w, .tile_h, both real MarioMSL properties) used to stop the scan
+                    // right at the underscore, leaving "_w"/"_h" as unconsumed literal text tacked onto the END of
+                    // the evaluated result instead of being part of the property name at all -- e.g.
+                    // "$obj_get(game,1).tile_w" silently printing as the literal text "_w" instead of running
+                    // obj_get with prop="tile_w" and printing its real width value.
+                    int pe = afterArgs + 1; while (pe < L && (iswalnum(in[pe]) || in[pe] == L'_')) pe++;
                     prop = in.Mid(afterArgs + 1, pe - afterArgs - 1); prop.MakeLower(); afterProp = pe;
                 }
                 if (hasArgs && FuncValue(w, name, args, prop, params, val)) { done = true; endIdx = afterProp; }
@@ -10930,6 +11315,28 @@ class CMainFrame : public CMDIFrameWnd {
                     // same empty list with nothing real to match -- "tools are missing, can't draw".
                     CString dotted = name + L"." + prop;
                     if (AliasDef* ad2 = FindAlias(dotted)) {
+                        if (!OnRunStack(ad2->name)) {
+                            m_result.Empty();
+                            RunAlias(w, *ad2, CString());
+                            val = m_result; done = true; endIdx = afterProp;
+                        }
+                    }
+                }
+                // A bare (no "()" at all, no dot) call to a user-defined, zero-argument alias -- e.g. MarioMSL's
+                // own "alias -l keyval2 { return $asc($upper($chr($keyval))) }", called exactly like the real
+                // built-in $keyval is, with no parens: "var %key = $keyval2". The dotted-bare case just above
+                // (name + "." + prop) already reaches FindAlias for a bare call with a dot in it ($pe.tools); a
+                // FLAT bare name never did -- it fell straight through to the "progressively shorter prefix"
+                // fallback directly below (meant for an unrelated built-in butted up against trailing literal
+                // text, e.g. $scriptdirTetris.bmp), which happily matched the built-in "$keyval" as a 6-character
+                // PREFIX of "keyval2" and left the trailing "2" as unconsumed literal text tacked onto the output
+                // -- so every single "$keyval2" call silently evaluated to "71" + "2" = "712" (for key code 71)
+                // instead of ever running the alias at all, corrupting the %keypress[...]/%keydown[...] array
+                // index used for every key the script tracks (and, by the same mechanism, any other script's own
+                // bare, parens-less, no-dot alias whose name happens to start with some built-in identifier's
+                // name). Must run BEFORE that shortening fallback, so the exact full name gets first claim.
+                if (!done && !hasArgs && prop.IsEmpty()) {
+                    if (AliasDef* ad2 = FindAlias(name)) {
                         if (!OnRunStack(ad2->name)) {
                             m_result.Empty();
                             RunAlias(w, *ad2, CString());
@@ -10972,6 +11379,24 @@ class CMainFrame : public CMDIFrameWnd {
         if (lc == L"set" || lc == L"inc" || lc == L"dec") {
             CString head = cmd; switches(head);
             CString name = Word(rest);
+            // The destination-name token is deliberately left UNEVALUATED above when it's already a literal
+            // "%name" -- evaluating that would substitute the variable's CURRENT value in place of its own name
+            // (see this function's own top comment). But a script just as routinely builds the name itself with a
+            // $-identifier expression instead of writing it literally -- MarioMSL's entire key-state tracking is
+            // "set $+(%,keypress[,%key,]) 1" / "set $+(%,keydown[,%key,]) 1", the standard mIRC idiom for a
+            // pseudo-array (%keypress[71], %keydown[39], ...) where the index isn't known until runtime. A bare
+            // "%name" token and a "$+(...)"-built one look identical by the time they reach here (both just
+            // Word(rest)), but only the first should skip evaluation; the second must be evaluated to actually
+            // compute the real "%keypress[71]" text, or CmdSet receives the literal, un-evaluated string
+            // "$+(%,keypress[,%key,])" verbatim -- which doesn't start with '%', so CmdSet rejects it outright
+            // with "* /set: variable names start with %", and (since this runs from an "on KEYDOWN" event against
+            // a custom @window already switched into picture-canvas mode) that error lands in the invisible,
+            // hidden text-log buffer behind the canvas rather than anywhere a user or even -s/-a tracing would
+            // ever see it. The upshot: %keypress[N]/%keydown[N] silently NEVER got written at all, for any key,
+            // ever -- not a wrong value, no value whatsoever -- while every single %keypress[...]/%keydown[...]
+            // check elsewhere in the whole script read permanently empty/false no matter what was actually
+            // pressed, which is exactly why G (and every other single-press action) looked like it did nothing.
+            if (name.Left(1) == L"$") name = EvalIds(w, name, params);
             return head + (name.IsEmpty() ? CString() : L" " + name) + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params));
         }
         if (lc == L"unset") return cmd + (rest.IsEmpty() ? CString() : L" " + EvalIds(w, rest, params, false));
@@ -11017,9 +11442,8 @@ class CMainFrame : public CMDIFrameWnd {
                     CString evaluated = EvalIds(w, tail, params);
                     if (!FinalValue(w, L"var", evaluated, sw, val)) return L"var";
                 }
-                StoreVar(name, val, sw, true);
+                StoreVar(name, val, sw, true);   // PERF: no eager FlushVars() -- "var %x = ..." is one of the single hottest lines in any script loop; see note at FlushVars()'s definition
             }
-            FlushVars();
             return L"var";   // the real work already happened above; this just reaches CmdVar with nothing left to do, harmlessly
         }
         if (!lc.IsEmpty() && lc[0] == L'%') {   // "%x = 5 + 1" / "%x=5+1": the name stays as typed, the value is evaluated -- but only when this is actually an assignment (an "=" genuinely present somewhere). A bare "%var" with nothing else on the line is a different, common mIRC idiom instead -- "expand this variable and run whatever command its value holds" (e.g. "if (%todo != $null) { %todo }") -- and needs the same full, normal expansion as any other line, not this assignment-only special case, or it reaches Dispatch() still completely unexpanded and trips its own "%" assignment check there too, producing a spurious "Expected: ... = value" error instead of ever running the intended command.
@@ -11056,7 +11480,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     bool OnRunStack(const CString& name) { for (size_t i = 0; i < m_runStack.size(); i++) if (m_runStack[i].CompareNoCase(name) == 0) return true; return false; }
     void SetAlias(const CString& name, const std::vector<CString>& lines) {
-        if (AliasDef* a = FindAlias(name)) a->lines = lines;
+        if (AliasDef* a = FindAlias(name)) { a->lines = lines; a->cachedNodes.reset(); }   // reset: this alias's OLD parsed tree no longer matches its new body (see AliasDef::cachedNodes)
         else { AliasDef n; n.name = name; n.lines = lines; m_aliases.push_back(n); }
     }
     std::vector<CString> AliasLines() {   // the file / editor text
@@ -11271,7 +11695,7 @@ class CMainFrame : public CMDIFrameWnd {
         // handles both forms (and a bare comparison like "!%x == 1") correctly rather than duplicating any of its
         // own comparison/truthiness logic here.
         if (s.Left(1) == L"!" && !rest.IsEmpty()) return !EvalCond(w, rest, params);
-        static const wchar_t* symOps[] = { L"===", L"==", L"!=", L"<=", L">=", L"<", L">" };
+        static const wchar_t* symOps[] = { L"===", L"==", L"!=", L"<=", L">=", L"<", L">", L"&", L"|" };   // "&"/"|" -- real mIRC's own bitwise-flag-test operators, directly usable in an "if (...)" condition (the standard idiom for testing a single bit out of a flags/bitmask value, e.g. "if ($mouse.key & 1)" for "is the left mouse button currently held"). A bare "&&"/"||" (logical AND/OR, chaining two whole sub-conditions) is already split off above by FindTop() before this loop ever runs, so a lone "&"/"|" reaching here is unambiguously the bitwise form.
         static const wchar_t* wordOps[] = { L"isnum", L"isincs", L"isin", L"iswmcs", L"iswm", L"ischan" };
         int pos = -1, len = 0; CString op; int d = 0;
         for (int i = 0; i < s.GetLength() && pos < 0; i++) {
@@ -11339,6 +11763,19 @@ class CMainFrame : public CMDIFrameWnd {
         else if (op == L"isnum") {
             double a = 0; r = ParseNum(lv, a);
             if (r && !rv.IsEmpty()) { int dash = rv.Find(L'-', 1); double lo = 0, hi = 0; if (dash > 0 && ParseNum(rv.Left(dash), lo) && ParseNum(rv.Mid(dash + 1), hi)) r = a >= lo && a <= hi; }
+        }
+        else if (op == L"&" || op == L"|") {
+            // Bitwise flag test: "if (<flags> & <bit>)" / "if (<flags> | <bit>)" -- this operator was missing
+            // from symOps entirely, so a condition like "if ($mouse.key & 1)" never reached any of these
+            // branches at all; it fell all the way down to the "no operator" case below, which just checks
+            // whether the WHOLE literal string "$mouse.key & 1" is non-empty -- which it always is, regardless
+            // of whatever $mouse.key actually evaluates to. That's what made mariolike.mrc's map editor paint a
+            // tile on every single mouse MOVE over the map instead of only while the left button was actually
+            // held down: its drag-to-paint check is exactly this "if ($mouse.key & 1)" idiom.
+            double a = 0, b = 0;
+            if (!lv.IsEmpty()) ParseNum(lv, a); if (!rv.IsEmpty()) ParseNum(rv, b);
+            long la = (long)a, lb = (long)b;
+            r = (op == L"&") ? ((la & lb) != 0) : ((la | lb) != 0);
         }
         else if (op == L"isin") { CString a = lv, b = rv; a.MakeLower(); b.MakeLower(); r = b.Find(a) >= 0; }
         else if (op == L"isincs") r = rv.Find(lv) >= 0;
@@ -11416,19 +11853,33 @@ class CMainFrame : public CMDIFrameWnd {
         __except ((code = GetExceptionCode()), (addr = GetExceptionInformation()->ExceptionRecord->ExceptionAddress), EXCEPTION_EXECUTE_HANDLER) {
             if (outCode) *outCode = code;
             if (outAddr) *outAddr = addr;
+            // A stack overflow (0xC00000FD) consumes the thread's guard page as part of how Windows detects it in
+            // the first place -- that guard page is a ONE-SHOT mechanism, so unless it's explicitly restored here,
+            // every subsequent call that gets anywhere near the stack limit on this same thread no longer trips
+            // the proper STATUS_STACK_OVERFLOW detection at all; it just raises a bare access violation instead
+            // (same crash address, over and over), because the one mechanism that would have told Windows "this is
+            // a stack limit, not a wild pointer" is gone. That is exactly the pattern MarioMSL's objects.txt load
+            // produced: the very first $obj_count(...) call (a user alias invoked as a $identifier(args), which
+            // recurses EvalIds -> RunAlias -> RunScript -> this very function, several real stack frames per
+            // level) overflowed legitimately once (0xC00000FD), and then -- without this reset -- every following
+            // call anywhere near that same depth kept faulting as a plain 0xC0000005 at the same address, unable
+            // to recover, for the rest of the process's life (not just this one script run). _resetstkoflw()
+            // (the documented MSVC CRT counterpart to this exact situation) re-arms the guard page so the next
+            // deep call is detected properly again instead of immediately re-faulting.
+            if (code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
             return C_HALT;
         }
     }
     int ExecNodes(const std::vector<SNode>& nodes, size_t start, ExecCtx& ctx) {
         for (size_t i = start; i < nodes.size(); i++) {
             if (m_halt) return C_HALT;
-            if (++m_steps > 200000 || GetTickCount64() - m_scriptStart > 4000) { Show(ctx.w, WatchdogMsg(), cPart); m_halt = true; return C_HALT; }
+            if (++m_steps > 3000000 || GetTickCount64() - m_scriptStart > 20000) { Show(ctx.w, WatchdogMsg(), cPart); m_halt = true; return C_HALT; }   // see this cap's own note where it's set for why it's this high -- 200000/4000ms used to be the budget, but that's well within reach of a perfectly finite script that just does real work (or a deliberate busy-wait delay loop, like Draw!'s "var %t 1 | while (%t <= 1000) { inc %t }" used ~700 times while animating a circle -- each /inc is its own step here, so that alone is >700000 steps) long before anything is actually hung
             const SNode& n = nodes[i]; int r = C_NEXT;
             if (n.kind == 0) r = ExecCmd(ctx, n.text);
             else if (n.kind == 1) { if (EvalCond(ctx.w, n.text, *ctx.params)) r = ExecNodes(n.a, 0, ctx); else if (!n.b.empty()) r = ExecNodes(n.b, 0, ctx); }
             else if (n.kind == 2) {
                 while (!m_halt && EvalCond(ctx.w, n.text, *ctx.params)) {
-                    if (++m_steps > 200000 || GetTickCount64() - m_scriptStart > 4000) { Show(ctx.w, WatchdogMsg(), cPart); m_halt = true; return C_HALT; }
+                    if (++m_steps > 3000000 || GetTickCount64() - m_scriptStart > 20000) { Show(ctx.w, WatchdogMsg(), cPart); m_halt = true; return C_HALT; }
                     int rr = ExecNodes(n.a, 0, ctx);
                     if (rr == C_BREAK) break;
                     if (rr == C_CONTINUE || rr == C_NEXT) continue;
@@ -11445,7 +11896,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         return C_NEXT;
     }
-    void RunScript(CChatWnd* w, const std::vector<CString>& lines, const CString& params) {
+    void RunScript(CChatWnd* w, const std::vector<CString>& lines, const CString& params, const std::vector<SNode>* precomputedNodes = nullptr) {   // precomputedNodes: RunAlias's already-tokenized+parsed cache for this exact `lines` body (see AliasDef::cachedNodes) -- every OTHER caller (a /timer firing, an event handler, a popup click, ...) leaves this null and pays the normal parse cost below, same as always
         // The watchdog budget (m_steps/m_scriptStart) only gets reset at a handful of call sites that wrap
         // RunScript -- RunPopupLines, ShowContextPopup, and the plain-input-line runner -- each gated on
         // m_depth==0 so a NESTED call (an alias calling another alias) keeps sharing one total budget instead of
@@ -11460,8 +11911,9 @@ class CMainFrame : public CMDIFrameWnd {
         // since m_depth is already incremented past 0 by the time they reach this point.
         if (m_depth == 0) { m_halt = false; m_steps = 0; m_scriptStart = GetTickCount64(); for (auto& v : m_vhist) v.Empty(); }
         ScopeGuard scope(this, true);   // its own variable scope: /var locals vanish when the script ends
-        std::vector<CString> toks = ScriptTokens(lines);
-        size_t pos = 0; std::vector<SNode> nodes = ParseNodes(toks, pos, false);
+        std::vector<SNode> parsedHere;
+        if (!precomputedNodes) { std::vector<CString> toks = ScriptTokens(lines); size_t pos = 0; parsedHere = ParseNodes(toks, pos, false); }
+        const std::vector<SNode>& nodes = precomputedNodes ? *precomputedNodes : parsedHere;
         CString localParams = params;   // a local, mutable copy -- /tokenize (via m_curCtx) replaces this for the rest of this run, which is why it's not just a pointer into the caller's const& argument
         ExecCtx ctx; ctx.w = w; ctx.params = &localParams;
         // Every script run -- a timer firing, an incoming-event handler, a menu click, an alias call -- funnels
@@ -11481,26 +11933,67 @@ class CMainFrame : public CMDIFrameWnd {
         // so it stops BEFORE unwinding back through RunAlias's own manual (non-RAII) m_depth--/m_runStack.pop_back()
         // cleanup, which would otherwise be skipped by a throw and leave that bookkeeping corrupted for every
         // script run after this one; ScopeGuard above is RAII and unwinds safely either way, but RunAlias's isn't.
+        // Snapshotted so every catch below can restore m_runStack/m_depth to exactly how they looked when THIS
+        // RunScript call was entered, undoing whatever nested RunAlias push_back()s a throw skipped the matching
+        // pop_back() for. Without this, a single caught exception/access-violation anywhere inside a deeply nested
+        // alias call permanently leaves that alias's name sitting on m_runStack -- OnRunStack(name) then returns
+        // true for it forever (for the rest of the process's life, surviving even a script reload, since this is
+        // runtime state, not file content), which silently breaks every future "$thatAlias(...)" identifier call
+        // (the alias-as-identifier guard at EvalIds's "if (OnRunStack(ad->name)) return false;" leaves it
+        // unevaluated, as literal text, rather than erroring -- so the symptom is a condition that always takes
+        // the same branch, with no error message at all, not a crash). Confirmed exactly this happening to
+        // MarioMSL's $game_IsRunning() after some earlier, unrelated caught exception during this same long
+        // session: $hget(edig) alone evaluated fine, but $game_IsRunning() came back as literal unevaluated text.
+        // Restoring to the saved size/depth (not clearing outright) matters because RunScript can itself be
+        // nested -- an on-event handler's RunScript call happening while an outer timer's RunScript call is still
+        // on the stack, say -- so this must undo only what THIS call could have added, not every legitimate outer
+        // frame still above it.
+        size_t savedStackSize = m_runStack.size(); int savedDepth = m_depth;
         try {
             DWORD sehCode = 0; void* sehAddr = nullptr;
             int rr = ExecNodesSEH(nodes, 0, ctx, &sehCode, &sehAddr);   // SEH wrapper, not a direct ExecNodes call -- see ExecNodesSEH's own comment: this is what actually catches an access violation, which a plain catch(...) below cannot
             if (sehCode) {
                 CString d; d.Format(L"* [script-exception] SEH 0x%08X at address 0x%p (an access violation or similar inside a command this script ran)", sehCode, sehAddr);
                 Show(w, d, cPart);
+                if (m_runStack.size() > savedStackSize) { m_runStack.resize(savedStackSize); m_aliasFileStack.resize(savedStackSize); }
+                m_depth = savedDepth;
             } else if (rr == C_GOTO) Show(w, L"* Label not found: " + ctx.gotoLabel, cPart);
         } catch (CException* e) {
             wchar_t buf[512]; e->GetErrorMessage(buf, 512); e->Delete();
             Show(w, CString(L"* [script-exception] MFC: ") + buf, cPart);
+            if (m_runStack.size() > savedStackSize) { m_runStack.resize(savedStackSize); m_aliasFileStack.resize(savedStackSize); }
+            m_depth = savedDepth;
         } catch (const std::exception& e) {
             CStringA msgA(e.what()); CString msg(msgA);
             Show(w, L"* [script-exception] std: " + msg, cPart);
+            if (m_runStack.size() > savedStackSize) { m_runStack.resize(savedStackSize); m_aliasFileStack.resize(savedStackSize); }
+            m_depth = savedDepth;
         } catch (...) {
             Show(w, L"* [script-exception] unknown exception type", cPart);
+            if (m_runStack.size() > savedStackSize) { m_runStack.resize(savedStackSize); m_aliasFileStack.resize(savedStackSize); }
+            m_depth = savedDepth;
         }
     }
     void RunAlias(CChatWnd* w, AliasDef ad, CString params, CString prop = CString()) {   // by value: the body may redefine aliases while it runs
-        if (m_runStack.size() >= 24) { Show(w, L"* Aliases nested too deeply (/" + ad.name + L")", cPart); m_halt = true; return; }
-        CString savedProp = m_prop; m_prop = prop; m_runStack.push_back(ad.name);
+        // 24 was real mIRC's own long-documented nesting cap, but it assumes "nesting" means explicit alias-calls-
+        // alias chains written by hand -- it was never meant to also count every implicit level that THIS engine's
+        // property-access sugar adds underneath a script's back. A single "$obj_get(type,id).prop" here is itself
+        // obj_get calling into hget-wrapping helpers, and MarioMSL's own render path chains several of those
+        // together per frame (engine_GameLoop -> engine_UpdateAndRender -> ... -> $obj_get(...).xxx, repeated per
+        // object) -- genuinely finite, non-buggy script logic that still walks past 24 real C++-level RunAlias
+        // frames once every property read's own internal hop is counted. That's exactly why engine_JumpToMap's
+        // tile-fill loop (200 flat iterations, no deep chains) sailed through fine while the very next thing to
+        // run -- a single game-loop tick's rendering pass -- tripped this immediately: "Aliases nested too deeply
+        // (/obj_ReadFirst)" wasn't a runaway recursion, it was this cap firing on ordinary per-frame work. And
+        // because m_halt doesn't stop the .timered loop itself (only the one tick that hit it), the NEXT tick hits
+        // the exact same cap again a frame later -- which is what was presenting as an endless stream of failures
+        // (and, downstream, the repeated Save-As popups) rather than a single clean error. The thread stack was
+        // already widened to 8MB (see the /STACK pragma near the top of this file) specifically because this
+        // engine's property-access sugar needs more real call depth than a hand-written script alone would -- this
+        // cap needs to grow to match that, not stay pinned to a limit sized for nesting as mIRC scripts actually
+        // write it.
+        if (m_runStack.size() >= 500) { Show(w, L"* Aliases nested too deeply (/" + ad.name + L")", cPart); m_halt = true; return; }
+        CString savedProp = m_prop; m_prop = prop; m_runStack.push_back(ad.name); m_aliasFileStack.push_back(ad.sourceFile);
         // m_depth++/-- here (not just at the handful of outer wrapper call sites) is what makes RunScript's own
         // m_depth==0 watchdog-reset check mean "truly top-level", for every path an alias can be reached from --
         // including a /timer firing or an incoming-event handler calling an alias directly, neither of which goes
@@ -11509,10 +12002,31 @@ class CMainFrame : public CMDIFrameWnd {
         // top-level and get its own fresh watchdog budget instead of sharing one total budget across the whole
         // chain -- not dangerous by itself, just a looser cap than intended for exactly the callers that used to
         // trip the watchdog falsely (see RunScript's own comment).
+        // Reuse (or build once) this alias's tokenized+parsed node tree instead of paying ScriptTokens()+
+        // ParseNodes()'s full text-scanning cost on every single call -- see AliasDef::cachedNodes. This has to
+        // be built/read on the MASTER AliasDef (found by name in m_aliases/m_remoteAliases/m_extraAliases), not
+        // on `ad` itself: `ad` is just the caller's byval snapshot of that master taken at find-time, almost
+        // always from BEFORE the cache was ever populated, so writing to ad.cachedNodes here would do the parse
+        // work and then throw it away the moment this call returns, never actually saving anything. A script
+        // like mariolike.mrc's game loop calls into dozens of aliases (engine_UpdateAndRender, obj_get's own
+        // hget-wrapping helpers, ...) many times every single frame, each previously re-parsing its entire body
+        // from raw text on every one of those calls -- by far the single largest cost found chasing this game's
+        // "game loop takes hundreds of ms, sometimes multiple SECONDS, per tick" slowdown, dwarfing the earlier
+        // SetTimer-interval, GetPixel/SetPixel, and hash-table-lookup fixes made along the way.
+        std::shared_ptr<std::vector<SNode>> nodes;
+        if (AliasDef* master = FindAlias(ad.name)) {
+            if (!master->cachedNodes) {
+                std::vector<CString> toks = ScriptTokens(master->lines);
+                size_t pos = 0;
+                master->cachedNodes = std::make_shared<std::vector<SNode>>(ParseNodes(toks, pos, false));
+            }
+            nodes = master->cachedNodes;
+        }
         m_depth++;
-        RunScript(w, ad.lines, params);
+        if (nodes) RunScript(w, ad.lines, params, nodes.get());
+        else RunScript(w, ad.lines, params);   // alias wasn't found under its own name (renamed/removed mid-call, or a synthetic AliasDef with no backing entry) -- fall back to parsing ad.lines directly, same as before this cache existed
         m_depth--;
-        m_runStack.pop_back(); m_prop = savedProp;
+        m_runStack.pop_back(); m_aliasFileStack.pop_back(); m_prop = savedProp;
     }
 
     // ---- popup menus: popups.ini  ([mpopup] status  [cpopup] channel  [qpopup] query  [lpopup] nick list  [bpopup] menu bar) ----
@@ -11767,6 +12281,8 @@ class CMainFrame : public CMDIFrameWnd {
     void RebuildFromRFiles() {
         m_remoteRaw = m_rfiles.empty() ? std::vector<CString>() : ReadScriptFileLines(m_rfiles[0]);   // the editor's own view: just the primary file
         m_remoteMerged.clear(); m_usersRaw.clear(); m_vars.clear(); m_cachedVarsPath.Empty(); m_cachedUsersPath.Empty(); m_remoteMenus.clear(); m_dialogTables.clear();
+        std::vector<RemoteEvent> allEvents;   // parsed per-file (not from the merged m_remoteMerged below) so each event can be tagged with the one script file it actually came from -- see RemoteEvent::sourceFile
+        std::vector<AliasDef> allAliases;   // same per-file treatment, same reason -- see AliasDef::sourceFile
         for (auto& path : m_rfiles) {
             if (HasIniSection(path, L"variables")) {
                 if (m_cachedVarsPath.IsEmpty()) m_cachedVarsPath = path;   // first one found wins, matching PrimaryVarsFilePath's old scan order
@@ -11787,12 +12303,23 @@ class CMainFrame : public CMDIFrameWnd {
                 m_dialogTables.insert(m_dialogTables.end(), fileDialogs.begin(), fileDialogs.end());
                 auto lines = StripForeignBlocks(rawLines);   // drop menu/dialog block bodies before anything else can misread a line inside one as top-level script content
                 m_remoteMerged.insert(m_remoteMerged.end(), lines.begin(), lines.end());
+                auto fileEvents = ParseRemoteEvents(lines, path);
+                allEvents.insert(allEvents.end(), fileEvents.begin(), fileEvents.end());
+                // Same cross-file "last definition of this name wins" rule ParseAliases itself applies WITHIN one
+                // file's worth of text -- replicated by hand here across files, since each file is now parsed on
+                // its own (to get a correct per-alias sourceFile) rather than as one merged blob.
+                auto fileAliases = ParseAliases(lines, path);
+                for (auto& ad : fileAliases) {
+                    bool replaced = false;
+                    for (auto& e : allAliases) if (e.name.CompareNoCase(ad.name) == 0) { e = ad; replaced = true; break; }
+                    if (!replaced) allAliases.push_back(ad);
+                }
             }
         }
-        m_events = ParseRemoteEvents(m_remoteMerged);
+        m_events = allEvents;
         m_rawEvents = ParseRawEvents(m_remoteMerged);
         m_ctcpEvents = ParseCtcpEvents(m_remoteMerged);
-        m_remoteAliases = ParseAliases(m_remoteMerged);   // "alias name { ... }" blocks written directly in a Remote script
+        m_remoteAliases = allAliases;   // "alias name { ... }" blocks written directly in a Remote script
         m_dialogEvents = ParseDialogEvents(m_remoteMerged);
         m_levelEntries = ParseLevelEntries(m_usersRaw);
         SyncGroupDeclarationsFrom(m_remoteMerged);
@@ -11862,9 +12389,10 @@ class CMainFrame : public CMDIFrameWnd {
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
-    // CLOSE/KEYDOWN: matched by window name/wildcard against the where-spec, same comma-list rule as JOIN/PART (see
-    // MatchesWhereSpec) but with no nick/address/IAL concept at all -- these are custom-window events, not IRC ones.
-    // KEYDOWN's params is the key code as text (also mirrored into $keyval via m_lastKeyVal); CLOSE's is empty.
+    // CLOSE/KEYDOWN/KEYUP: matched by window name/wildcard against the where-spec, same comma-list rule as JOIN/PART
+    // (see MatchesWhereSpec) but with no nick/address/IAL concept at all -- these are custom-window events, not IRC
+    // ones. KEYDOWN/KEYUP's params is the key code as text (also mirrored into $keyval via m_lastKeyVal); CLOSE's
+    // is empty.
     bool FireWindowEvent(CChatWnd* w, const CString& eventName, const CString& winName, const CString& params) {
         if (!m_remoteOn || !m_eventsOn) return false;
         m_evHaltDef = false;
@@ -11875,7 +12403,7 @@ class CMainFrame : public CMDIFrameWnd {
                 if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
                 if (!IsGroupEnabled(ev.groupName)) continue;
                 if (!MatchesWhereSpec(ev.whereSpec, winName)) continue;
-                if (eventName == L"KEYDOWN" && !MatchesKeySpec(ev.keySpec, _wtoi(params))) continue;
+                if ((eventName == L"KEYDOWN" || eventName == L"KEYUP") && !MatchesKeySpec(ev.keySpec, _wtoi(params))) continue;
                 m_evChan = winName; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, params);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
@@ -12315,6 +12843,21 @@ class CMainFrame : public CMDIFrameWnd {
             RunScript(w, ev.lines, params);
         }
         m_evNick = savedNick; m_evAddress = savedAddr; m_evNewnick = savedNewnick; m_evName = savedName; m_evLevel = savedLevel;
+    }
+    // on LOAD / on UNLOAD -- real mIRC fires these with no match/where field and no $nick/$address/etc context, so
+    // this is simpler than FireSimpleEvent above: just run every matching handler's body. sourceFile empty fires
+    // every on LOAD/on UNLOAD handler across every currently-loaded script (used once at startup, matching real
+    // mIRC firing on LOAD for everything already in the Remote file list when mIRC itself starts); a specific path
+    // scopes it to just that one script's own handlers (used by /load -rs and /unload -rs), so loading or unloading
+    // one script doesn't also re-fire every OTHER already-loaded script's on LOAD handler.
+    void FireScriptLoadEvent(CChatWnd* w, const CString& eventName, const CString& sourceFile) {
+        if (!m_remoteOn || !m_eventsOn || !w) return;
+        for (auto& ev : m_events) {
+            if (ev.eventName != eventName) continue;
+            if (!sourceFile.IsEmpty() && ev.sourceFile.CompareNoCase(sourceFile) != 0) continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            RunScript(w, ev.lines, CString());
+        }
     }
     // ---- Scripts Editor: the Popups tab shows all five popups.ini sections as one text block, bracketed headers
     // marking where each one starts, same idea as the [Status Window] etc. shown in the real mIRC editor ----
@@ -13314,9 +13857,7 @@ class CMainFrame : public CMDIFrameWnd {
                     if (srcbv) for (BYTE b : srcbv->data) packed += (wchar_t)b;
                     data = packed;
                 }
-                bool found = false;
-                for (auto& kv : t->items) if (kv.first.CompareNoCase(item) == 0) { kv.second = data; found = true; break; }
-                if (!found) t->items.push_back({ item, data });
+                t->Set(item, data);
             }
         }
         else if (cmd == L"hdel") {   // /hdel [-sw] <name> <item> -- -w treats <item> as a wildcard, deleting every matching item in that table
@@ -13329,27 +13870,25 @@ class CMainFrame : public CMDIFrameWnd {
             else if (wild) {
                 int removed = 0;
                 t->items.erase(std::remove_if(t->items.begin(), t->items.end(), [&](const std::pair<CString, CString>& kv) { if (GlobMatch(item, kv.first)) { ++removed; return true; } return false; }), t->items.end());
+                t->RebuildIndex();
                 if (showMsg) Show(w, L"* /hdel: removed " + CString(std::to_wstring(removed).c_str()) + L" item(s)", cPart);
             } else {
-                auto it = std::find_if(t->items.begin(), t->items.end(), [&](const std::pair<CString, CString>& kv) { return kv.first.CompareNoCase(item) == 0; });
-                if (it != t->items.end()) { t->items.erase(it); if (showMsg) Show(w, L"* /hdel: removed item '" + item + L"'", cPart); }
+                if (t->Erase(item) && showMsg) Show(w, L"* /hdel: removed item '" + item + L"'", cPart);
                 // deleting a non-existent single item (no -w) is quietly a no-op in real mIRC too, unlike a missing table
             }
         }
         else if (cmd == L"hinc") CmdHashIncDec(w, cmd, arg, 1);
         else if (cmd == L"hdec") CmdHashIncDec(w, cmd, arg, -1);
-        else if (cmd == L"hsave") {   // /hsave [-nsa] <name> <filename> -- plain-text format only (name line + data line per item, or -n for values-only); see this loop's own comment for what's skipped
-            CString a = arg; bool showMsg = false, namesOnly = false, append = false;
+        else if (cmd == L"hsave") {   // /hsave [-bnsa] <name> <filename> -- -b/-B writes real mIRC binary format (length-prefixed records); otherwise the plain text format (name line + data line per item, or -n for values-only)
+            CString a = arg; bool showMsg = false, namesOnly = false, append = false, binary = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) {
                 CString sw = Word(a); sw.MakeLower();
                 if (sw.Find(L's') >= 0) showMsg = true;
                 if (sw.Find(L'n') >= 0) namesOnly = true;
                 if (sw.Find(L'a') >= 0) append = true;
-                // -b/-B (binary -- no binary-variable subsystem exists in this client), -i (INI section format),
-                // -u (include items with a scheduled unset -- no such scheduling exists here, so every item is
-                // always "included" already) are all accepted-but-ignored: this always writes the same plain
-                // default text format (or -n's values-only form), so /hload reading it back with THIS client
-                // works regardless of which of those switches was given to /hsave.
+                if (sw.Find(L'b') >= 0) binary = true;
+                // -i (INI section format), -u (include items with a scheduled unset -- no such scheduling exists
+                // here, so every item is always "included" already) are still accepted-but-ignored.
             }
             CString tname = Word(a);
             CString fname = a; fname.Trim();
@@ -13359,18 +13898,49 @@ class CMainFrame : public CMDIFrameWnd {
             if (!t) { Show(w, L"* /hsave: table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
             try {
                 CStdioFile f;
-                if (!f.Open(fname, CFile::modeCreate | CFile::modeWrite | (append ? CFile::modeNoTruncate : 0))) {
+                // BUGFIX (text branch only): this used to open without CFile::typeBinary, i.e. in the CRT's
+                // default TEXT mode, while still writing an explicit "\r\n" (2 raw bytes) per line below. In text
+                // mode, the CRT itself translates any '\n' byte into "\r\n" on write -- so the explicit '\n' in
+                // that literal got retranslated too, turning one intended "\r\n" into "\r" + "\r\n" = "\r\r\n"
+                // actually written to disk. /hload (opened in text mode too, correctly, since IT never writes a
+                // raw "\r\n" itself) could only undo ONE of those two \r's when reading it back, leaving a stray
+                // trailing '\r' silently stuck onto the end of every single line -- both key names and values --
+                // loaded from any file /hsave ever wrote. Opening in binary mode here stops the CRT from
+                // touching the bytes at all, so the explicit "\r\n" this code already writes lands on disk
+                // exactly as given -- a normal single "\r\n" per line, which /hload's own text-mode read already
+                // strips correctly. (Always safe to open binary here regardless of -b, since this branch writes
+                // its own explicit line terminators either way.)
+                if (!f.Open(fname, CFile::modeCreate | CFile::modeWrite | CFile::typeBinary | (append ? CFile::modeNoTruncate : 0))) {
                     Show(w, L"* /hsave: unable to open '" + fname + L"'", cPart); return;
                 }
                 if (append) f.SeekToEnd();
-                for (auto& kv : t->items) {
-                    if (!namesOnly) { CStringA n8 = CW2A(kv.first, CP_UTF8); f.Write(n8.GetString(), n8.GetLength()); f.Write("\r\n", 2); }
-                    CStringA d8 = CW2A(kv.second, CP_UTF8); f.Write(d8.GetString(), d8.GetLength()); f.Write("\r\n", 2);
+                if (binary) {
+                    // Real mIRC's own binary hash-table format: each item is [uint16 LE name length][name
+                    // bytes][uint16 LE value length][value bytes], back to back, no other framing -- confirmed by
+                    // inspecting a file mIRC itself saved (e.g. "\x0E\x00@tilemap.39.sw\x0D\x00256 288 32 32..."):
+                    // 0x0E=14 matches "@tilemap.39.sw"'s length, 0x0D=13 matches "256 288 32 32"'s length. With
+                    // -n (names only, no binary-variable subsystem's "unset" tracking needed here) only the value
+                    // length+bytes are written per item, matching mIRC's own -n behavior.
+                    auto writeLP = [&](const CString& s) {
+                        CStringA s8 = CW2A(s, CP_UTF8);
+                        WORD len = (WORD)s8.GetLength();
+                        f.Write(&len, 2);
+                        if (len) f.Write(s8.GetString(), len);
+                    };
+                    for (auto& kv : t->items) {
+                        if (!namesOnly) writeLP(kv.first);
+                        writeLP(kv.second);
+                    }
+                } else {
+                    for (auto& kv : t->items) {
+                        if (!namesOnly) { CStringA n8 = CW2A(kv.first, CP_UTF8); f.Write(n8.GetString(), n8.GetLength()); f.Write("\r\n", 2); }
+                        CStringA d8 = CW2A(kv.second, CP_UTF8); f.Write(d8.GetString(), d8.GetLength()); f.Write("\r\n", 2);
+                    }
                 }
                 if (showMsg) Show(w, L"* /hsave: saved hash table '" + tname + L"' to '" + fname + L"'", cInfo);
             } catch (CFileException* fe) { fe->Delete(); Show(w, L"* /hsave: write error on '" + fname + L"'", cPart); }
         }
-        else if (cmd == L"hload") {   // /hload [-snm[N]] <name> <filename> -- plain-text format only; see /hsave's own comment for what's skipped (-b/-B/-i all fall back to the same default text format, so a file this client itself /hsave'd always loads correctly here regardless of the switch originally given)
+        else if (cmd == L"hload") {   // /hload [-snm[N]] <name> <filename> -- the -b/-B switch is accepted but not what decides the parse: see the content-sniffing comment below for why.
             CString a = arg; bool showMsg = false, namesOnly = false, makeIfMissing = false; int makeSize = 100;
             while (a.Left(1) == L"-" && a.GetLength() > 1) {
                 CString sw = Word(a); sw.MakeLower();
@@ -13388,28 +13958,92 @@ class CMainFrame : public CMDIFrameWnd {
                 if (!makeIfMissing) { Show(w, L"* /hload: table '" + tname + L"' doesn't exist", cPart); m_halt = true; return; }
                 HashTableEntry nt; nt.name = tname; nt.size = makeSize; m_hashTables.push_back(nt); t = &m_hashTables.back();
             }
-            CStdioFile f;
-            if (!f.Open(fname, CFile::modeRead)) { Show(w, L"* /hload: unable to open '" + fname + L"'", cPart); m_halt = true; return; }
-            CString line;
             // Loading into a table that already has items replaces the value of any item whose name matches a
             // loaded item and leaves everything else alone -- matching real mIRC's own documented behavior --
             // rather than clearing the table first.
-            if (namesOnly) {   // -n: every line is a value only; items are named with sequential integers starting at 1
-                int seq = 1;
-                while (f.ReadString(line)) {
-                    CString itemName; itemName.Format(L"%d", seq++);
-                    bool found = false;
-                    for (auto& kv : t->items) if (kv.first.CompareNoCase(itemName) == 0) { kv.second = line; found = true; break; }
-                    if (!found) t->items.push_back({ itemName, line });
+            //
+            // Format is decided by SNIFFING the file's actual bytes, not by whether -b was passed. The reason:
+            // scripts (including mariolike.mrc's own engine_SaveMap/engine_LoadMap) tend to pass -b unconditionally
+            // on every call, regardless of what format the target file actually turns out to be in -- e.g. a file
+            // that was saved back when this client's /hsave -b still silently wrote plain text, before binary
+            // support existed. Real binary records are 16-bit length-prefixed, so any name/value under 256 bytes
+            // (effectively all of them) writes a 0x00 high byte into the file -- a NUL that can never appear in a
+            // legitimate text save, since both this client's own text format and real mIRC's text format are
+            // newline-delimited readable text with no embedded NULs. So: read a prefix of the file and treat it as
+            // binary if a NUL byte turns up anywhere in it, regardless of the switch. This keeps loading correct
+            // for all three cases that matter here: a file real mIRC itself saved as binary (e.g. lotsofanim.obj),
+            // a file this client saved with its own now-working /hsave -b, and this client's older text-format
+            // saves (test.obj/test2.obj/test3.obj) that must keep loading as text even though -b is still passed.
+            bool binaryFmt = false;
+            {
+                CFile sniff;
+                if (sniff.Open(fname, CFile::modeRead)) {
+                    BYTE buf[4096];
+                    UINT n = sniff.Read(buf, sizeof(buf));
+                    for (UINT i = 0; i < n; i++) { if (buf[i] == 0) { binaryFmt = true; break; } }
+                    sniff.Close();
                 }
-            } else {   // default: each item is two lines -- its name, then its data
-                CString name; bool haveName = false;
-                while (f.ReadString(line)) {
-                    if (!haveName) { name = line; haveName = true; continue; }
-                    bool found = false;
-                    for (auto& kv : t->items) if (kv.first.CompareNoCase(name) == 0) { kv.second = line; found = true; break; }
-                    if (!found) t->items.push_back({ name, line });
-                    haveName = false;
+            }
+            if (binaryFmt) {
+                // Real mIRC's own binary hash-table format (confirmed by inspecting a file mIRC itself saved):
+                // each item is [uint16 LE name length][name bytes][uint16 LE value length][value bytes], back to
+                // back, no other framing -- see /hsave's own comment for the exact byte evidence. This client's
+                // own /hsave -b now writes this same format, so a round trip through this client works too, but
+                // this branch exists specifically so a file saved by REAL mIRC (which this client could never
+                // read before -- every /hload used to fall back to the plain-text format regardless of switch)
+                // loads correctly here for the first time.
+                CFile f;
+                if (!f.Open(fname, CFile::modeRead)) { Show(w, L"* /hload: unable to open '" + fname + L"'", cPart); m_halt = true; return; }
+                ULONGLONG total = f.GetLength();
+                ULONGLONG pos = 0;
+                int seq = 1;
+                auto readLP = [&](CString& out) -> bool {
+                    if (pos + 2 > total) return false;
+                    WORD len = 0;
+                    if (f.Read(&len, 2) != 2) return false;
+                    pos += 2;
+                    std::string buf; buf.resize(len);
+                    if (len) { if (f.Read(&buf[0], len) != (UINT)len) return false; pos += len; }
+                    out = CA2W(buf.c_str(), CP_UTF8);
+                    return true;
+                };
+                while (pos < total) {
+                    if (namesOnly) {   // -n: every record is a value only; items are named with sequential integers starting at 1
+                        CString val;
+                        if (!readLP(val)) break;
+                        CString itemName; itemName.Format(L"%d", seq++);
+                        t->Set(itemName, val);
+                    } else {   // default: each item is a name record followed by a value record
+                        CString name, val;
+                        if (!readLP(name)) break;
+                        if (!readLP(val)) break;
+                        t->Set(name, val);
+                    }
+                }
+            } else {
+                CStdioFile f;
+                if (!f.Open(fname, CFile::modeRead)) { Show(w, L"* /hload: unable to open '" + fname + L"'", cPart); m_halt = true; return; }
+                CString line;
+                // BUGFIX: every file /hsave ever wrote before its own typeBinary fix has a stray trailing '\r'
+                // baked onto the end of each line (see /hsave's comment for the double-CRLF-translation cause).
+                // Strip one here if present so files saved by the old, buggy /hsave still load correctly --
+                // harmless no-op on a file saved by the fixed /hsave, since those never have a trailing '\r' on
+                // a ReadString'd line.
+                if (namesOnly) {   // -n: every line is a value only; items are named with sequential integers starting at 1
+                    int seq = 1;
+                    while (f.ReadString(line)) {
+                        if (!line.IsEmpty() && line.Right(1) == L"\r") line = line.Left(line.GetLength() - 1);
+                        CString itemName; itemName.Format(L"%d", seq++);
+                        t->Set(itemName, line);
+                    }
+                } else {   // default: each item is two lines -- its name, then its data
+                    CString name; bool haveName = false;
+                    while (f.ReadString(line)) {
+                        if (!line.IsEmpty() && line.Right(1) == L"\r") line = line.Left(line.GetLength() - 1);
+                        if (!haveName) { name = line; haveName = true; continue; }
+                        t->Set(name, line);
+                        haveName = false;
+                    }
                 }
             }
             if (showMsg) Show(w, L"* Loaded hash table '" + tname + L"' from '" + fname + L"'", cInfo);
@@ -13680,6 +14314,14 @@ class CMainFrame : public CMDIFrameWnd {
             CFile f; if (f.Open(file, (clearFirst ? CFile::modeCreate : (CFile::modeCreate | CFile::modeNoTruncate)) | CFile::modeWrite)) {
                 f.SeekToEnd(); CString line = text + (noCrlf ? CString() : CString(L"\r\n")); CStringA a8(line); f.Write(a8.GetString(), a8.GetLength());
             }
+            // CFile::Open's failure (bad path, no permission, relative path resolving somewhere unexpected -- this
+            // runs with the process's current working directory, not necessarily the script's folder, for any
+            // filename that isn't itself absolute) used to be completely silent: no line written, no error shown,
+            // nothing -- a script relying on /write for logging (or real mIRC scripts that use it for persistent
+            // data) would look like it simply never executed, with no way to tell a failed write apart from one
+            // that just never ran at all. Mirrors every other failure path in this file, which all tell the user
+            // something went wrong rather than failing invisibly.
+            else { Show(w, L"* /write: unable to open file: " + file, cPart); }
         }
         else if (cmd == L"dcc") {
             CString a = arg; CString sub = Word(a); sub.MakeLower();
@@ -13914,7 +14556,7 @@ class CMainFrame : public CMDIFrameWnd {
             }
             return;
         }
-        else if (cmd == L"load" || cmd == L"reload") {   // /reload is documented to skip on start/load triggers -- this client has no such events to skip, so both behave identically here
+        else if (cmd == L"load" || cmd == L"reload") {   // /reload is documented to skip on LOAD (see the -rs branch below, which only fires it for plain /load)
             CString a = arg; a.TrimLeft();
             if (a.Left(1) != L"-") { Show(w, L"* Usage: /" + cmd + L" <-aN|-pscqnm|-ruvsN> <filename>", cPart); return; }
             CString sw = Word(a); sw.MakeLower();
@@ -13954,13 +14596,15 @@ class CMainFrame : public CMDIFrameWnd {
                 int posN = 0; CString numPart = sw.Mid(3); if (!numPart.IsEmpty() && IsAllDigits(numPart)) posN = _wtoi(numPart);
                 InsertIntoFileList(m_rfiles, path, posN); SaveFileList(L"rfiles", m_rfiles); LoadRemote();
                 Show(w, L"* Loaded script file: " + path, cInfo);
+                if (cmd == L"load") FireScriptLoadEvent(w, L"LOAD", path);   // /reload is documented to skip on LOAD (that's the whole point of /reload over /load -rs) -- /load itself fires it, scoped to just the file that was loaded
                 return;
             }
             Show(w, L"* Usage: /" + cmd + L" <-aN|-pscqnm|-ruvsN> <filename>", cPart);
         }
-        else if (cmd == L"unload") {   // the -n switch (skip on unload trigger) is accepted but has nothing to actually skip -- this client has no on UNLOAD event
+        else if (cmd == L"unload") {   // the -n switch skips firing on UNLOAD for this call
             CString a = arg; a.TrimLeft();
-            if (a.Left(2).CompareNoCase(L"-n") == 0) { a = a.Mid(2); a.TrimLeft(); }
+            bool skipEvent = false;
+            if (a.Left(2).CompareNoCase(L"-n") == 0) { a = a.Mid(2); a.TrimLeft(); skipEvent = true; }
             if (a.Left(1) != L"-") { Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart); return; }
             CString sw = Word(a); sw.MakeLower();
             CString fname = a; fname.Trim();
@@ -13976,7 +14620,10 @@ class CMainFrame : public CMDIFrameWnd {
             if (sw == L"-rs") {
                 bool removed = false;
                 for (auto it = m_rfiles.begin(); it != m_rfiles.end(); ++it) if (it->CompareNoCase(path) == 0) { m_rfiles.erase(it); removed = true; break; }
-                if (removed) { SaveFileList(L"rfiles", m_rfiles); LoadRemote(); Show(w, L"* Unloaded: " + path, cInfo); }
+                if (removed) {
+                    if (!skipEvent) FireScriptLoadEvent(w, L"UNLOAD", path);   // must fire before LoadRemote() below, which re-parses m_events and drops this file's own handlers entirely
+                    SaveFileList(L"rfiles", m_rfiles); LoadRemote(); Show(w, L"* Unloaded: " + path, cInfo);
+                }
                 else Show(w, L"* Not currently loaded: " + path, cPart);
                 return;
             }
@@ -14469,6 +15116,7 @@ class CMainFrame : public CMDIFrameWnd {
     afx_msg void OnClose() {   // banks whatever's left of the current online-timer session before the app actually closes
         if (m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; }
         SaveOnlineTimer();
+        FlushVars();   // PERF: vars.ini writes are now debounced (see FlushVars()'s own note) -- make sure nothing from the last <500ms is lost on exit
         StopIdentd();
         CloseSoundChannel(m_waveChan); CloseSoundChannel(m_midiChan); CloseSoundChannel(m_mp3Chan);
         // "If you hold down the Shift key when you quit mIRC, the next time you run it, it will be minimized."
@@ -17469,8 +18117,8 @@ class CMainFrame : public CMDIFrameWnd {
             dstCw->ShowCanvas();
             int dx = _wtoi(Word(rest)), dy = _wtoi(Word(rest));
             CString t1 = Word(rest), t2 = Word(rest);
-            int dw = -1, dh = -1;
-            if (IsNumTok(t1) && IsNumTok(t2)) { dw = _wtoi(t1); dh = _wtoi(t2); }
+            int dw = -1, dh = -1; bool hasDwDh = false;
+            if (IsNumTok(t1) && IsNumTok(t2)) { dw = _wtoi(t1); dh = _wtoi(t2); hasDwDh = true; }
             if (srcW <= 0 || srcH <= 0) return;
             dstCw->GrowCanvasFor(dx + (dw > 0 ? dw : srcW), dy + (dh > 0 ? dh : srcH));
             CDC* sdc = srcCw->CanvasDC(); CDC* ddc = dstCw->CanvasDC();
@@ -17483,15 +18131,47 @@ class CMainFrame : public CMDIFrameWnd {
                 // preview shape on top of that, then "drawcopy -nt" it onto the real picture so only the shape's
                 // own pixels land -- without real key-skipping, that overlay's blank background (the key colour
                 // itself, a packed deep blue in this script) flooded over the whole picture on every mouse move.
-                int outW = (dw > 0) ? dw : srcW, outH = (dh > 0) ? dh : srcH;
-                for (int oy = 0; oy < outH; oy++) {
-                    int syy = sy + (srcH == outH ? oy : (oy * srcH) / outH);
-                    for (int ox = 0; ox < outW; ox++) {
-                        int sxx = sx + (srcW == outW ? ox : (ox * srcW) / outW);
-                        COLORREF c = sdc->GetPixel(sxx, syy);
-                        if (c == keyCol) continue;
-                        ddc->SetPixel(dx + ox, dy + oy, c);
+                //
+                // This used to be done with a manual GetPixel/SetPixel loop, correct but ruinously slow: GDI's
+                // per-pixel accessors each cost several microseconds of API/driver overhead, so a single 32x32
+                // sprite tile was ~2000 of those calls, and mariolike.mrc's game loop does this for every player
+                // sprite and every animated tile (coins, blocks, ...) on screen, every single frame. That's what
+                // was actually behind the game running at ~0.5 SECONDS per loop tick even after the separate
+                // 15ms SetTimer-interval fix -- the timer was firing fine, the frame body itself just took that
+                // long to execute. ::TransparentBlt does the exact same "copy, but skip pixels matching this key
+                // colour" semantics in one GDI call (handling any stretch itself too), so it's used here instead.
+                //
+                // One thing ::TransparentBlt does NOT support, unlike ::StretchBlt, is a negative width/height to
+                // mirror the image -- mariolike.mrc relies on exactly that for its "facing left" sprite flip
+                // (drawcopy's dw argument comes in as "$calc(0 - %w)", a negative width, whenever the player faces
+                // left). A plain "outW = (dw > 0) ? dw : srcW" silently discarded that sign and fell back to the
+                // positive srcW, so the sprite was still drawn, just never actually flipped -- the player always
+                // faced right on screen no matter which way they were actually moving/facing in the script's own
+                // state. Composite onto a small persistent scratch DC first (pre-seeded with whatever's already at
+                // the destination, so the sprite's transparent pixels still show the correct background underneath
+                // once mirrored), then flip THAT onto the real destination with ::StretchBlt, which does support a
+                // negative destination width/height for mirroring.
+                int outW = hasDwDh ? (dw < 0 ? -dw : dw) : srcW, outH = hasDwDh ? (dh < 0 ? -dh : dh) : srcH;   // avoids relying on <cstdlib>'s abs(int) just for this
+                bool flipX = hasDwDh && dw < 0, flipY = hasDwDh && dh < 0;
+                if (!flipX && !flipY) {
+                    ::TransparentBlt(ddc->GetSafeHdc(), dx, dy, outW, outH, sdc->GetSafeHdc(), sx, sy, srcW, srcH, keyCol);
+                } else {
+                    static HDC s_flipDC = nullptr; static HBITMAP s_flipBmp = nullptr, s_flipOldBmp = nullptr;
+                    static int s_flipW = 0, s_flipH = 0;
+                    if (!s_flipDC || outW > s_flipW || outH > s_flipH) {   // grow-only cache, same policy as CChatWnd::GrowCanvasFor -- avoids a Create/Delete pair every single flipped sprite draw (every frame, for every on-screen player) once the common tile size is reached
+                        if (s_flipDC) { ::SelectObject(s_flipDC, s_flipOldBmp); ::DeleteObject(s_flipBmp); ::DeleteDC(s_flipDC); }
+                        s_flipW = (std::max)(outW, s_flipW); s_flipH = (std::max)(outH, s_flipH);
+                        HDC scr = ::GetDC(nullptr);
+                        s_flipBmp = ::CreateCompatibleBitmap(scr, s_flipW, s_flipH);
+                        s_flipDC = ::CreateCompatibleDC(scr);
+                        ::ReleaseDC(nullptr, scr);
+                        s_flipOldBmp = (HBITMAP)::SelectObject(s_flipDC, s_flipBmp);
                     }
+                    ::BitBlt(s_flipDC, 0, 0, outW, outH, ddc->GetSafeHdc(), dx, dy, SRCCOPY);   // seed with the real destination's current pixels, so transparent source pixels still show the correct background once mirrored below
+                    ::TransparentBlt(s_flipDC, 0, 0, outW, outH, sdc->GetSafeHdc(), sx, sy, srcW, srcH, keyCol);
+                    int fx = flipX ? outW : 0, fw = flipX ? -outW : outW;
+                    int fy = flipY ? outH : 0, fh = flipY ? -outH : outH;
+                    ::StretchBlt(ddc->GetSafeHdc(), dx + fx, dy + fy, fw, fh, s_flipDC, 0, 0, outW, outH, SRCCOPY);
                 }
             }
             else if (dw > 0 && (dw != srcW || dh != srcH)) { ddc->SetStretchBltMode(HALFTONE); ddc->SetBrushOrg(0, 0); ddc->StretchBlt(dx, dy, dw, dh, sdc, sx, sy, srcW, srcH, SRCCOPY); }
@@ -17554,8 +18234,39 @@ class CMainFrame : public CMDIFrameWnd {
             if (!ok) Show(w, L"* /drawsave: couldn't save " + filename, cPart);
 #endif
         }
-        // /drawscroll, /drawreplace, /drawrotate etc. aren't implemented -- silently accepted rather than falling
-        // through to the raw-server catch-all (see the original comment this whole block replaced).
+        else if (cmd == L"drawscroll") {
+            // /drawscroll -n <@win> <dx> <dy> <x> <y> <w> <h> -- shifts the pixel content of the rectangle
+            // (x,y,w,h) within <win> by (dx,dy), leaving the newly-exposed strip at the trailing edge as
+            // whatever was already there (NOT blanked or filled) -- the caller is expected to repaint that
+            // strip itself afterward. This was entirely unimplemented before (silently a no-op, like the other
+            // less-common draw* commands this replaced a raw-server-send fallback for), which is a real problem
+            // for mariolike.mrc specifically: its map editor keeps only a small scrolling tile buffer (@edb0,
+            // just big enough to cover the visible window plus a 1-tile margin) rather than ever drawing the
+            // WHOLE map at once, and relies on /drawscroll to shift that buffer's existing pixel content every
+            // time the camera crosses a tile boundary (see cam_ScrollTo), immediately followed by a
+            // buffer_RedrawCol/buffer_RedrawRow call that repaints just the newly-exposed column/row of tiles.
+            // Without /drawscroll actually doing anything, the buffer's pixel content never moved to track the
+            // camera at all -- every tile already painted into it (including every block the player places in
+            // the map editor) stayed at its OLD fixed pixel position inside @edb0 forever, while the on-screen
+            // blit math (which samples @edb0 at an offset derived from the CURRENT camera position) kept
+            // assuming the buffer's content had shifted to match. The net visible effect was exactly "placed
+            // tiles drift along with the screen instead of staying put on the map" -- they weren't actually
+            // moving, the buffer just never scrolled out from under them the way the renderer assumed it had.
+            CString name = RunWord(a); CChatWnd* cw = FindDrawWin(name);
+            if (!cw) { Show(w, L"* /drawscroll: no such window: " + name, cPart); return; }
+            CString rest = a; rest.TrimLeft();
+            int dx = _wtoi(Word(rest)), dy = _wtoi(Word(rest));
+            int rx = _wtoi(Word(rest)), ry = _wtoi(Word(rest)), rw = _wtoi(Word(rest)), rh = _wtoi(Word(rest));
+            if (rw <= 0 || rh <= 0) return;
+            CDC* dc = cw->CanvasDC();
+            if (dc) {
+                RECT scrollRect = { rx, ry, rx + rw, ry + rh };
+                ::ScrollDC(dc->GetSafeHdc(), dx, dy, &scrollRect, &scrollRect, nullptr, nullptr);
+            }
+            if (!swN) cw->RepaintCanvas();
+        }
+        // /drawreplace, /drawrotate etc. aren't implemented -- silently accepted rather than falling through to
+        // the raw-server catch-all (see the original comment this whole block replaced).
     }
     static void CwSort(CChatWnd* cw) {   // -s: keeps m_cwLines (and the parallel color array) sorted together
         std::vector<size_t> order(cw->m_cwLines.size()); for (size_t i = 0; i < order.size(); i++) order[i] = i;
@@ -17767,9 +18478,26 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_timers.empty()) { Show(w, L"* No active timers.", cInfo); return; }
         for (auto& t : m_timers) ShowTimerStatus(w, t);
     }
-    void StartTimerTickIfNeeded() { if (!m_timerTickId && !m_timers.empty()) m_timerTickId = SetTimer(2002, 100, nullptr); }
+    // 100ms (10 ticks/sec) used to be the underlying poll rate for EVERY /timer, including a ".timered -om 0 0 ..."
+    // one (interval 0 == "fire again as fast as possible", per TimerTick()'s own nextFire = now + 0 math just
+    // below) -- which is exactly how MarioMSL drives its whole game loop (engine_GameLoop). That script moves the
+    // player a fixed number of pixels per engine_GameLoop CALL, not scaled by actual elapsed wall-clock time, so
+    // running that loop at only 10 calls/sec made every on-screen motion (walking, jumping) look roughly 6-10x
+    // slower than in real mIRC, whose own internal timer granularity is much finer. 15ms (~65 ticks/sec) is close
+    // to Windows' own default USER-timer resolution (SetTimer is coalesced to the system tick, ~15.6ms, regardless
+    // of a smaller requested value -- asking for less than that buys nothing without also calling
+    // timeBeginPeriod(1), which isn't worth the added global side effects here), and brings this back in line with
+    // what a real-mIRC-driven game loop actually feels like.
+    void StartTimerTickIfNeeded() { if (!m_timerTickId && !m_timers.empty()) m_timerTickId = SetTimer(2002, 15, nullptr); }
     void TimerTick() {
         if (m_timers.empty()) { if (m_timerTickId) { KillTimer(m_timerTickId); m_timerTickId = 0; } return; }
+        // Skip this tick entirely while a modal script dialog ($sfile/$input/etc, see ModalWatchdogGuard's own
+        // comment) is blocking -- WM_TIMER still reaches us through that dialog's own message pump, but firing a
+        // timer's command here would re-enter script execution while an earlier RunScript call for this SAME timer
+        // is still sitting on the C++ stack inside that dialog's DoModal(), which is exactly how a single Save-As
+        // prompt cascaded into a stack of them. Timers simply hold their due firings until the dialog closes, then
+        // catch up on the next 100ms tick like normal -- nothing is lost, just delayed until it's safe to re-enter.
+        if (m_modalNestLevel > 0) return;
         ULONGLONG now = GetTickCount64();
         for (size_t i = 0; i < m_timers.size();) {
             // Copy the timer's data out BY VALUE before running its command: this used to hold a live `TimerInfo&`
@@ -18414,6 +19142,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (m_menuOpen) return; RefreshBars(); CheckLayout(); TickVars(); UpdateOnlineTimer();
         TipTick(); TipCheckActivation(); SoundTick(); NotifyTick(); AutoActionTick();
         if (m_identdAutoStopAt && GetTickCount64() >= m_identdAutoStopAt) StopIdentd();
+        FlushVars();   // PERF: debounced vars.ini save -- see note at FlushVars()'s own definition; this runs on the ~300-500ms UI timer instead of on every /set, /inc, /dec, or alias return
     }
     afx_msg void OnTbRClick(NMHDR*, LRESULT* pResult) {
         *pResult = 0;
@@ -18782,9 +19511,10 @@ public:
         RecalcLayout(); LayoutBars(); SetTimer(1, 500, nullptr);
         PostMessage(WM_COMMAND, IDM_CONNECT);
         Net* net = NewNet();   // an idle, disconnected network with just a Status window � lets local commands
-        Status(net);           // (/clear, testing the UI, etc.) be tried without ever connecting anywhere
+        CChatWnd* startupStatus = Status(net);           // (/clear, testing the UI, etc.) be tried without ever connecting anywhere
         Note(net, L"IRC ready. Not connected use File > Connect, the toolbar, or /server [-m] host [+port] to connect. "
              L"Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
+        FireScriptLoadEvent(startupStatus, L"LOAD", CString());   // real mIRC fires on LOAD for every script already in the Remote file list when mIRC itself starts, before any server connection -- sourceFile empty means every script, not just one
     }
 };
 
