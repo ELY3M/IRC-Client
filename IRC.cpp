@@ -3528,8 +3528,22 @@ struct CalcParser {   // $calc(): + - * / % ^ , unary minus and parentheses, wit
         for (;;) {
             ws();
             if (*p == L'*') { p++; v *= unary(); }
-            else if (*p == L'/') { p++; double q = unary(); if (q == 0) ok = false; else v /= q; }
-            else if (*p == L'%') { p++; double q = unary(); if (q == 0) ok = false; else v = fmod(v, q); }
+            // BUGFIX: division/modulus by zero used to set ok=false and abort the WHOLE expression, which the
+            // caller (FuncValue's "calc" handler) treats exactly like an unrecognized identifier -- it leaves the
+            // entire "$calc(...)" text completely unevaluated, verbatim, rather than producing any number at all.
+            // That's lenient right up until the moment a script hits a genuine 0/0 -- space.mrc's own HUD draws
+            // "$int($round($calc(%space_hits / %space_shots * 100),1))" every frame, and before the player's
+            // fired a single shot both %space_hits and %space_shots are unset (0), making this a literal 0/0 on
+            // the very first frame. The unevaluated "$calc(...)" text then fed straight into $round(...) and
+            // $int(...) around it, which (for the same reason -- their own argument didn't come back as a usable
+            // number) likewise gave up and left THEIR text unevaluated too, so the whole nested expression's raw
+            // source text got drawn on screen character-for-character instead of a percentage: exactly the
+            // "000/000$int($round($ca..." garbage visible over the HUD's accuracy line. Real mIRC's own $calc
+            // doesn't fail the expression on a division/modulus by zero -- it just comes back 0 -- so this now
+            // matches that instead of erroring, the same "lenient arithmetic" standard primary() already applies
+            // to a missing operand just below.
+            else if (*p == L'/') { p++; double q = unary(); v = (q == 0) ? 0 : v / q; }
+            else if (*p == L'%') { p++; double q = unary(); v = (q == 0) ? 0 : fmod(v, q); }
             else return v;
         }
     }
@@ -3859,7 +3873,34 @@ static std::vector<CString> ScriptTokens(const std::vector<CString>& lines) {
         if (inComment) { int e = t.Find(L"*/"); if (e < 0) continue; t = t.Mid(e + 2); inComment = false; }
         t.Trim();
         if (t.Left(2) == L"/*") { int e = t.Find(L"*/", 2); if (e < 0) { inComment = true; continue; } t = t.Mid(e + 2); t.Trim(); }
-        if (pending.IsEmpty() && (t.IsEmpty() || t[0] == L';')) continue;
+        if (pending.IsEmpty() && t.IsEmpty()) continue;
+        if (pending.IsEmpty() && t[0] == L';') {
+            // BUGFIX: a ';' comment at the start of a fresh line used to drop the ENTIRE physical line, full stop --
+            // but real mIRC scripts constantly write "; label | realcommand" all on one row (space.mrc's own
+            // "on *:keydown:@IRC:37:{ ;Left | checkcontrols left }" is exactly this, once for each of the four
+            // movement keys), relying on the extremely common, well-established mIRC idiom that a ';' comment only
+            // runs up to the next top-level '|' -- not to the true end of the physical line -- so the real command
+            // after the pipe still executes. Dropping the whole line instead silently discarded "checkcontrols
+            // left"/"up"/"right"/"down" entirely: the KEYDOWN event still fired fine (confirmed empirically -- a
+            // separate, comment-free "on *:keydown:@IRC:17:{ fire }" handler for Ctrl worked perfectly), but
+            // movement's own handler body never ran a single real command, so %space_angle was never touched and
+            // the ship could never move no matter how long an arrow key was held -- while firing, whose handler
+            // has no leading comment to trip over, worked the whole time. Same top-level-pipe rule SplitPipes
+            // already uses elsewhere (a '|' only counts as a separator with whitespace on both sides, and inside
+            // matching '('/'{' nesting doesn't count) -- a comment's own text can legitimately contain a stray
+            // '|' that isn't meant as a separator at all, so this doesn't just grab the first raw '|' character.
+            int depth2 = 0, pipePos = -1, tn = t.GetLength();
+            for (int ci = 0; ci < tn; ci++) {
+                wchar_t cc = t[ci];
+                if (cc == L'(' || cc == L'{') depth2++; else if ((cc == L')' || cc == L'}') && depth2 > 0) depth2--;
+                bool spacedBefore = ci == 0 || t[ci - 1] == L' ' || t[ci - 1] == L'\t';
+                bool spacedAfter = ci + 1 >= tn || t[ci + 1] == L' ' || t[ci + 1] == L'\t';
+                if (cc == L'|' && depth2 == 0 && spacedBefore && spacedAfter) { pipePos = ci; break; }
+            }
+            if (pipePos < 0) continue;   // no '|' anywhere -- a genuine whole-line comment, nothing real follows it
+            t = t.Mid(pipePos + 1); t.TrimLeft();
+            if (t.IsEmpty()) continue;
+        }
         bool cont = t.GetLength() >= 2 && t.Right(2) == L"$&";
         if (cont) t = t.Left(t.GetLength() - 2);
         if (!pending.IsEmpty()) t.TrimLeft();
@@ -4602,7 +4643,11 @@ static std::vector<CString> SplitVarDecls(const CString& s) {
         else if (c == L')') { if (depth > 0) depth--; }
         if (c == L',' && depth == 0) {
             int k = i + 1; while (k < n && s[k] == L' ') k++;
-            bool startsNewDecl = (k < n && s[k] == L'%' && k + 1 < n && (iswalnum(s[k + 1]) || s[k + 1] == L'_'));
+            // Same start-of-name gap as EvalIds's own "%variable" recognition (see its own BUGFIX comment): without
+            // '-' allowed as the very first name character here too, a comma-separated declaration list containing
+            // a hyphen-led name -- "var %a = 1, %-b = 2" -- wouldn't recognize "%-b" as starting a new declaration
+            // at all, so the comma would be left as ordinary value text instead of a split point.
+            bool startsNewDecl = (k < n && s[k] == L'%' && k + 1 < n && (iswalnum(s[k + 1]) || s[k + 1] == L'_' || s[k + 1] == L'-'));
             if (startsNewDecl) { out.push_back(cur); cur.Empty(); continue; }
         }
         cur += c;
@@ -4614,6 +4659,54 @@ static CString UnquoteField(CString f) {
     f.Trim();
     if (f.GetLength() >= 2 && f.Left(1) == L"\"" && f.Right(1) == L"\"") f = f.Mid(1, f.GetLength() - 2);
     return f;
+}
+// BUGFIX: every multi-arg comma-separated identifier in this file ($readini, $ini, $read, $sdir, $dir, $abook, $zip,
+// the save/open-file-dialog identifiers, etc.) used to split its evaluated argument text with the exact same
+// hand-rolled loop: "int pos = 0; while (pos != -1) { parts.push_back(a.Tokenize(L\",\", pos)); }". That loop runs
+// into a genuine, easy-to-miss quirk of MFC's own CString::Tokenize: when the LAST comma-separated field runs all
+// the way to the end of the string with no delimiter after it (i.e. almost every real call, since scripts don't
+// normally write a trailing comma), Tokenize's own iStart bookkeeping lands EXACTLY on GetLength() for that final
+// call instead of being reset to -1 -- so the loop condition (pos != -1) is still true, the loop fires one more
+// time, and Tokenize (correctly, in isolation) returns an empty string for "nothing left to read" while finally
+// setting iStart to -1. The net effect: every one of these identifiers silently got back ONE MORE part than it
+// actually had, with that extra part always an empty string tacked onto the end. $readini($qt(file),settings,health)
+// -- three real arguments -- came back as four parts ("<file>","settings","health",""), which shifted this
+// function's own switches/section/item field assignment down by one (section read "health" where it should have
+// read "settings", and item read the phantom empty string where it should have read "health") -- so $readini could
+// never find anything, however correct the filename and section/item text were, and every script value it was
+// supposed to populate (e.g. space.mrc's %space_background, %space_speed, %space_w/h, and the enemy-wave spawn
+// loop itself) silently stayed empty. This same bug shape affects every other identifier using the same loop
+// pattern, just less visibly (an extra optional trailing argument that scripts never actually pass). Replaces that
+// loop everywhere with a plain, correct split that has no such edge case: counting delimiters directly rather than
+// trusting Tokenize's own end-of-string iStart math.
+static std::vector<CString> SplitCommaParts(const CString& s) {
+    std::vector<CString> parts;
+    int len = s.GetLength(), start = 0;
+    for (int i = 0; i <= len; i++) { if (i == len || s[i] == L',') { parts.push_back(s.Mid(start, i - start)); start = i + 1; } }
+    return parts;
+}
+// Separating-axis test for two convex polygons (used by $onpoly -- see its own comment for why this exists and
+// what it's for). Exact for the axis-aligned rectangles space.mrc actually passes, and correct for any other
+// convex polygon. An empty or degenerate (<2 point) polygon never intersects anything.
+static bool PolygonsIntersect(const std::vector<std::pair<double, double>>& a, const std::vector<std::pair<double, double>>& b) {
+    if (a.size() < 2 || b.size() < 2) return false;
+    const std::vector<std::pair<double, double>>* polys[2] = { &a, &b };
+    for (int pi = 0; pi < 2; pi++) {
+        const auto& poly = *polys[pi];
+        size_t n = poly.size();
+        for (size_t i = 0; i < n; i++) {
+            auto p1 = poly[i], p2 = poly[(i + 1) % n];
+            double edgeX = p2.first - p1.first, edgeY = p2.second - p1.second;
+            double axisX = -edgeY, axisY = edgeX;   // perpendicular to this edge -- the candidate separating axis
+            if (axisX == 0 && axisY == 0) continue;   // degenerate (repeated point) edge -- no useful axis
+            double minA = 1e300, maxA = -1e300;
+            double minB = 1e300, maxB = -1e300;
+            for (auto& pt : a) { double proj = pt.first * axisX + pt.second * axisY; minA = (std::min)(minA, proj); maxA = (std::max)(maxA, proj); }
+            for (auto& pt : b) { double proj = pt.first * axisX + pt.second * axisY; minB = (std::min)(minB, proj); maxB = (std::max)(maxB, proj); }
+            if (maxA < minB || maxB < minA) return false;   // this axis separates the two polygons -- no overlap
+        }
+    }
+    return true;
 }
 // Scans raw (unstripped) script lines for "dialog [-l] name { ... }" blocks, same line-level brace matching as
 // StripForeignBlocks/ParseMenuBlocks and for the same reason (a control's default text could in principle contain
@@ -7651,7 +7744,13 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"logdir") { val = m_logFolder; return true; }
         if (name == L"sfstate") { val = m_sfstate; return true; }
         if (name == L"v1") { val = m_v1; return true; }   // see m_v1's own comment -- the chosen path from the most recent $sfile() call used as a boolean condition
-        if (name == L"tempfn") { val = MakeTempName(CString()); return true; }
+        // BUGFIX: this used to be a duplicate, earlier $tempfn handler that ignored its own argument entirely
+        // (MakeTempName(CString()) -- ALWAYS passed an empty string, no matter what the script actually wrote inside
+        // the parens) and, being earlier in this if-chain, permanently shadowed the real, argument-respecting,
+        // now-also-quote-stripping $tempfn handler further down (see its own comment, next to $nofile/$nopath/etc.) --
+        // that second one could never be reached. Removed outright rather than fixed in place, since the later one
+        // already does everything this one did (and more, correctly). Same duplicate-shadowing pattern found and
+        // fixed for $nopath, $mknickfn, and $samepath just below.
         if (name == L"inwave" || name == L"inmidi" || name == L"insong") {   // $inwave.fname / .pos / .length / .pause (bare identifier, no parens -- see the EvalIds property-parsing fix above)
             SoundChannel& ch = name == L"inwave" ? m_waveChan : name == L"inmidi" ? m_midiChan : m_mp3Chan;
             if (prop.IsEmpty()) { val = (ch.open && ch.playing) ? L"$true" : L"$false"; return true; }
@@ -8198,6 +8297,73 @@ class CMainFrame : public CMDIFrameWnd {
             if (!ParseNum(p[0], px) || !ParseNum(p[1], py) || !ParseNum(p[2], rx) || !ParseNum(p[3], ry) || !ParseNum(p[4], rw) || !ParseNum(p[5], rh)) return false;
             bool inside = px >= rx && px <= rx + rw && py >= ry && py <= ry + rh;
             val = inside ? L"$true" : L"$false";
+            return true;
+        }
+        if (name == L"onpoly") {
+            // $onpoly(n1,n2,poly1,poly2) -- NOT previously implemented at all, which was a genuine functional gap:
+            // an unrecognized "$onpoly(...)" call fell through to whatever this engine's default behaviour is for
+            // an unknown identifier, and since that default is non-empty (and non-"0"), every "if (%g)" check built
+            // around it came back TRUE regardless of the actual geometry -- i.e. EVERY pair of game entities was
+            // treated as colliding, always, every single frame. In space.mrc (the Invaders game this was found
+            // against) that meant every two-entity pass through /update's collision loop immediately "detected" a
+            // collision, and since two same-type entities (enemy vs enemy) colliding is explicitly a no-op in that
+            // script's own deducthealth alias (nothing dies, no health changes), the loop's own "something changed,
+            // restart the whole scan" reset fired every single time with nothing ever actually resolving -- an
+            // unbounded loop that froze the whole client until the watchdog killed that one script run, with the
+            // very next timer tick landing in the exact same state and hanging again, over and over. Fixing THAT
+            // (see PolygonsIntersect's own comment) stopped the freeze, but a second, independent bug remained in
+            // how this handler read its own arguments -- see immediately below.
+            //
+            // Real mIRC's $onpoly tests whether two polygons overlap. This script calls it as
+            // "$onpoly( 4,4, [ $replace(x1 y1 x2 y2 x3 y3 x4 y4,$chr(32),$chr(44)) ] , [ $replace(...) ] )" -- a
+            // vertex count for each polygon, then each polygon's own flattened x,y point list, with each list
+            // wrapped in "[ ... ]" purely so $replace's own internal commas aren't misread as $onpoly's top-level
+            // argument separators. The FIRST version of this handler took that "[ ... ]" at face value and tried
+            // to split $onpoly's raw argument text on its own top-level commas, expecting to land on exactly 4
+            // pieces (n1, n2, "[poly1]", "[poly2]") and only then evaluate each piece. That was wrong about WHEN
+            // this text actually reaches here: ExecCmd (see its own comment) runs ExpandBrackets() over the WHOLE
+            // command line BEFORE EvalCmdLine/EvalIds ever gets to "$onpoly(..." at all -- and ExpandBrackets is
+            // this engine's own implementation of that exact real-mIRC "[ ... ]" idiom, which eagerly evaluates
+            // the bracketed sub-expression and splices the PLAIN RESULT back into the line, brackets and all
+            // removed, well before $onpoly's own identifier parsing ever runs. So by the time this handler is
+            // entered, there are no brackets left to find and nothing left to protect: the whole argument list has
+            // already collapsed into one flat, comma-separated run of plain numbers, e.g.
+            // "4,4, 393,475,441,475,441,523,393,523 , 200,-494,232,-494,232,-462,200,-462" -- confirmed directly
+            // from a live debug dump of this exact handler's own rawArgs. The old code's top-level split (still
+            // expecting 4 pieces) instead produced 18 one-number pieces for exactly this text, with poly1/poly2
+            // each ending up as a single bare coordinate like "393" -- too short to parse as a 4-point polygon, so
+            // poly1Pts/poly2Pts came back empty EVERY time and PolygonsIntersect's own "a.size() < 2" guard made
+            // $onpoly return false unconditionally -- the opposite failure from before (never colliding instead of
+            // always colliding), which is why movement/firing worked but nothing could ever take damage or die.
+            //
+            // The fix: stop assuming any particular bracket/paren structure survived and just read the actual flat
+            // format directly -- evaluate the whole argument list once, strip any '[' / ']' that happen to still
+            // be present (harmless no-ops if ExpandBrackets already removed them, but keeps this correct too if
+            // $onpoly is ever called from a context ExpandBrackets doesn't cover, e.g. as a nested argument to
+            // another identifier), split on every comma, then read n1 and n2 off the front and consume exactly
+            // 2*n1 and 2*n2 further numbers for each polygon's own points, in order. No knowledge of how the
+            // caller grouped its own arguments is needed at all -- just the counts it already tells us.
+            CString a = EvalIds(w, rawArgs, params);
+            a.Remove(L'['); a.Remove(L']');
+            std::vector<CString> nums = SplitCommaParts(a);
+            for (auto& t : nums) t.Trim();
+            if (nums.size() < 2) { val = L"$false"; return true; }
+            double n1D = 0, n2D = 0; ParseNum(nums[0], n1D); ParseNum(nums[1], n2D);
+            int n1 = (int)n1D, n2 = (int)n2D;
+            if (n1 < 0) n1 = 0; if (n2 < 0) n2 = 0;
+            size_t need = 2 + (size_t)n1 * 2 + (size_t)n2 * 2;
+            if (nums.size() < need) { val = L"$false"; return true; }   // not enough coordinates for the vertex counts given -- malformed input, no sensible answer but $false (not $true) so it never wrongly reports a collision
+            auto readPts = [&](size_t start, int n) {
+                std::vector<std::pair<double, double>> pts;
+                for (int i = 0; i < n; i++) {
+                    double x = 0, y = 0; ParseNum(nums[start + (size_t)i * 2], x); ParseNum(nums[start + (size_t)i * 2 + 1], y);
+                    pts.push_back({ x, y });
+                }
+                return pts;
+            };
+            auto poly1Pts = readPts(2, n1);
+            auto poly2Pts = readPts(2 + (size_t)n1 * 2, n2);
+            val = PolygonsIntersect(poly1Pts, poly2Pts) ? L"$true" : L"$false";
             return true;
         }
         if (name == L"calc") { double r; if (!CalcExpr(EvalIds(w, rawArgs, params), r)) return false; val = FmtNum(r); return true; }
@@ -8845,24 +9011,16 @@ class CMainFrame : public CMDIFrameWnd {
             if (!a.IsEmpty() && a[0] == L'"') a = a.Mid(1);
             val = a; return true;
         }
-        if (name == L"nopath") {   // $nopath(filename) -- the filename with any leading path stripped
-            CString a = EvalIds(w, rawArgs, params);
-            int s = a.ReverseFind(L'\\'); if (s < 0) s = a.ReverseFind(L'/');
-            val = s >= 0 ? a.Mid(s + 1) : a; return true;
-        }
-        if (name == L"mknickfn") {   // $mknickfn(nickname) -- strips characters that aren't valid in a Windows filename
-            CString a = EvalIds(w, rawArgs, params);
-            CString out; for (int i = 0; i < a.GetLength(); ++i) { wchar_t c = a[i]; if (!wcschr(L"\\/:*?\"<>|", c) && c >= 32) out += c; }
-            val = out; return true;
-        }
-        if (name == L"samepath") {   // $samepath(path1,path2) -- $true if both resolve to the same file/folder on disk; relative paths are resolved against the current directory, matching GetFullPathName's own behaviour
-            CString a = EvalIds(w, rawArgs, params);
-            int c = a.ReverseFind(L','); if (c < 0) return false;
-            CString p1 = a.Left(c), p2 = a.Mid(c + 1);
-            wchar_t full1[MAX_PATH], full2[MAX_PATH];
-            if (!GetFullPathNameW(p1, MAX_PATH, full1, nullptr) || !GetFullPathNameW(p2, MAX_PATH, full2, nullptr)) return false;
-            val = (_wcsicmp(full1, full2) == 0) ? L"$true" : L"$false"; return true;
-        }
+        // BUGFIX: $nopath, $mknickfn (folded into $mkfn), and $samepath used to each have an EARLIER, duplicate
+        // handler right here, before $input -- none of the three stripped a surviving $qt()-style quote pair from
+        // their argument, and because this is a first-match-wins if-chain, being earlier meant these three
+        // permanently shadowed the correct, quote-stripping versions that already existed further down (right next
+        // to $nofile/$shortfn/$longfn/etc. -- see their own comment), which could NEVER actually run. That's why,
+        // even after fixing the real $nopath/$samepath handlers to strip quotes, a script calling $nopath($1) on a
+        // $qt()-wrapped path (e.g. space.mrc's "var %a = $qt($+($scriptdir,$nopath($1)))") kept getting back a
+        // filename with a stray trailing quote character still attached -- THIS duplicate, unquoted handler was the
+        // one actually running the whole time. Removed outright (not fixed in place) so the real handlers are
+        // reachable at all. Same duplicate-shadowing pattern found and fixed for $tempfn just above.
         if (name == L"input") {   // $input(prompt,options,window,title,text) -- a simplified version of a feature-rich mIRC dialog: this always shows a plain text editbox (the by-far most common real use), returning the typed text on OK or $null on Cancel. The o/y/r (Yes/No/Retry-style, returning $true/$false) and p (password masking) variants, and the timeout-related switches, aren't implemented.
             CString a = EvalIds(w, rawArgs, params);
             std::vector<CString> p; { int start = 0; while (start <= a.GetLength()) { int c = a.Find(L',', start); if (c < 0) { p.push_back(a.Mid(start)); break; } p.push_back(a.Mid(start, c - start)); start = c + 1; } }
@@ -9855,28 +10013,40 @@ class CMainFrame : public CMDIFrameWnd {
             return true;
         }
         // ---- File and directory identifiers ----
-        if (name == L"exists") { val = PathExistsFn(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
-        if (name == L"isfile") { val = IsFilePathFn(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
+        // BUGFIX: every one of these takes a filename/path argument, and real-world scripts almost always wrap that
+        // argument in $qt(...) to protect spaces (e.g. $isfile($qt($scriptdirlevel1.ini))) -- same convention already
+        // handled for $lines() just below, and for /remove's path argument (see UnquoteField's own call site at the
+        // DeleteFileW/SHFileOperationW site). These identifiers were evaluating straight to ::GetFileAttributesW (or
+        // GDI+'s Bitmap constructor) WITHOUT stripping a surviving pair of quote characters first, so a perfectly
+        // valid, quoted path (e.g. a literal "C:\foo\bar.ini" string, quotes included) never matched any real file on
+        // disk -- GetFileAttributesW has no idea quote characters aren't part of the path -- and every one of these
+        // silently came back "doesn't exist"/empty for ANY quoted argument. Confirmed root cause of a third-party
+        // script (space.mrc's loadsettings alias) calling "if (!$isfile($qt($+($scriptdir,$nopath($1))))) { return }"
+        // as an early-return guard: the guard always fired (false isfile result), permanently skipping every setting
+        // the rest of that alias was supposed to load, including the background image path -- which is exactly why
+        // the game rendered as a solid black screen with no error of any kind (nothing downstream ever ran).
+        if (name == L"exists") { val = PathExistsFn(UnquoteField(EvalIds(w, rawArgs, params))) ? L"$true" : L"$false"; return true; }
+        if (name == L"isfile") { val = IsFilePathFn(UnquoteField(EvalIds(w, rawArgs, params))) ? L"$true" : L"$false"; return true; }
         if (name == L"pic") {   // $pic(filename)[.width/.height] -- an image file's pixel dimensions, read via GDI+ the same way /drawpic itself loads a picture. Only .width/.height are implemented (not mIRC's own .type/.colors/.id); empty for either property means the file couldn't be loaded as an image at all.
-            CString path = EvalIds(w, rawArgs, params);
+            CString path = UnquoteField(EvalIds(w, rawArgs, params));
             Gdiplus::Bitmap bmp(path);
             if (bmp.GetLastStatus() != Gdiplus::Ok) { val.Empty(); return true; }
             if (prop == L"height") val.Format(L"%u", bmp.GetHeight());
             else val.Format(L"%u", bmp.GetWidth());   // .width, or no property at all -- same default mIRC itself uses for a bare $pic(file)
             return true;
         }
-        if (name == L"isdir") { val = IsDirPath(EvalIds(w, rawArgs, params)) ? L"$true" : L"$false"; return true; }
-        if (name == L"nofile") { val = NoFilePart(EvalIds(w, rawArgs, params)); return true; }
-        if (name == L"nopath") { val = NoPathPart(EvalIds(w, rawArgs, params)); return true; }
-        if (name == L"shortfn") { val = ShortFnOf(EvalIds(w, rawArgs, params)); return true; }
-        if (name == L"longfn") { val = LongFnOf(EvalIds(w, rawArgs, params)); return true; }
-        if (name == L"mkfn" || name == L"mknickfn") { val = MakeValidFn(EvalIds(w, rawArgs, params)); return true; }
-        if (name == L"mklogfn") { val = MakeValidFn(EvalIds(w, rawArgs, params)); return true; }   // this client's logging has no "dated logfiles" toggle to append a date for, so the name comes back unchanged (just sanitized)
-        if (name == L"tempfn") { val = MakeTempName(EvalIds(w, rawArgs, params)); return true; }
+        if (name == L"isdir") { val = IsDirPath(UnquoteField(EvalIds(w, rawArgs, params))) ? L"$true" : L"$false"; return true; }
+        if (name == L"nofile") { val = NoFilePart(UnquoteField(EvalIds(w, rawArgs, params))); return true; }
+        if (name == L"nopath") { val = NoPathPart(UnquoteField(EvalIds(w, rawArgs, params))); return true; }
+        if (name == L"shortfn") { val = ShortFnOf(UnquoteField(EvalIds(w, rawArgs, params))); return true; }
+        if (name == L"longfn") { val = LongFnOf(UnquoteField(EvalIds(w, rawArgs, params))); return true; }
+        if (name == L"mkfn" || name == L"mknickfn") { val = MakeValidFn(UnquoteField(EvalIds(w, rawArgs, params))); return true; }
+        if (name == L"mklogfn") { val = MakeValidFn(UnquoteField(EvalIds(w, rawArgs, params))); return true; }   // this client's logging has no "dated logfiles" toggle to append a date for, so the name comes back unchanged (just sanitized)
+        if (name == L"tempfn") { val = MakeTempName(UnquoteField(EvalIds(w, rawArgs, params))); return true; }
         if (name == L"samepath") {
             CString a = EvalIds(w, rawArgs, params); int c = a.Find(L',');
             if (c < 0) { val = L"$false"; return true; }
-            CString p1 = a.Left(c), p2 = a.Mid(c + 1); p1.Trim(); p2.Trim();
+            CString p1 = UnquoteField(a.Left(c)), p2 = UnquoteField(a.Mid(c + 1));
             wchar_t full1[MAX_PATH] = {}, full2[MAX_PATH] = {};
             ::GetFullPathNameW(p1, MAX_PATH, full1, nullptr); ::GetFullPathNameW(p2, MAX_PATH, full2, nullptr);
             val = (ShortFnOf(full1).CompareNoCase(ShortFnOf(full2)) == 0) ? L"$true" : L"$false";
@@ -9889,7 +10059,7 @@ class CMainFrame : public CMDIFrameWnd {
             return true;
         }
         if (name == L"file") {   // $file(filename): size, ctime, mtime, atime, shortfn, longfn, attr, path, name, ext -- .sig/.version not implemented (would need PE resource parsing)
-            CString a = EvalIds(w, rawArgs, params);
+            CString a = UnquoteField(EvalIds(w, rawArgs, params));
             WIN32_FILE_ATTRIBUTE_DATA fad;
             if (!::GetFileAttributesExW(a, GetFileExInfoStandard, &fad)) { val.Empty(); return true; }
             auto toStr = [](FILETIME ft) { SYSTEMTIME st, lst; ::FileTimeToSystemTime(&ft, &st); ::SystemTimeToTzSpecificLocalTime(nullptr, &st, &lst); CTime ct(lst.wYear, lst.wMonth, lst.wDay, lst.wHour, lst.wMinute, lst.wSecond); return ct.Format(L"%a %b %d %H:%M:%S %Y"); };
@@ -9962,7 +10132,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"getdir") { val = m_dccGetDir; return true; }   // $getdir(filename): same stored path regardless of filename/type, since no per-type DCC directory config exists here
         if (name == L"read") {   // $read(filename, [ntswrp], [matchtext], [N]) -- 'r' (regex) is treated the same as 'w' (wildcard); true regex matching isn't implemented
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             if (parts.empty()) { val.Empty(); return true; }
             CString filename = parts[0]; filename.Trim();
             CString switches = parts.size() > 1 ? parts[1] : CString(); switches.Trim();
@@ -10008,9 +10178,13 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"readini") {   // $readini(filename, [np], section, item)
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part, which used to shift section/item down by one and made every $readini() call come back empty
             if (parts.size() < 3) { val.Empty(); return true; }
-            CString filename = parts[0]; filename.Trim();
+            // BUGFIX: filename is almost always passed through $qt(...) by real scripts (e.g. "$readini($qt($scriptdirlevel1.ini),settings,background)",
+            // straight from space.mrc) to protect spaces in the path -- GetPrivateProfileStringW takes it literally,
+            // quote characters and all, so a surviving pair of quotes pointed at a file that doesn't exist and this
+            // always silently came back empty (same bug class as $isfile/$exists/etc., fixed alongside this one).
+            CString filename = UnquoteField(parts[0]);
             CString section, item, switches;
             if (parts.size() >= 4) { switches = parts[1]; section = parts[2]; item = parts[3]; } else { section = parts[1]; item = parts[2]; }
             section.Trim(); item.Trim(); switches.Trim();
@@ -10023,9 +10197,9 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"ini") {   // $ini(file,topic/N,item/N)
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             if (parts.size() < 2) { val.Empty(); return true; }
-            CString filename = parts[0]; filename.Trim(); CString topicSel = parts[1]; topicSel.Trim();
+            CString filename = UnquoteField(parts[0]); CString topicSel = parts[1]; topicSel.Trim();   // same $qt()-quoting bug as $readini just above
             wchar_t secBuf[32768] = {}; ::GetPrivateProfileSectionNamesW(secBuf, 32768, filename);
             std::vector<CString> sections; { wchar_t* p = secBuf; while (*p) { sections.push_back(p); p += wcslen(p) + 1; } }
             double topicNumD; bool topicIsNum = ParseNum(topicSel, topicNumD);
@@ -10080,7 +10254,7 @@ class CMainFrame : public CMDIFrameWnd {
             // no filename pre-filled and no way to type a new one that wasn't already an existing file, instead of
             // the Save-As prompt mIRC shows with "PixedNNNNN.bmp" already suggested.
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             CString initial = parts.size() > 0 ? parts[0] : CString(); CString title = parts.size() > 1 ? parts[1] : CString(L"Save As");
             CString dir, fname = initial;
             int slash = (std::max)(initial.ReverseFind(L'\\'), initial.ReverseFind(L'/'));
@@ -10159,7 +10333,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"sdir") {   // $sdir(dir,title): the standard folder-browse dialog
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             CString title = parts.size() > 1 ? parts[1] : CString(L"Select Folder");
             m_sfstate.Empty();
             wchar_t path[MAX_PATH] = {};
@@ -10170,7 +10344,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"dir") {   // $dir(dir,title): the same standard folder-browse dialog as $sdir -- deprecated by real mIRC in favor of $sdir, which this client already implements; real mIRC's own $dir doesn't actually take parens at all (its legacy syntax is the bare identifier followed by =\"title\" <dir> as raw trailing text), but this engine -- like the rest of this codebase -- only ever parses $identifier(args) or a bare $identifier, never that exotic form, so it's given $sdir's own (dir,title) argument order instead
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             CString title = parts.size() > 1 ? parts[1] : CString(L"Select Folder");   // parts[0] (the initial directory) isn't used -- same gap $sdir itself already has, since BROWSEINFOW needs a callback to preset the starting folder
             m_sfstate.Empty();
             wchar_t path[MAX_PATH] = {};
@@ -10183,7 +10357,7 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = EvalIds(w, rawArgs, params);
             double nD;
             if (ParseNum(a, nD)) { int idx = (int)nD; val = (idx >= 1 && idx <= (int)m_msfileResults.size()) ? m_msfileResults[idx - 1] : CString(); return true; }
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             CString dir = parts.size() > 0 ? parts[0] : CString(); CString title = parts.size() > 1 ? parts[1] : CString(L"Select Files");
             m_sfstate.Empty(); m_msfileResults.clear();
             std::vector<wchar_t> buf(16384, 0);
@@ -10231,7 +10405,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"abook") {   // $abook(nick,N): properties nick, info, email, website, picture, note -- "noteN" in the spec all map to this one stored notes field
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); t.Trim(); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a); for (auto& p : parts) p.Trim();   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             AddressEntry* found = nullptr;
             if (parts.size() == 1) {
                 double nD;
@@ -10568,7 +10742,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"zip") {   // $zip(file.zip,cetlpo,file|dir,password,N) -- create/extract/test/list a zip, with optional AES-256 password protection
             CString a = EvalIds(w, rawArgs, params);
-            std::vector<CString> parts; { int pos = 0; while (pos != -1) { CString t = a.Tokenize(L",", pos); parts.push_back(t); } }
+            std::vector<CString> parts = SplitCommaParts(a);   // see SplitCommaParts' own comment -- the old hand-rolled Tokenize loop here added a phantom trailing empty part
             if (parts.size() < 2) { val.Empty(); return true; }
             CString zipFile = parts[0]; zipFile.Trim();
             CString switches = parts[1]; switches.Trim(); switches.MakeLower();
@@ -11054,7 +11228,23 @@ class CMainFrame : public CMDIFrameWnd {
                 if (i + 1 < L && in[i + 1] == L'$') { hashPending = true; continue; }   // decided once we know the value that follows
                 out += c; continue;
             }
-            if (c == L'%' && evalVars && i + 1 < L && (iswalnum(in[i + 1]) || in[i + 1] == L'_')) {   // %variable (an unset one is empty)
+            // BUGFIX: this start-of-name check used to require the character right after '%' to be alnum or '_',
+            // which rejects a variable name that's ENTIRELY punctuation up front, like "%-x" -- even though the
+            // CONTINUATION scan two lines down has always deliberately allowed '.', '-', '+', ':' and '[...]'
+            // inside a variable name once it's started (see that loop's own long comment for why -- %auto-todo1,
+            // %nY+1, %Tetris:Shape, %keypress[83], all real, all already working once the first character passed
+            // this gate). "%-x" never got that far: with '-' excluded from the START condition, this whole "%"
+            // was never recognized as beginning a variable reference at all, and "%-x" came out the other end as
+            // completely literal, unexpanded text. space.mrc's own endplayer alias leans on exactly this
+            // ("%-x %-y %-w %-h %-p" are its own deliberate, intentional variable names, declared and read the
+            // same way throughout that one alias), so every death explosion ended up calling
+            // "explode %-x %-y %-w %-h" with each argument still reading as the four literal words "%-x" "%-y"
+            // "%-w" "%-h" -- never real numbers at all. From there explode()'s "$1 - 20" arithmetic saw an
+            // operand that wasn't a number (TryMath's 3-token check fails on non-numeric text), so %new_x kept
+            // its own literal multi-word garbage, which is exactly what went on to shift /drawpic's later
+            // arguments and produce the repeating "/drawpic: couldn't load 20" -- confirmed directly from a live
+            // debug dump of explode()'s own raw arguments: "raw=[%-x %-y %-w %-h]", word for word.
+            if (c == L'%' && evalVars && i + 1 < L && (iswalnum(in[i + 1]) || in[i + 1] == L'_' || in[i + 1] == L'-')) {   // %variable (an unset one is empty)
                 int k = i + 1;
                 for (;;) {
                     if (k < L && (iswalnum(in[k]) || in[k] == L'_' || in[k] == L'.' || in[k] == L'-' || in[k] == L'+')) { k++; continue; }   // '.', '-' and '+' are all perfectly ordinary, valid characters within an mIRC variable name itself (e.g. %ircop.serv1, %auto-todo1 and Tetris's own %nY+1/%nY+2/%nY+3 are each one variable, not %ircop/%auto/%nY followed by literal trailing text) -- unlike a $identifier, where these characters mean something else (property access, subtraction, concatenation), a %variable has no such conflicting syntax. Without the '+' here, every reference to %nY+1 etc. (declared fine, since /var's own name-parsing just reads up to the next space/'=') silently read as %nY's value with "+1"/"+2"/"+3" left as literal trailing text at every USE site -- corrupting (not halting) every sprite-border coordinate built from them
@@ -11374,7 +11564,40 @@ class CMainFrame : public CMDIFrameWnd {
     CString EvalCmdLine(CChatWnd* w, const CString& line, const CString& params) {
         CString rest = line, cmd = Word(rest), lc = cmd; lc.MakeLower();
         auto switches = [&](CString& head) {
-            for (;;) { CString t = rest; t.TrimLeft(); if (t.Left(1) != L"-" || t.GetLength() < 2) break; head += L" " + Word(rest); }
+            for (;;) {
+                CString t = rest; t.TrimLeft();
+                if (t.Left(1) == L"-" && t.GetLength() >= 2) { head += L" " + Word(rest); continue; }
+                // BUGFIX: a switch can also be built dynamically instead of typed literally -- space.mrc's own
+                // "set $+(-u,$readini(...)) %space_protect yes" is exactly this (a computed "-uN" expiry switch,
+                // N read from the level's own .ini settings). In the RAW, not-yet-evaluated text this function
+                // works on, that token starts with '$', not '-', so the plain check above never recognized it as
+                // a switch at all -- the loop just stopped, leaving the whole "$+(-u,...)" expression to fall
+                // through to the NAME-reading code a few lines down. That code only skips evaluating a token that
+                // ALREADY starts with '%' (the normal, literal case); since this one starts with '$' instead, it
+                // took the OTHER branch ("name.Left(1) == '$'" -> evaluate it), correctly resolving to "-u3" --
+                // but now MASQUERADING as the destination NAME, while the REAL name, "%space_protect", got pushed
+                // one slot over into what this function treats as the VALUE portion. The value portion (unlike
+                // the name) is ALWAYS blindly evaluated via plain EvalIds -- which, for an ordinary bare
+                // "%space_protect" token, substitutes its CURRENT value right there, same as it would anywhere
+                // else in a line. The first time this ran all game, %space_protect didn't have a value yet, so it
+                // was replaced with nothing at all: the "set" line CmdSet actually received came out as
+                // "set -u3  yes" (literally two spaces where the variable name used to be), which is exactly what
+                // a live dump of CmdSet's own received argument showed. CmdSet's own Word()-based parsing then
+                // read the FIRST thing in that mangled text as the destination name -- which, with %space_protect
+                // gone, was "yes" -- not starting with '%', hence "/set: variable names start with %". Peeking at
+                // and evaluating a '$'-led token HERE, before deciding whether it's a switch, mirrors what real
+                // mIRC itself does (switches are recognized from the fully-resolved text, not the raw source);
+                // only consuming it as a switch when the evaluated result genuinely starts with '-' leaves an
+                // ordinary dynamically-built NAME (e.g. "set $+(%,keypress[,%key,]) 1", MarioMSL's own pseudo-array
+                // idiom) completely untouched here, for the existing name-handling code right below to evaluate
+                // exactly as before.
+                if (t.Left(1) == L"$") {
+                    CString probeRest = rest; CString raw = Word(probeRest);   // peek the next raw token without disturbing `rest` yet, in case it turns out NOT to be a switch
+                    CString evaluated = EvalIds(w, raw, params);
+                    if (evaluated.Left(1) == L"-" && evaluated.GetLength() >= 2) { Word(rest); head += L" " + evaluated; continue; }
+                }
+                break;
+            }
         };
         if (lc == L"set" || lc == L"inc" || lc == L"dec") {
             CString head = cmd; switches(head);
@@ -14171,6 +14394,18 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = arg; bool force = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'o') >= 0) force = true; }
             CString from = Word(a), to = a; to.Trim();
+            // BUGFIX: Word() is a plain space-splitter -- unlike RunWord() (used by /remove, /copy and friends),
+            // it never strips a surrounding quoted path's own quote characters, it just stops at the next space.
+            // space.mrc always calls this as ".rename $qt(before.txt) $qt(top.txt)" (the standard mIRC idiom for
+            // protecting a path that might contain spaces), so `from`/`to` arrived here as the literal text
+            // ["H:\...\before.txt"] and ["H:\...\top.txt"] -- quote characters and all, still attached. Windows'
+            // own MoveFileW takes the path exactly as given and doesn't recognize '"' as filename punctuation to
+            // strip, so both the existence checks AND the move itself were being run against a path that doesn't
+            // actually name anything on disk -- which is exactly ERROR_INVALID_NAME (123), and why a live dump of
+            // this failure showed BOTH the source and destination as "doesn't exist" even though before.txt was
+            // right there on disk the whole time. /remove already had this exact fix (see its own UnquoteField
+            // call and comment); /rename just never got it when it was added.
+            from = UnquoteField(from); to = UnquoteField(to);
             if (from.IsEmpty() || to.IsEmpty()) { Show(w, L"* Usage: /rename [-fo] <filename> <newfilename>", cPart); return; }
             if (force) DeleteFileW(to);
             if (!MoveFileW(from, to)) Show(w, L"* /rename: couldn't rename " + from + L" to " + to, cPart);
@@ -14179,6 +14414,11 @@ class CMainFrame : public CMDIFrameWnd {
             CString a = arg; bool append = false, overwrite = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'a') >= 0) append = true; if (sw.Find(L'o') >= 0) overwrite = true; }
             CString from = Word(a), to = a; to.Trim();
+            // BUGFIX: same quote-stripping gap as /rename just above (see its own comment) -- Word() leaves a
+            // $qt(...)-wrapped path's surrounding quote characters attached, which CFile::Open/CopyFileW don't
+            // strip on their own, so a quoted "/copy $qt(a.txt) $qt(b.txt)" call (the normal way a script protects
+            // a path with spaces) would fail the same way /rename did.
+            from = UnquoteField(from); to = UnquoteField(to);
             if (from.IsEmpty() || to.IsEmpty()) { Show(w, L"* Usage: /copy [-aofp] <filename> <filename>", cPart); return; }
             if (append) {
                 CFile fin, fout;
@@ -14322,6 +14562,46 @@ class CMainFrame : public CMDIFrameWnd {
             // that just never ran at all. Mirrors every other failure path in this file, which all tell the user
             // something went wrong rather than failing invisibly.
             else { Show(w, L"* /write: unable to open file: " + file, cPart); }
+        }
+        else if (cmd == L"filter") {
+            // Real mIRC's /filter is a fairly large command (text/wildcard/regex line matching, line-number
+            // targeting, unique-line dedup, writing to a &binvar instead of a file, and more); only the one form
+            // actually implemented here is the CUSTOM-COMPARATOR SORT it also supports, because it's the only
+            // form any loaded script calls: space.mrc's own /sorttop does
+            // "filter -ca $qt(top.txt) $qt(before.txt) entfilter" every time a new score is recorded, where
+            // entfilter takes two whole LINES as $1 and $2 and returns a signed number comparing them -- the
+            // standard qsort-style comparator shape (negative: $1 sorts before $2; positive: after; zero: equal)
+            // -- to re-sort the scores file by score, highest first. Before this existed, "filter" wasn't a
+            // recognized command OR a script alias, so the whole call fell through all the way to the raw-server
+            // send fallback, producing a misleading "Not connected. Use /server <host> [port]" instead of ever
+            // sorting anything -- the scores file was never actually being re-sorted at all.
+            // The exact switch semantics of real mIRC's own version aren't independently distinguished here (this
+            // engine recognizes the comparator-sort FORM by its trailing argument naming a real user alias, not
+            // by which switch letters were given) since nothing that calls this needs more than that one form.
+            CString a = arg;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) Word(a);   // switches consumed and ignored -- see this command's own comment
+            CString inFile = RunWord(a), outFile = RunWord(a), aliasName = a; aliasName.Trim();
+            if (inFile.IsEmpty() || outFile.IsEmpty() || aliasName.IsEmpty()) { Show(w, L"* Usage: /filter [switches] <infile> <outfile> <comparator alias>", cPart); return; }
+            AliasDef* ad = FindAlias(aliasName);
+            if (!ad) { Show(w, L"* /filter: unknown alias (only the comparator-sort form of /filter is implemented -- the last argument must name a real alias): " + aliasName, cPart); return; }
+            AliasDef adCopy = *ad;   // RunAlias takes its AliasDef BY VALUE -- see RunAlias's own comment: the comparator alias could in principle redefine itself mid-sort
+            std::vector<CString> lines = ReadAllLinesOf(inFile);   // a missing/empty infile just means nothing to sort -- not an error (space.mrc's very first-ever score write hits exactly this, with top.txt not created yet)
+            std::stable_sort(lines.begin(), lines.end(), [&](const CString& x, const CString& y) {
+                // Each whole line is passed as ONE logical parameter ($1 / $2), even though it's very likely to
+                // contain its own internal spaces (a score record here is "score nick date hits/shots(pct%)") --
+                // protecting those internal spaces with the engine's own kTokenizeSpace sentinel (the same
+                // mechanism /tokenize already uses for exactly this reason) before joining x and y with a real
+                // space keeps them as two separate params instead of fragmenting each line into a dozen of them.
+                CString px = x, py = y; px.Replace(L' ', kTokenizeSpace); py.Replace(L' ', kTokenizeSpace);
+                m_result.Empty();
+                RunAlias(w, adCopy, px + L" " + py);
+                double n = 0; ParseNum(m_result, n);
+                return n < 0;
+            });
+            CFile f;
+            if (f.Open(outFile, CFile::modeCreate | CFile::modeWrite)) {
+                for (auto& ln : lines) { CString line = ln + L"\r\n"; CStringA a8(line); f.Write(a8.GetString(), a8.GetLength()); }
+            } else { Show(w, L"* /filter: unable to open output file: " + outFile, cPart); }
         }
         else if (cmd == L"dcc") {
             CString a = arg; CString sub = Word(a); sub.MakeLower();
@@ -15458,8 +15738,9 @@ class CMainFrame : public CMDIFrameWnd {
         ch.open = ch.playing = ch.paused = false; ch.curFile.Empty();
     }
     // Returns empty on success, or a human-readable reason on failure (missing file, no codec for this type, etc.)
-    CString OpenAndPlaySound(SoundChannel& ch, const CString& file, int startMs = -1) {
+    CString OpenAndPlaySound(SoundChannel& ch, const CString& fileIn, int startMs = -1) {
         CloseSoundChannel(ch);
+        CString file = UnquoteField(fileIn);   // belt-and-suspenders: strip a surviving $qt()-style quote pair here too, in case a caller (e.g. /wavplay, which hands its whole argument through unsplit) didn't already
         CString type = MciTypeForFile(file);
         if (type.IsEmpty()) return L"Unsupported file type (only .wav, .mid/.midi, .mp3/.mp2 are recognized)";
         CString resolved = ResolveSoundPath(file);
@@ -15569,7 +15850,17 @@ class CMainFrame : public CMDIFrameWnd {
             if (wFlag || any) m_waveChan.queue.clear(); if (mFlag || any) m_midiChan.queue.clear(); if (pFlag || any) m_mp3Chan.queue.clear();
             if (arg.IsEmpty()) { Show(w, L"* Sound queue cleared.", cInfo); return; }
         }
-        CString first = arg; CString w1 = Word(first); CString w1l = w1; w1l.MakeLower();
+        // BUGFIX: this used to pull the filename word via plain Word(), which only ever splits on spaces and knows
+        // nothing about quotes -- scripts almost always wrap the path in $qt(...) (e.g. ".splay -p $qt($scriptdirintro.mp3)",
+        // straight from space.mrc), so w1 ended up as the LITERAL quoted string, quote characters and all. Even with
+        // no spaces inside the path, that surviving trailing quote character fed straight into MciTypeForFile's
+        // "extension = text after the last '.'" check turned "intro.mp3" into "mp3\"" -- which matches neither
+        // "mp3" nor "mp2" -- so MP3 (and MID/WAV) files passed through $qt() always came back "Unsupported sound
+        // file type" even though MciTypeForFile does recognize .mp3 just fine. RunWord already implements mIRC's
+        // own "a leading quote starts a path that runs to the next quote, spaces inside included" convention (see
+        // its own use for /run), so using it here both fixes this exact bug and, as a bonus, correctly handles a
+        // quoted path that contains spaces, which plain Word() would have incorrectly split into two words anyway.
+        CString first = arg; CString w1 = RunWord(first); CString w1l = w1; w1l.MakeLower();
         auto targets = [&]() { std::vector<SoundChannel*> t; if (wFlag) t.push_back(&m_waveChan); if (mFlag) t.push_back(&m_midiChan); if (pFlag) t.push_back(&m_mp3Chan); if (t.empty()) t = { &m_waveChan, &m_midiChan, &m_mp3Chan }; return t; };
         if (w1l == L"stop" || w1l == L"pause" || w1l == L"resume" || w1l == L"skip") {
             for (auto* ch : targets()) {
@@ -17800,7 +18091,27 @@ class CMainFrame : public CMDIFrameWnd {
         CChatWnd* cw = Find(nullptr, name);
         if (cFlag) { if (cw) cw->DestroyWindow(); return; }
         bool creating = !cw;
-        if (!cw) cw = OpenCustomWindow(name, hFlag, zFlag);
+        if (!cw) {
+            // BUGFIX: creating any MDI child -- even one asked for with -h (hidden) -- sends it a WM_MDICREATE,
+            // which Windows' own MDI client always treats as "and make this new child the active one", regardless
+            // of WS_VISIBLE. OpenCustomWindow had no guard against that at all, so a script that opens its real,
+            // visible game window and THEN one or more -h off-screen buffer windows for compositing -- exactly
+            // what space.mrc's own "space" alias does, creating the visible @IRC canvas first and immediately
+            // following it with "window -pdCw0k0h +befl @IRC.buf ..." and "...@IRC.buf2 ..." -- ends up with the
+            // LAST hidden buffer window silently stealing MDI-active status (and with it, keyboard focus) away
+            // from the visible game window the player is actually looking at. Every "on KEYDOWN:@IRC:37" (etc.)
+            // handler is wired to fire for whichever window currently owns keyboard focus, filtered by name --
+            // with an invisible @IRC.buf2 holding focus instead, @IRC's own key events never fire at all, which
+            // is exactly why arrow keys and Ctrl (fire) did nothing even though the game was clearly running (the
+            // freeze/black-screen/HUD fixes above all worked -- movement was a separate, previously-masked bug).
+            // OpenBg (just above) already solves this exact class of problem for background query windows by
+            // saving/restoring whatever was active around the creation call; the same fix belongs here for any
+            // window created hidden, so an -h buffer window can exist without ever disturbing which (visible)
+            // window the player can actually type into.
+            CMDIChildWnd* prevActive = hFlag ? MDIGetActive() : nullptr;
+            cw = OpenCustomWindow(name, hFlag, zFlag);
+            if (prevActive) MDIActivate(prevActive);
+        }
         if (eFlag) cw->m_hasEdit = true;
         if (lFlag) cw->m_cwListMode = true;
         if (sFlagSw) { cw->m_cwSort = true; CwSort(cw); }
