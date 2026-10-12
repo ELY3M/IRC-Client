@@ -1858,29 +1858,34 @@ public:
         if (!tls->Handshake()) { if (onConn) onConn((int)tls->lastStatus); return; }
         Queue(tls->tosend); tls->tosend.clear();          // send ClientHello; onConn fires when TLS is ready
     }
-    void OnReceive(int) override {
+    // One receive-and-process cycle, factored out of OnReceive so OnClose below can also call it (repeatedly, to
+    // drain) instead of duplicating this logic. Never closes the socket or fires onConn/onDrop itself -- it just
+    // reports what happened, so each caller can decide what "close"/"drop" actually means for ITS situation (a
+    // live OnReceive vs. OnClose's drain-then-finish sequence).
+    enum class Pump { Empty, Data, ProxyFail, TlsFail };
+    Pump PumpOnce() {
         char b[16384]; int n = Receive(b, sizeof b);
-        if (n <= 0) return;
+        if (n <= 0) return Pump::Empty;
         if (px.proto != ProxyProto::None && !px.Done()) {
             std::string toSend;
             bool finished = px.Feed(b, n, toSend);
             if (!toSend.empty()) CAsyncSocket::Send(toSend.data(), (int)toSend.size());
-            if (!finished) return;
-            if (!px.Ok()) { Close(); if (onConn) onConn(PROXY_FAIL); return; }
+            if (!finished) return Pump::Data;
+            if (!px.Ok()) return Pump::ProxyFail;
             px.proto = ProxyProto::None;   // tunnel is up: stop routing further bytes through the proxy parser
             OnTunnelReady();
-            return;
+            return Pump::Data;
         }
         std::string plain;
         if (tls) {
             tls->in.append(b, n);
             if (!tls->ready) {
-                if (!tls->Handshake()) { Close(); if (onConn) onConn((int)tls->lastStatus); return; }
+                if (!tls->Handshake()) return Pump::TlsFail;
                 Queue(tls->tosend); tls->tosend.clear();
                 if (tls->ready && onConn) onConn(0);
             }
             if (tls->ready) {
-                if (!tls->Decrypt()) { Close(); if (onDrop) onDrop(); return; }
+                if (!tls->Decrypt()) return Pump::TlsFail;
                 plain.swap(tls->out);
             }
         } else plain.assign(b, n);
@@ -1890,8 +1895,36 @@ public:
             CStringA l = buf.Left(i); buf = buf.Mid(i + 1); l.TrimRight("\r");
             if (onLine) onLine(CString(CA2W(l, CP_UTF8)));
         }
+        return Pump::Data;
     }
-    void OnClose(int) override { Close(); if (onDrop) onDrop(); }
+    void OnReceive(int) override {
+        switch (PumpOnce()) {
+            case Pump::ProxyFail: Close(); if (onConn) onConn(PROXY_FAIL); break;
+            case Pump::TlsFail: Close(); if (onDrop) onDrop(); break;
+            default: break;
+        }
+    }
+    // BUGFIX: this used to just be "Close(); if (onDrop) onDrop();" -- but FD_CLOSE (what drives OnClose) isn't
+    // guaranteed to be preceded by one last FD_READ/OnReceive for every byte the OS already has sitting in this
+    // socket's kernel receive buffer; Windows is free to coalesce them, and in practice a server that sends a few
+    // final lines and then immediately closes the connection (exactly what killing a client does: "KILL nick
+    // :reason" followed straight by "ERROR :Closing Link: ...") routinely delivers both in one notification
+    // batch, with no separate OnReceive ever firing for them at all. Close() throws away anything still unread
+    // the instant it runs, so those lines -- here, "You were killed by Mouse (testing)" and the server's own
+    // "Closing Link" notice, both of which real mIRC shows -- were being silently discarded, leaving nothing in
+    // the log but the final "Disconnected." from onDrop. Draining via PumpOnce() first (same line-parsing path
+    // OnReceive itself uses) until there's genuinely nothing left fixes that, with no behavior change for the
+    // ordinary case where OnReceive already got everything.
+    void OnClose(int) override {
+        for (;;) {
+            Pump r = PumpOnce();
+            if (r == Pump::Empty) break;
+            if (r == Pump::ProxyFail) { Close(); if (onConn) onConn(PROXY_FAIL); return; }
+            if (r == Pump::TlsFail) break;   // already failing/closing anyway -- fall through to the normal close below rather than retrying a dead socket
+        }
+        Close();
+        if (onDrop) onDrop();
+    }
 };
 
 // ---------------- DCC: a plain async socket, no TLS and no line-buffering of its own (DCC Chat does its own simple
@@ -2375,6 +2408,20 @@ public:
     // $editbox(window)[.selstart/.selend] -- m_in is protected, so CMainFrame (an unrelated class) needs this small
     // public accessor rather than reaching in directly.
     void GetEditBoxInfo(CString& text, int& selStart, int& selEnd) { m_in.GetWindowText(text); m_in.GetSel(selStart, selEnd); }
+    // /editbox -- the write side of the above: same "m_in is protected" reason for needing public accessors.
+    bool HasEditBox() const { return m_in.m_hWnd != nullptr; }
+    void SetEditBoxText(const CString& text) { if (!m_in.m_hWnd) return; m_in.SetWindowText(text); int len = text.GetLength(); m_in.SetSel(len, len); }
+    void SetEditBoxSel(int lo, int hi) { if (m_in.m_hWnd) m_in.SetSel(lo, hi); }
+    void FocusEditBox() { if (m_in.m_hWnd) m_in.SetFocus(); }
+    void SubmitEditBox() {   // fill-then-press-Enter: same path as the real Enter key (see PreTranslateMessage's VK_RETURN handler)
+        if (!m_in.m_hWnd) return;
+        CString s; m_in.GetWindowText(s); m_in.SetWindowText(L"");
+        if (!s.IsEmpty()) {
+            if (m_hist.empty() || m_hist.back() != s) m_hist.push_back(s);
+            m_histPos = -1;
+            if (onInput) onInput(this, s);
+        }
+    }
 
     void Put(const CString& t, COLORREF fg, COLORREF bg, DWORD fx) {   // every new run also carries the current font explicitly
         m_out.SetSel(-1, -1);
@@ -4564,12 +4611,18 @@ static std::vector<MenuBlockDef> ParseMenuBlocks(const std::vector<CString>& in)
 }
 // ---------------- Custom dialogs: "dialog [-l] name { ... }" blocks, remote.ini / a remote script ----------------
 struct DialogControlDef {
-    CString kind;                 // "text"/"edit"/"button"/"check"/"radio"/"box"/"list"/"combo" -- scope of this pass
-    CString text;                 // the leading "text", if this control type has one
+    CString kind;                 // "text"/"edit"/"button"/"check"/"radio"/"box"/"list"/"combo"/"tab" -- scope of this pass
+    CString text;                 // the leading "text", if this control type has one (for "tab", this is the page's own header label)
     int scriptId = 0;             // the id the script uses -- remapped to a safe Win32 control id internally, never used directly as one
     int x = 0, y = 0, w = 0, h = 0;
     std::set<CString> styles;     // lowercased style words (read, multi, ok, cancel, sort, pass, ...)
     CString varName;              // a bare %var token in the definition, if any -- set from the control's value when the dialog closes
+    // "tab N" -- a non-tab control's own containing page: 0 means not tied to any tab (always visible). For a
+    // "tab" kind control itself, this field isn't used -- a "tab" entry WITH geometry (x y w h, all nonzero) opens
+    // a brand-new physical tab strip; a "tab" entry with none (real mIRC's own shorthand, matching asciibox.mrc's
+    // "tab "128-255", 502" second line) adds one more page to whichever tab strip was most recently opened,
+    // rather than creating a second overlapping strip -- see CCustomDialogWnd's constructor for where that's resolved.
+    int tabId = 0;
 };
 struct DialogTableDef {
     CString name;
@@ -4739,7 +4792,7 @@ static std::vector<DialogTableDef> ParseDialogTables(const std::vector<CString>&
             body.push_back(tk); k++;
         }
         DialogTableDef dt; dt.name = namePart;
-        static const wchar_t* const kKinds[] = { L"text", L"edit", L"button", L"check", L"radio", L"box", L"list", L"combo" };
+        static const wchar_t* const kKinds[] = { L"text", L"edit", L"button", L"check", L"radio", L"box", L"list", L"combo", L"tab" };
         for (auto& raw : body) {
             CString line = raw; line.Trim();
             if (line.IsEmpty() || line.Left(1) == L";") continue;
@@ -4749,7 +4802,7 @@ static std::vector<DialogTableDef> ParseDialogTables(const std::vector<CString>&
             else if (klc == L"option") { CString o = rest; o.MakeLower(); if (o.Find(L"dbu") >= 0) dt.dbu = true; if (o.Find(L"disable") >= 0) dt.disabledOpt = true; }
             else {
                 bool isKind = false; for (auto kk : kKinds) if (klc == kk) { isKind = true; break; }
-                if (!isKind) continue;   // icon/link/tab/scroll/menu/item: not supported by this pass, skipped rather than misparsed
+                if (!isKind) continue;   // icon/link/scroll/menu/item: not supported by this pass, skipped rather than misparsed
                 auto fields = SplitTopLevelCommas(rest);
                 DialogControlDef c; c.kind = klc;
                 size_t fi = 0;
@@ -4767,7 +4820,23 @@ static std::vector<DialogTableDef> ParseDialogTables(const std::vector<CString>&
                     for (;;) {
                         CString wtok = styleStr.Tokenize(L" \t", pos);
                         if (wtok.IsEmpty() && pos == -1) break;
-                        if (!wtok.IsEmpty()) { if (wtok.Left(1) == L"%") c.varName = wtok; else { wtok.MakeLower(); c.styles.insert(wtok); } }
+                        if (!wtok.IsEmpty()) {
+                            if (wtok.Left(1) == L"%") c.varName = wtok;
+                            else {
+                                wtok.MakeLower();
+                                // "tab N" -- not a bare style word like "sort"/"multi", it's a two-token pair naming
+                                // which tab page (by that page's OWN scriptId, e.g. the 501/502 from a "tab ..." line
+                                // elsewhere in this same table) this control lives on; consume the id token too
+                                // rather than letting it fall through and get misfiled as an unrelated style word.
+                                if (wtok == L"tab") {
+                                    CString idTok = styleStr.Tokenize(L" \t", pos);
+                                    if (!idTok.IsEmpty()) c.tabId = _wtoi(idTok);
+                                    if (pos == -1) break;
+                                    continue;
+                                }
+                                c.styles.insert(wtok);
+                            }
+                        }
                         if (pos == -1) break;
                     }
                 }
@@ -4999,7 +5068,44 @@ class CCustomDialogWnd : public CDialog {
         t.push_back((WORD)x); t.push_back((WORD)y); t.push_back((WORD)cx); t.push_back((WORD)cy); t.push_back(id);
         t.push_back(0xFFFF); t.push_back(cls); S(txt); t.push_back(0); ++cnt;
     }
+    // Same as Item(), but for a control whose window class isn't one of the six predefined atoms (edit/button/
+    // static/listbox/combobox/scrollbar) that Item()'s "0xFFFF + atom" form is limited to -- a tab control
+    // ("SysTabControl32") is a comctl32 common control, which a raw DLGITEMTEMPLATE instead names as a plain
+    // null-terminated class-name string in that same slot.
+    void ItemClass(DWORD st, int x, int y, int cx, int cy, WORD id, const wchar_t* clsName, const wchar_t* txt) {
+        if (t.size() & 1) t.push_back(0);
+        W(st | WS_CHILD | WS_VISIBLE); W(0);
+        t.push_back((WORD)x); t.push_back((WORD)y); t.push_back((WORD)cx); t.push_back((WORD)cy); t.push_back(id);
+        S(clsName); S(txt); t.push_back(0); ++cnt;
+    }
     const DialogControlDef* FindCtrl(int scriptId) const { for (auto& c : def.controls) if (c.scriptId == scriptId) return &c; return nullptr; }
+    // Tab-page bookkeeping, filled in by the constructor below (see its "tab" branch) and consumed by
+    // OnInitDialog/UpdateTabVisibility: m_hostPages maps each physical tab strip (keyed by ITS OWN scriptId, the
+    // one that actually owns a real SysTabControl32 window) to its pages' scriptIds in display order;
+    // m_tabPageHost maps every page's scriptId back to the strip that owns it, so a non-tab control's own
+    // "tab N" style (DialogControlDef::tabId) can be resolved to "which physical strip, and is N its current page".
+    std::map<int, std::vector<int>> m_hostPages;
+    std::map<int, int> m_tabPageHost;
+    void UpdateTabVisibility() {
+        std::map<int, int> curPageOfHost;   // host scriptId -> the scriptId of its currently selected page
+        for (auto& kv : m_hostPages) {
+            if (kv.second.empty()) continue;
+            CWnd* hostWnd = GetDlgItem(CtrlIdOf(kv.first));
+            if (!hostWnd || !hostWnd->GetSafeHwnd()) continue;
+            int idx = (int)::SendMessage(hostWnd->GetSafeHwnd(), TCM_GETCURSEL, 0, 0);   // qualified with :: -- CWnd::SendMessage (an unrelated 3-arg overload: message/wParam/lParam, no HWND) would otherwise hide the real Win32 API this needs
+            if (idx < 0 || idx >= (int)kv.second.size()) idx = 0;
+            curPageOfHost[kv.first] = kv.second[idx];
+        }
+        for (auto& c : def.controls) {
+            if (c.tabId == 0) continue;   // not tied to any tab page at all -- always visible, same as a control outside every tab(s)
+            auto hostIt = m_tabPageHost.find(c.tabId);
+            if (hostIt == m_tabPageHost.end()) continue;   // "tab N" named a page id that doesn't actually exist in this table -- leave the control alone rather than hiding it on a guess
+            auto curIt = curPageOfHost.find(hostIt->second);
+            bool visible = curIt != curPageOfHost.end() && curIt->second == c.tabId;
+            CWnd* cw = GetDlgItem(CtrlIdOf(c.scriptId));
+            if (cw) cw->ShowWindow(visible ? SW_SHOW : SW_HIDE);
+        }
+    }
 public:
     DialogTableDef def;
     int okScriptId = -1, cancelScriptId = -1;
@@ -5007,6 +5113,12 @@ public:
     // specific control triggered it).
     std::function<void(CCustomDialogWnd*, const CString& ev, int scriptId)> onEvent;
     CCustomDialogWnd(const DialogTableDef& d) : def(d) {
+        // SysTabControl32 (used by the "tab" control kind below) is a comctl32 common control, not a core USER32
+        // one like edit/button/listbox/combobox/static -- its window class has to actually be registered in this
+        // process before CreateDialogIndirect (in OpenCustomDialog, right after this constructor returns) can
+        // create one from the raw template below, and nothing else in this app does that registration already.
+        static bool tabClassReady = false;
+        if (!tabClassReady) { INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TAB_CLASSES }; InitCommonControlsEx(&icc); tabClassReady = true; }
         // "Fixedsys Excelsior" here, not DEFAULT_FONT ("Fixedsys") like this file's other, hand-laid-out dialogs
         // use -- plain Fixedsys is a raster (bitmap) font with only a few fixed native sizes, and CreateFontW
         // requesting an arbitrary logical height for it can make GDI's font mapper silently substitute a
@@ -5020,6 +5132,7 @@ public:
         W(DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE); W(0);
         t.push_back(0); t.push_back(0); t.push_back(0); t.push_back((WORD)def.sw); t.push_back((WORD)def.sh);
         t.push_back(0); t.push_back(0); S(def.title); t.push_back(kCustomDialogFontPt); S(L"Fixedsys Excelsior");
+        int curTabHost = -1;   // the most recently-opened physical tab strip's scriptId -- see DialogControlDef::tabId's own comment on why a geometry-less "tab" entry joins this one rather than opening a second strip
         for (auto& c : def.controls) {
             WORD id = (WORD)(kDlgIdBase + c.scriptId);
             if (c.styles.count(L"ok")) okScriptId = c.scriptId;
@@ -5054,6 +5167,11 @@ public:
                 DWORD st = WS_BORDER | WS_TABSTOP | WS_VSCROLL | CBS_HASSTRINGS | (c.styles.count(L"drop") ? CBS_DROPDOWNLIST : CBS_DROPDOWN);
                 if (c.styles.count(L"sort")) st |= CBS_SORT;
                 Item(st, c.x, c.y, c.w, c.h + 60, id, 0x0085, L"");   // extra cy: a combo's template height must include room for its dropped-down list, not just the visible edit row
+            } else if (c.kind == L"tab") {
+                bool hasGeo = c.w > 0 && c.h > 0;
+                if (hasGeo || curTabHost < 0) { ItemClass(WS_TABSTOP, c.x, c.y, c.w, c.h, id, L"SysTabControl32", L""); curTabHost = c.scriptId; }
+                m_hostPages[curTabHost].push_back(c.scriptId);
+                m_tabPageHost[c.scriptId] = curTabHost;
             }
         }
         t[4] = (WORD)cnt;   // patch the real control count back into the template's cdit field -- it was written as a 0 placeholder before any Item() calls ran, since the count isn't known until they're all done; every other raw-template dialog in this file does this same patch-up (see CConnDlg), and without it Windows reads cdit=0 and never parses any of the controls just appended, so the dialog would open completely empty
@@ -5061,14 +5179,40 @@ public:
     const DLGTEMPLATE* Template() const { return (const DLGTEMPLATE*)t.data(); }
     int ScriptIdOf(UINT ctrlId) const { return (int)ctrlId - kDlgIdBase; }
     UINT CtrlIdOf(int scriptId) const { return (UINT)(kDlgIdBase + scriptId); }
-    CString CtrlKind(int scriptId) const { const DialogControlDef* c = FindCtrl(scriptId); return c ? c->kind : CString(); }   // "text"/"edit"/"button"/"check"/"radio"/"box"/"list"/"combo" -- reads the known definition rather than querying the live HWND's Win32 class name
+    CString CtrlKind(int scriptId) const { const DialogControlDef* c = FindCtrl(scriptId); return c ? c->kind : CString(); }   // "text"/"edit"/"button"/"check"/"radio"/"box"/"list"/"combo"/"tab" -- reads the known definition rather than querying the live HWND's Win32 class name
     CString GetCtrlText(int scriptId) { CWnd* w = GetDlgItem(CtrlIdOf(scriptId)); if (!w) return CString(); CString s; w->GetWindowText(s); return s; }
     void SetCtrlText(int scriptId, const CString& s) { CWnd* w = GetDlgItem(CtrlIdOf(scriptId)); if (w) w->SetWindowText(s); }
     BOOL OnInitDialog() override {
         CDialog::OnInitDialog();
         for (auto& c : def.controls) if (c.kind == L"radio" && c.styles.count(L"push")) { /* push-style radio: cosmetic only here, BS_PUSHLIKE not set to keep rendering simple */ }
+        for (auto& kv : m_hostPages) {   // populate each physical tab strip's page headers, now that the real HWNDs exist
+            CWnd* hostWnd = GetDlgItem(CtrlIdOf(kv.first));
+            if (!hostWnd || !hostWnd->GetSafeHwnd()) continue;
+            int idx = 0;
+            for (int pageId : kv.second) {
+                const DialogControlDef* pc = FindCtrl(pageId);
+                CString label = pc ? pc->text : CString();
+                TCITEMW tci = {}; tci.mask = TCIF_TEXT; tci.pszText = label.GetBuffer();
+                ::SendMessage(hostWnd->GetSafeHwnd(), TCM_INSERTITEM, (WPARAM)idx, (LPARAM)&tci);   // :: -- see UpdateTabVisibility's own comment on why CWnd::SendMessage must not be used here
+                label.ReleaseBuffer();
+                idx++;
+            }
+            ::SendMessage(hostWnd->GetSafeHwnd(), TCM_SETCURSEL, 0, 0);   // first page selected by default, same as real mIRC
+        }
+        UpdateTabVisibility();
         if (onEvent) onEvent(this, L"init", 0);
         return TRUE;
+    }
+    BOOL OnNotify(WPARAM wParam, LPARAM lParam, LRESULT* pResult) override {
+        NMHDR* h = (NMHDR*)lParam;
+        if (h && h->code == (UINT)TCN_SELCHANGE) {
+            UpdateTabVisibility();
+            int sid = ScriptIdOf((UINT)h->idFrom);
+            if (sid >= 0 && onEvent) onEvent(this, L"sclick", sid);   // the tab strip itself just changed page -- fire sclick on it, same as a list/combo selection change elsewhere in this class
+            if (pResult) *pResult = 0;
+            return TRUE;
+        }
+        return CDialog::OnNotify(wParam, lParam, pResult);
     }
     void OnOK() override {   // reached only via Enter when some control has the default-button style
         if (okScriptId < 0) return;
@@ -7211,7 +7355,7 @@ class CMainFrame : public CMDIFrameWnd {
             Send(net, L"NICK " + net->nick); Send(net, L"USER " + net->o.user + L" 0 * :" + net->o.real);
         };
         net->sock.onLine = [this, net](const CString& s) { OnLine(net, s); };
-        net->sock.onDrop = [this, net]() { net->conn = false; SetState(net, L"Disconnected"); Note(net, L"Disconnected.", cPart); };
+        net->sock.onDrop = [this, net]() { net->conn = false; SetState(net, L"Disconnected"); Note(net, L"* Disconnected.", cQuit); };
     }
     void Show(CChatWnd* w, const CString& t, COLORREF c = cText, int tsOverride = -1) {
         if (!w) return;
@@ -13559,6 +13703,54 @@ class CMainFrame : public CMDIFrameWnd {
             if (bFlag) MessageBeep(MB_OK);
             if (fFlag) FlashWindow(TRUE);
         }
+        else if (cmd == L"editbox") {   // /editbox [-saf[N]nopbNeNvqN] [window] <text>  -- $editbox() (the read side) already existed; this is the missing write side
+            CString a = arg;
+            bool sFlag = false, aFlagSw = false, pFlag = false, nFlag = false, vFlag = false;
+            int focusN = -1, selB = -1, selE = -1;
+            if (a.Left(1) == L"-") {
+                int i = 1;
+                for (; i < a.GetLength() && a[i] != L' '; i++) {
+                    wchar_t c = a[i];
+                    auto digitsAfter = [&]() -> int { CString d; while (i + 1 < a.GetLength() && iswdigit(a[i + 1])) d += a[++i]; return d.IsEmpty() ? -1 : _wtoi(d); };
+                    if (c == L's') sFlag = true;
+                    else if (c == L'a') aFlagSw = true;
+                    else if (c == L'p') pFlag = true;
+                    else if (c == L'n') nFlag = true;
+                    else if (c == L'v') vFlag = true;
+                    else if (c == L'f') { int n = digitsAfter(); focusN = n < 0 ? 1 : n; }
+                    else if (c == L'b') selB = digitsAfter();
+                    else if (c == L'e') selE = digitsAfter();
+                    else if (c == L'o' || c == L'q') digitsAfter();   // -o / -qN: real mIRC's "second editbox" feature -- this client has only one editbox per window (see $editbox's own comment), so these are accepted for compatibility but have no effect
+                }
+                a = a.Mid(i); a.TrimLeft();
+            }
+            CChatWnd* target = nullptr;
+            if (sFlag) target = Status(net);
+            else if (aFlagSw) target = dynamic_cast<CChatWnd*>(MDIGetActive());
+            else if (a.Left(13).CompareNoCase(L"Status Window") == 0 && (a.GetLength() == 13 || a[13] == L' ')) {
+                target = Status(net); a = a.Mid(13); a.TrimLeft();
+            } else {
+                CString tmp = a; CString first = Word(tmp);
+                if (!first.IsEmpty()) { CString tn = first; if (tn[0] == L'=') tn = tn.Mid(1);
+                    CChatWnd* found = tn[0] == L'@' ? Find(nullptr, tn) : Find(net, tn);
+                    if (IsChan(tn) || found) { target = IsChan(tn) ? Open(net, tn, true) : found; a = tmp; }
+                }
+            }
+            if (!target) target = w;
+            if (!target->HasEditBox()) { Show(w, L"* /editbox: that window has no editbox.", cPart); return; }
+            CString text = a;
+            if (pFlag) text += L" ";
+            if (!vFlag && (!nFlag || !text.IsEmpty())) {   // -v: used alongside -f/-q to move focus/toggle without touching the contents -- skip the text-replace entirely
+                target->SetEditBoxText(text);
+            }
+            if (selB >= 0 || selE >= 0) {
+                CString cur; int s0 = 0, e0 = 0; target->GetEditBoxInfo(cur, s0, e0);
+                int lo = selB >= 0 ? selB : 0, hi = selE >= 0 ? selE : cur.GetLength();
+                target->SetEditBoxSel(lo, hi);
+            }
+            if (focusN == 1) target->FocusEditBox();
+            if (nFlag) target->SubmitEditBox();   // fill the editbox and press Enter, i.e. submit it exactly as if the user had typed it and hit Return
+        }
         else if (cmd == L"say") { if (inChat) Say(net, w->m_name, arg); else Note(net, L"You're not in a channel or query.", cPart); }   // sends text as-is, even if it starts with a slash
         else if (cmd == L"alias") {   // /alias (list)   /alias name (show)   /alias name commands (define; File > Aliases... edits multi-line ones)
             CString name = Word(arg); arg.Trim();
@@ -15100,6 +15292,14 @@ class CMainFrame : public CMDIFrameWnd {
                 if (w->DelNick(nick) || (!w->m_chan && w->m_name.CompareNoCase(nick) == 0))
                     Show(w, L"* " + nick + L" has quit (" + P(0) + L")", cQuit);
             }
+        }
+        else if (cmd == L"KILL") {   // :killer KILL target :reason -- a server operator forcibly disconnecting a client. The server always follows this with an ERROR line and then actually closes the socket (handled just below, and see CIrcSock::OnClose's own BUGFIX comment on why both of these used to never even get this far)
+            CString reason = P(1).IsEmpty() ? CString() : L" (" + P(1) + L")";
+            if (P(0).CompareNoCase(net->nick) == 0) Note(net, L"You were killed by " + nick + reason, cQuit);
+            else Note(net, L"* " + P(0) + L" was killed by " + nick + reason, cQuit);
+        }
+        else if (cmd == L"ERROR") {   // no prefix, just "ERROR :<text>" -- almost always the server's own notice right as it closes the link (after a KILL, a ping timeout, a K-line, etc). Shown plainly instead of falling into the generic "CMD: text" fallback at the bottom of this chain, same as real mIRC
+            Note(net, P(0), cPart);
         }
         else if (cmd == L"NICK") {
             CString nn = P(0); if (me) net->nick = nn;
