@@ -13721,6 +13721,17 @@ class CMainFrame : public CMDIFrameWnd {
             if (it.depth > depth) { i++; continue; }
             i++;
             bool hasKids = i < items.size() && items[i].depth > depth;
+            // BUGFIX: a title is evaluated EVERY time the menu is built, same as a click runs it.cmd -- but unlike
+            // the click path (see actsSrc just above and RunPopupLines' own sourceFile parameter), this EvalIds call
+            // never pushed the item's OWN script onto m_aliasFileStack first, so FindAlias's local-alias scoping
+            // (see its own comment) couldn't resolve a local alias referenced AS AN IDENTIFIER in the title itself.
+            // menutest.mrc's own "menu test $mversion $mauthor $myear { ... }" is exactly this: $mversion/$mauthor/
+            // $myear are each `alias -l`, scoped to menutest.mrc, so they came back as literal, unsubstituted text
+            // in the menu LABEL ("menu test $mversion $mauthor $myear") even though clicking the item ran its cmd
+            // ("echo -s menu test $mversion $mauthor $myear") just fine, since RunPopupLines already had the right
+            // sourceFile by then -- the exact same split FindAlias's own header comment describes for space.mrc's
+            // "on *:load:{ ... by $sauthor $syear ... }", just reached from a menu TITLE instead of an event body.
+            FileStackGuard fsGuard(this, it.sourceFile);
             CString t = EvalIds(w, it.title, params); m_halt = false; t.Trim();
             UINT flags = 0;
             while (t.GetLength() >= 3 && t[0] == 0x1E && t[2] == 0x1E) { int n = t[1] - L'0'; if (n & 1) flags |= MF_CHECKED; if (n & 2) flags |= MF_GRAYED; t = t.Mid(3); t.TrimLeft(); }
