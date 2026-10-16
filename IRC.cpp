@@ -19027,15 +19027,22 @@ class CMainFrame : public CMDIFrameWnd {
             if (!cw) { Show(w, L"* /drawtext: no such window: " + name, cPart); return; }
             cw->ShowCanvas();
             CString rest = a; rest.TrimLeft();
-            // mIRC's /drawtext takes exactly ONE color (the text color) -- there is no separate background-color
-            // argument in its syntax at all. The background is just solid black when opaque (the default) or left
-            // untouched when -o (transparent) is given; it was never a second token to read off the line. Reading
-            // one anyway (as this used to) ate the very next word instead -- almost always the font name, e.g.
-            // "drawtext @win 1 Tahoma 50 375 85 12" had "Tahoma" consumed as a bogus color, which cascaded into
-            // "50"/"375"/"85" being misread as font/size/x and "12"/y/text sliding out of alignment, usually
-            // leaving nothing left over to actually draw -- text silently never appearing is exactly that failure.
+            // BUGFIX: real mIRC's /drawtext syntax is "-hnrpbocvd <id> <color> [color] [font size] <x y [w h]>
+            // <text>" (confirmed against mIRC's own documented switch list) -- the second color IS part of the
+            // real syntax, but it's read ONLY when -b is given ("treats the second color as the text's background
+            // color"), not unconditionally and not keyed off -o at all. The PREVIOUS version of this comment had
+            // concluded /drawtext takes exactly one color, full stop -- true for the specific asciipaint.mrc call
+            // that prompted it (which never passed -b), but wrong in general: bigtext.mrc's own "drawtext -brp
+            // @bigtext $color(%fc) $color(%bc) $qt(%ff) %fs 0 0 %text" passes TWO colors precisely because it DOES
+            // use -b, and reading only one left $color(%bc)'s own (large, numeric) return value sitting as the next
+            // token -- consumed as the FONT NAME by the very next line, which cascaded exactly like the asciipaint
+            // case this used to guard against: ptSize became 0 (from $qt(%ff), not a number) -> defaulted to 10,
+            // x became the real font SIZE, y became the literal "0", and the text itself started one word late --
+            // producing an unreadably mispositioned, wrong-font render instead of the intended big pixel-sampled
+            // letters, which is what was showing up as a garbled blob instead of legible text.
             COLORREF fg = DrawColorFromTok(Word(rest), swR);
             COLORREF bg = RGB(0, 0, 0);
+            if (swB) bg = DrawColorFromTok(Word(rest), swR);   // -b: a second color follows, used as the opaque background (see this block's own comment)
             CString font = RunWord(rest);   // quote-aware: a multi-word font name like "Courier New" arrives pre-quoted by $qt()
             int ptSize = _wtoi(Word(rest));
             int x = _wtoi(Word(rest)), y = _wtoi(Word(rest));
@@ -19056,25 +19063,28 @@ class CMainFrame : public CMDIFrameWnd {
             }
             CString text = rest;   // whatever's left, verbatim -- mIRC's drawtext takes the rest of the line as the text, spaces and all
             if (ptSize < 1) ptSize = 10;
-            SIZE sz = MeasureTextSizePixels(text, font, ptSize, swB);
+            SIZE sz = MeasureTextSizePixels(text, font, ptSize, swO);
             cw->GrowCanvasFor(x + (boxW >= 0 ? boxW : sz.cx) + 1, y + (boxH >= 0 ? boxH : sz.cy) + 1);
             CDC* dc = cw->CanvasDC();
             if (dc) {
                 int logHeight = -MulDiv(ptSize, 96, 72);   // fixed 96 DPI -- must match MeasureTextSizePixels above, see its comment
-                HFONT hf = ::CreateFontW(logHeight, 0, 0, 0, swB ? FW_BOLD : FW_NORMAL, swI, swU, FALSE, DEFAULT_CHARSET,
+                // BUGFIX: -o is BOLD in real mIRC's /drawtext, not -b (that's "second color = background", see the
+                // color-reading comment above) -- these two switch letters were swapped here, so a script asking
+                // for bold text via -o got the (previously misnamed) "opaque" behavior instead, and a script using
+                // -b for a background color got bold text it never asked for. swO now drives FW_BOLD, matching the
+                // real switch.
+                HFONT hf = ::CreateFontW(logHeight, 0, 0, 0, swO ? FW_BOLD : FW_NORMAL, swI, swU, FALSE, DEFAULT_CHARSET,
                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, font);
                 CFont* oldF = dc->SelectObject(CFont::FromHandle(hf));
                 dc->SetTextColor(fg);
-                // -o means OPAQUE (fill a solid background box behind the text) in real mIRC, not transparent --
-                // this had the two switched, so plain "drawtext <win> <color> <font> <size> <x> <y> <text>" (no
-                // -o, the overwhelmingly common case -- drawclock.mrc never passes it) was filling an opaque BLACK
-                // box behind every character before drawing on top, with the fix above also defaulting fg black --
-                // black text on an opaque black box is invisible, hence those solid black rectangles where the
-                // clock's "12"/"3"/"6"/"9" and the date/time text should have been legible. Default is now
-                // transparent (blends with whatever's already drawn, same as real mIRC), -o opts into the opaque
-                // black box instead.
-                dc->SetBkMode(swO ? OPAQUE : TRANSPARENT);
-                if (swO) dc->SetBkColor(bg);
+                // BUGFIX: whether the background is painted opaque is driven by -b (same switch that reads the
+                // second color above), not -o -- real mIRC has no separate "opaque" switch at all; an opaque
+                // background box is simply what you get when you supply -b's second color, and plain
+                // "drawtext <win> <color> <font> <size> <x> <y> <text>" (no -b, the overwhelmingly common case --
+                // drawclock.mrc never passes it) stays transparent, blending with whatever's already drawn, same
+                // as real mIRC.
+                dc->SetBkMode(swB ? OPAQUE : TRANSPARENT);
+                if (swB) dc->SetBkColor(bg);
                 // -c: clip the text to the [w h] box given above, same as real mIRC -- CanvasDC() is a long-lived
                 // DC reused by every draw call on this window, not a fresh one scoped to just this call, so the
                 // clip region must be removed again right after this one TextOut or it would silently keep
