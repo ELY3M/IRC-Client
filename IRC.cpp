@@ -1832,7 +1832,7 @@ public:
     // immediately. GetAddrInfoW is the modern, dual-stack-aware resolver -- it handles IPv4 literals, IPv6 literals,
     // and regular hostnames (picking whichever family the OS resolves/prefers), and the socket is then (re)created
     // with the matching address family before connecting.
-    bool ConnectSmart(const CString& host, UINT port) {
+    bool ConnectSmart(const CString& host, UINT port, const CString& bindAddr = CString()) {   // bindAddr: /bindip's bound local address, or empty for the OS's normal default-interface choice
         ADDRINFOW hints = {}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP;
         CString portStr; portStr.Format(L"%u", port);
         PADDRINFOW result = nullptr;
@@ -1842,6 +1842,22 @@ public:
         bool ok = false;
         SOCKET s = ::socket(use->ai_family, SOCK_STREAM, IPPROTO_TCP);   // created manually with the resolved family, since CAsyncSocket::Create itself has no family parameter to pick IPv6 with
         if (s != INVALID_SOCKET) {
+            // BUGFIX (/bindip support): bind the socket to a specific local address BEFORE connect(), same ordering
+            // real mIRC uses -- a bind() after connect() is a no-op, the kernel already picked the outgoing interface
+            // by then. Only attempted when bindAddr parses as a literal numeric address in the SAME family as the
+            // resolved remote (a v4 local address can't be used to reach a v6 remote, and vice versa); a bindAddr
+            // that fails to parse (e.g. mIRC's other documented form, an adapter NAME rather than its IP) is silently
+            // skipped, which leaves the OS's normal default-interface choice in place -- not wrong, just not the
+            // specific interface /bindip's caller asked for.
+            if (!bindAddr.IsEmpty()) {
+                if (use->ai_family == AF_INET) {
+                    sockaddr_in la = {}; la.sin_family = AF_INET;
+                    if (::InetPtonW(AF_INET, bindAddr, &la.sin_addr) == 1) ::bind(s, (sockaddr*)&la, sizeof(la));
+                } else if (use->ai_family == AF_INET6) {
+                    sockaddr_in6 la6 = {}; la6.sin6_family = AF_INET6;
+                    if (::InetPtonW(AF_INET6, bindAddr, &la6.sin6_addr) == 1) ::bind(s, (sockaddr*)&la6, sizeof(la6));
+                }
+            }
             if (Attach(s, FD_READ | FD_WRITE | FD_OOB | FD_ACCEPT | FD_CONNECT | FD_CLOSE)) {   // Attach wires up the same async notifications Create would have, and puts the socket in non-blocking mode as a side effect
                 int rc = ::connect(m_hSocket, use->ai_addr, (int)use->ai_addrlen);
                 ok = (rc == 0) || (::WSAGetLastError() == WSAEWOULDBLOCK);
@@ -2349,10 +2365,15 @@ protected:
     // (Flip/Rotate/Resize/Add/Remove/Import/Export/Autosave/Close -- several of which have no keyboard shortcut at
     // all) was completely unreachable in this client despite being fully implemented and working once it opens.
     afx_msg void OnRButtonUp(UINT, CPoint p);   // defined after CChatWnd, like OnPaint/OnKeyDown/etc above -- it touches owner->onLogMenu, which needs CChatWnd's full definition
+    // mIRC's "on CHAR" (added v7.62) -- a WM_CHAR-level companion to on KEYDOWN/KEYUP: fires with the actual
+    // resulting Unicode codepoint/character ($keyval/$keychar), not the raw virtual-key code, and is matched
+    // against a comma-list of codepoints (or "*" for any) in the "on" line's own field rather than the free-form
+    // key-name field KEYDOWN/KEYUP use -- see MatchesCharSpec. Custom @windows only, same as KEYDOWN/KEYUP.
+    afx_msg void OnChar(UINT ch, UINT rep, UINT flags);
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CCanvasWnd, CWnd)
-    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_KEYUP() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE() ON_WM_MOUSELEAVE() ON_WM_RBUTTONUP()
+    ON_WM_PAINT() ON_WM_ERASEBKGND() ON_WM_KEYDOWN() ON_WM_KEYUP() ON_WM_CHAR() ON_WM_LBUTTONDOWN() ON_WM_LBUTTONUP() ON_WM_MOUSEMOVE() ON_WM_MOUSELEAVE() ON_WM_RBUTTONUP()
 END_MESSAGE_MAP()
 
 class CChatWnd : public CMDIChildWnd {
@@ -2366,6 +2387,7 @@ public:
     std::function<bool(CChatWnd*, CPoint)> onLogMenu;             // right-click in the chat log: true if a popup menu was shown
     std::function<void(CChatWnd*, const CString&, const CString&, int, int, int, const CString&)> onHotlinkFire;   // on HOTLINK: word, line, lineNo, wordPos, charPos, mouse-action name -- see CLogEdit::onHotlink
     std::function<void(const CString&)> onLog;                    // called with the plain (color-code-stripped, un-timestamped) text of each new line, for history logging
+    std::function<void(CChatWnd*)> onActivate;   // on ACTIVE -- fired by OnMDIActivate below when this window becomes the active MDI child; see CMainFrame's wiring (FireActiveEvent) for $active/$lactive bookkeeping
     int m_tsMode = -1;   // this window's /timestamp override: -1 = follow the global setting, 0 = off, 1 = on
     ULONGLONG m_lastMsgTick = 0;   // GetTickCount64() of the last PRIVMSG/NOTICE/DCC-chat line shown OR sent in this window -- $query().idle / $chat().idle ("seconds since a message was sent or received")
     // ---- DCC Chat / Send windows reuse this class too, net stays null same as a custom @window; an opaque pointer
@@ -2608,6 +2630,7 @@ public:
     int m_mouseX = 0, m_mouseY = 0;                        // last canvas mouse position, for $mouse.x/$mouse.y
     std::function<void(CChatWnd*, UINT, bool)> onCanvasKey;   // on KEYDOWN wiring, set by CMainFrame::OpenCustomWindow -- bool: OS auto-repeat (key already held), for $keyrpt
     std::function<void(CChatWnd*, UINT)> onCanvasKeyUp;    // on KEYUP wiring, set by CMainFrame::OpenCustomWindow -- see CCanvasWnd::OnKeyUp's own comment for why this needed to exist
+    std::function<void(CChatWnd*, UINT, bool)> onCanvasChar;   // on CHAR wiring, set by CMainFrame::OpenCustomWindow -- UINT is the WM_CHAR codepoint ($keyval/$keychar), bool is OS auto-repeat (for $keyrpt, same as KEYDOWN)
     // mIRC's reserved "Menu @window { ... }" mouse labels on the canvas -- "sclick" (button down), "uclick"
     // (button up), "mouse" (every move), "leave" (pointer leaves the canvas), "rclick" (right button down); evt
     // carries which one fired. Wiring set by CMainFrame::OpenCustomWindow. Used to be just a single-purpose
@@ -2659,6 +2682,7 @@ public:
     void RepaintCanvas() { if (m_canvasShown && m_canvas.m_hWnd) { m_canvas.Invalidate(); m_canvas.UpdateWindow(); } }
     void OnCanvasKeyDown(UINT vk, bool isRepeat) { if (onCanvasKey) onCanvasKey(this, vk, isRepeat); }
     void OnCanvasKeyUp(UINT vk) { if (onCanvasKeyUp) onCanvasKeyUp(this, vk); }
+    void OnCanvasChar(UINT ch, bool isRepeat) { if (onCanvasChar) onCanvasChar(this, ch, isRepeat); }
     void OnCanvasMouseMove(CPoint p) { m_mouseX = p.x; m_mouseY = p.y; }
     bool FireCanvasEvent(CPoint p, const CString& evt) { OnCanvasMouseMove(p); return onCanvasEvent ? onCanvasEvent(this, p, evt) : false; }   // "sclick"/"uclick"/"mouse"/"leave"/"rclick" -- see CCanvasWnd's handlers and CMainFrame::OpenCustomWindow's wiring of onCanvasEvent
 
@@ -2739,6 +2763,14 @@ protected:
     }
     // (the MDI-activate repaint timer that used to live here was specifically to fight the background-image race;
     // it's gone along with that feature, since a plain color via SetBackgroundColor doesn't have that problem)
+    // mIRC's "on ACTIVE" -- fires when this window becomes the active MDI child (switching to it with the mouse,
+    // keyboard, Window menu, or /window -a). OnMDIActivate is called by MFC's MDI frame machinery with
+    // bActivate=TRUE for the child gaining activation and FALSE for the one losing it -- only the gaining side
+    // fires a matching real-mIRC event (there's no separate "on DEACTIVE"), so only bActivate==TRUE is forwarded.
+    afx_msg void OnMDIActivate(BOOL bActivate, CWnd* pActivateWnd, CWnd* pDeactiveWnd) {   // message-map handler, not a virtual override -- see ON_WM_MDIACTIVATE() in this class's message map
+        CMDIChildWnd::OnMDIActivate(bActivate, pActivateWnd, pDeactiveWnd);
+        if (bActivate && onActivate) onActivate(this);
+    }
     afx_msg void OnDestroy() {
         if (m_cwDC) { ::SelectObject(m_cwDC, m_cwOldBmp); ::DeleteObject(m_cwBmp); ::DeleteDC(m_cwDC); m_cwDC = nullptr; m_cwBmp = nullptr; }
         CMDIChildWnd::OnDestroy(); if (onClose) onClose(this);
@@ -2806,11 +2838,12 @@ protected:
     DECLARE_MESSAGE_MAP()
 };
 BEGIN_MESSAGE_MAP(CChatWnd, CMDIChildWnd)
-    ON_WM_CREATE() 
-    ON_WM_SIZE() 
-    ON_WM_SETFOCUS() 
+    ON_WM_CREATE()
+    ON_WM_SIZE()
+    ON_WM_SETFOCUS()
     ON_WM_DESTROY()
     ON_WM_CTLCOLOR()
+    ON_WM_MDIACTIVATE()
     ON_LBN_DBLCLK(4, OnNickDbl)
     ON_BN_CLICKED(11, OnDccCancelClick) ON_BN_CLICKED(12, OnDccOpenFolderClick) ON_BN_CLICKED(13, OnDccOpenClick) ON_BN_CLICKED(14, OnDccCloseClick)
 END_MESSAGE_MAP()
@@ -2839,6 +2872,7 @@ void CCanvasWnd::OnPaint() {
 // continuous-hold movement) kept working fine since it's set unconditionally regardless of that branch.
 void CCanvasWnd::OnKeyDown(UINT vk, UINT, UINT flags) { if (owner) owner->OnCanvasKeyDown(vk, (flags & 0x4000) != 0); }
 void CCanvasWnd::OnKeyUp(UINT vk, UINT, UINT) { if (owner) owner->OnCanvasKeyUp(vk); }
+void CCanvasWnd::OnChar(UINT ch, UINT, UINT flags) { if (owner) owner->OnCanvasChar(ch, (flags & 0x4000) != 0); }   // on CHAR -- ch is the actual WM_CHAR codepoint (already OS-composed, e.g. a real accented character from a dead-key sequence), not a raw virtual-key code, same flags' bit-14 auto-repeat test as OnKeyDown
 // BUGFIX: "rclick" is one of real mIRC's reserved "Menu @window { ... }" canvas mouse labels, same family as
 // sclick/uclick/mouse/leave -- a script that defines one (asciipaint.mrc's right-click color-swap/secondary-color
 // picker, among others) expects it to run INSTEAD of the normal right-click popup, not alongside or never at all.
@@ -5526,8 +5560,8 @@ struct RemoteEvent {
     CString sourceFile;             // which script-kind file (a path from m_rfiles) this event came from -- empty if parsed from a source with no single file of its own. Exists so on LOAD/on UNLOAD (see FireScriptLoadEvent) can fire only the handlers belonging to the one script file actually being loaded/unloaded, not every other already-loaded script's on LOAD handler too.
 };
 static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in, const CString& sourceFile = CString()) {
-    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL", L"HOTLINK" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal; HOTLINK's against the hovered/clicked word (control codes stripped), same as $1
-    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"KEYUP", L"SOCKOPEN", L"SOCKREAD", L"SOCKCLOSE", L"SOCKLISTEN", L"HOTLINK" };   // CLOSE/KEYDOWN/KEYUP: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal, but matched against the /sockopen-given socket name instead of a window name. HOTLINK's where-spec is the window-type code (*,#,?,=,!,@), matched by MatchesHotlinkWhere.
+    static const wchar_t* const kNeedsMatch[] = { L"TEXT", L"ACTION", L"NOTICE", L"WALLOPS", L"SIGNAL", L"HOTLINK", L"DCCSERVER" };   // SIGNAL's matchtext is wildcard-matched against the signal name passed to /signal; HOTLINK's against the hovered/clicked word (control codes stripped), same as $1; DCCSERVER's against "Chat"/"Send"/"Fserve" -- no separate where-field at all, see FireDccServerEvent
+    static const wchar_t* const kNeedsWhere[] = { L"TEXT", L"ACTION", L"NOTICE", L"JOIN", L"PART", L"KICK", L"TOPIC", L"MODE", L"OP", L"DEOP", L"VOICE", L"DEVOICE", L"BAN", L"UNBAN", L"CLOSE", L"KEYDOWN", L"KEYUP", L"CHAR", L"SOCKOPEN", L"SOCKREAD", L"SOCKWRITE", L"SOCKCLOSE", L"SOCKLISTEN", L"HOTLINK", L"INPUT", L"ACTIVE" };   // ACTIVE's where-field is the same *#?=!@[,specific-name] code set as INPUT's -- matched by MatchesInputWhere, see FireActiveEvent. SOCKWRITE was missing here entirely despite FireSockEvent already firing it (see /sockwrite and /sockudp) -- any "on *:SOCKWRITE:name:{...}" script line could never actually parse, since nothing told ParseRemoteEvents this event even HAS a where-field (the socket name) to read before the command body -- a real UDPWRITE/SOCKWRITE naming-and-registration gap, not just a firing one.   // KEYDOWN/KEYUP: custom @window events -- where-spec is a comma list of window names/wildcards, matched by MatchesWhereSpec exactly like a channel list. CLOSE's where-spec accepts EITHER that same name-list form OR real mIRC's documented ?/@/=/!/* type-code form, matched by MatchesCloseWhere -- see Forget()/FireWindowEvent. SOCKOPEN/SOCKREAD/SOCKCLOSE/SOCKLISTEN: same deal as KEYDOWN/KEYUP, but matched against the /sockopen-given socket name instead of a window name. HOTLINK's where-spec is the window-type code (*,#,?,=,!,@), matched by MatchesHotlinkWhere. INPUT's is the same code set, PLUS an optional specific channel name/wildcard for "#" -- matched by MatchesInputWhere.
     auto inList = [](const CString& s, const wchar_t* const* list, int n) { for (int i = 0; i < n; i++) if (s == list[i]) return true; return false; };
     std::vector<RemoteEvent> out;
     CString curGroup;
@@ -5543,11 +5577,24 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
         { CString levelNum = level; levelNum.Remove(L'^'); levelNum.Remove(L'*'); ev.level = _wtoi(levelNum); }   // "*" (any level) parses to 0, same as a bare level field would
         int c2 = rest.Find(L':'); if (c2 < 0) continue;
         ev.eventName = rest.Left(c2); ev.eventName.MakeUpper(); rest = rest.Mid(c2 + 1);
-        if (inList(ev.eventName, kNeedsMatch, 6)) {
+        if (ev.eventName == L"OPEN" || ev.eventName == L"QUERYOPEN") {
+            // on <level>:OPEN:<?|@|=|!|*>:<matchtext>:<commands> -- the window-type field comes BEFORE matchtext
+            // here, the reverse of on TEXT's matchtext-then-type order, so this can't reuse the generic
+            // kNeedsMatch/kNeedsWhere field-order logic just below (which always reads matchtext first). QUERYOPEN
+            // is folded into the exact same field layout and firing point as OPEN's "?" (query-window) case --
+            // this client's own KB page for QUERYOPEN carries no documented syntax of its own (an empty stub, next
+            // to on PONG/on QUIT in its event index), and real mIRC's own official help only documents "on OPEN"
+            // at all, never a separate QUERYOPEN, so treating QUERYOPEN as an alias rather than inventing a
+            // distinct, undocumented field layout for it is the honest reading -- see FireOpenEvent.
+            int c3 = rest.Find(L':'); if (c3 < 0) continue;
+            ev.whereSpec = rest.Left(c3); rest = rest.Mid(c3 + 1);
+            int c4 = rest.Find(L':'); if (c4 < 0) continue;
+            ev.matchText = rest.Left(c4); rest = rest.Mid(c4 + 1);
+        } else if (inList(ev.eventName, kNeedsMatch, 7)) {
             int c3 = rest.Find(L':'); if (c3 < 0) continue;
             ev.matchText = rest.Left(c3); rest = rest.Mid(c3 + 1);
         }
-        if (inList(ev.eventName, kNeedsWhere, 21)) {
+        if (ev.eventName != L"OPEN" && ev.eventName != L"QUERYOPEN" && inList(ev.eventName, kNeedsWhere, 25)) {
             // The where-spec is a single ":"-delimited field (a window name/wildcard, or a comma list of them for
             // CLOSE) immediately before the command body, so the naive first-colon search is correct UNLESS that
             // field is itself followed by another field before the body -- which is exactly KEYDOWN's real mIRC
@@ -5570,7 +5617,7 @@ static std::vector<RemoteEvent> ParseRemoteEvents(const std::vector<CString>& in
             // set -- e.g. Ctrl+Z firing pe.undo *and* pe.exportimage's Save-As file dialog in the same keystroke).
             int c4 = rest.Find(L':'); if (c4 < 0) continue;
             ev.whereSpec = rest.Left(c4); rest = rest.Mid(c4 + 1);
-            if (ev.eventName == L"KEYDOWN" || ev.eventName == L"KEYUP") {
+            if (ev.eventName == L"KEYDOWN" || ev.eventName == L"KEYUP" || ev.eventName == L"CHAR") {   // CHAR reuses this same window-field-then-key/codepoint-field-then-commands layout -- "on LEVEL:CHAR:@window:38,42,55,78:{ ... }" -- see MatchesCharSpec
                 int c5 = rest.Find(L':'); if (c5 < 0) continue;
                 ev.keySpec = rest.Left(c5); ev.keySpec.Trim();
                 rest = rest.Mid(c5 + 1);
@@ -5854,6 +5901,44 @@ static bool MatchesKeySpec(const CString& spec, int vk) {
     if (kw.GetLength() == 1) { wchar_t c = kw[0]; if (c >= L'a' && c <= L'z') return vk == (int)(c - L'a' + L'A'); }   // a single letter: "z" matches VK 'Z'
     return false;
 }
+// CHAR's own field: a comma-separated list of codepoints ("38,42,55,78"), or "*" (or empty) for any -- unlike
+// KEYDOWN/KEYUP's key field, there's no named-key shorthand here, just plain decimal Unicode codepoints.
+static bool MatchesCharSpec(const CString& spec, int codepoint) {
+    CString s = spec; s.Trim();
+    if (s.IsEmpty() || s == L"*") return true;
+    int pos = 0;
+    for (;;) {
+        int comma = s.Find(L',', pos);
+        CString one = comma < 0 ? s.Mid(pos) : s.Mid(pos, comma - pos); one.Trim();
+        if (!one.IsEmpty() && _wtoi(one) == codepoint) return true;
+        if (comma < 0) break;
+        pos = comma + 1;
+    }
+    return false;
+}
+// CLOSE's own where-field: real mIRC documents it as the same ?/@/=/!/* window-TYPE code set on CLOSE uses on
+// OPEN, but every real-world script actually seen here instead writes a plain comma list of specific window
+// NAMES (Tetris's own "on *:CLOSE:@Tetris,@Tetris:{...}") -- the same convention KEYDOWN/KEYUP's window field
+// uses. Rather than pick one and break the other, this accepts EITHER in the same comma-separated field: a
+// bare single-character token is matched as a type code against 'kind', anything else as a GlobMatch wildcard
+// against the window's own name.
+static bool MatchesCloseWhere(const CString& spec, wchar_t kind, const CString& winName) {
+    CString s = spec; s.Trim();
+    if (s.IsEmpty() || s == L"*") return true;
+    int pos = 0;
+    for (;;) {
+        int comma = s.Find(L',', pos);
+        CString one = comma < 0 ? s.Mid(pos) : s.Mid(pos, comma - pos); one.Trim();
+        if (!one.IsEmpty()) {
+            if (one.GetLength() == 1 && (one[0] == L'*' || one[0] == L'#' || one[0] == L'?' || one[0] == L'=' || one[0] == L'!' || one[0] == L'@')) {
+                if (one[0] == kind) return true;
+            } else if (GlobMatch(one, winName)) return true;
+        }
+        if (comma < 0) break;
+        pos = comma + 1;
+    }
+    return false;
+}
 static bool MatchesTextWhere(const CString& spec, bool isPriv, const CString& chanOrNick) {   // TEXT/ACTION/NOTICE
     CString s = spec; s.Trim();
     if (s.IsEmpty() || s == L"*") return true;
@@ -5879,6 +5964,29 @@ static bool MatchesHotlinkWhere(const CString& spec, wchar_t kind) {
     CString s = spec; s.Trim();
     if (s.IsEmpty() || s == L"*") return true;
     for (int i = 0; i < s.GetLength(); i++) if (s[i] == kind) return true;   // mIRC allows the window-type field to list more than one code with no separator, e.g. "#?"
+    return false;
+}
+// INPUT's where-spec: real mIRC documents it as one of *,#,?,=,!,@ (any window / any channel / query / DCC chat /
+// fserve / custom), same code set as HOTLINK -- but ALSO documents "#" as accepting a specific channel name (or a
+// comma list of them) to restrict the handler to just that channel's input box, not every channel. So unlike
+// MatchesHotlinkWhere (bare kind-code only), this checks each comma-separated token as EITHER a bare kind-code
+// (matched against this window's own kind char) OR, for a channel window specifically, a wildcard matched against
+// the channel's actual name.
+static bool MatchesInputWhere(const CString& spec, wchar_t kind, const CString& chanName) {
+    CString s = spec; s.Trim();
+    if (s.IsEmpty() || s == L"*") return true;
+    int pos = 0;
+    for (;;) {
+        int comma = s.Find(L',', pos);
+        CString one = comma < 0 ? s.Mid(pos) : s.Mid(pos, comma - pos); one.Trim();
+        if (!one.IsEmpty()) {
+            if (one.GetLength() == 1 && (one[0] == L'*' || one[0] == L'#' || one[0] == L'?' || one[0] == L'=' || one[0] == L'!' || one[0] == L'@')) {
+                if (one[0] == kind) return true;
+            } else if (kind == L'#' && GlobMatch(one, chanName)) return true;
+        }
+        if (comma < 0) break;
+        pos = comma + 1;
+    }
     return false;
 }
 
@@ -7369,6 +7477,16 @@ class CMainFrame : public CMDIFrameWnd {
     // 0=Socks4, 1=Socks5, 2=Proxy (HTTP CONNECT) -- +1 maps it onto ProxyProto, which reserves 0 for None itself.
     int m_proxyConnFor = 0, m_proxyProto = 1; CString m_proxyHost, m_proxyUser, m_proxyPass, m_proxyExceptions; UINT m_proxyPort = 1080;
     bool ProxyAppliesToServer() const { return m_proxyConnFor == 1 || m_proxyConnFor == 3; }
+    // /bindip [on [IP|adapter] | off] -- m_bindIp is only ever matched against via InetPtonW (see CIrcSock::ConnectSmart's
+    // new bindAddr parameter), so a literal IPv4/IPv6 address works exactly like real mIRC; a network-ADAPTER name (the
+    // other thing real mIRC's own help text allows there) would need enumerating this machine's adapters and is not
+    // attempted here -- InetPtonW on a non-IP string just fails to parse and ConnectSmart silently skips the bind,
+    // same end result (falls back to the OS's default outgoing interface) as giving mIRC an adapter it can't resolve.
+    bool m_bindIpOn = false; CString m_bindIp;
+    int m_maxDepth = 500;   // /maxdepth <1-100> -- real mIRC's own cap on a single alias's recursion depth; RunAlias's "nested too deeply" check below reads this instead of a hardcoded 500
+    ULONGLONG m_idleResetTick = 0;   // /resetidle -- virtual "last input" GetTickCount64() value; see the $idle identifier for how it's combined with the real GetLastInputInfo() value
+    int m_fsendN = -1; bool m_fsendOn = false;   // /fsend [on|off|N] -- this client's DCC sends are already as fast as CAsyncSocket allows, with no separate "fast send" code path of their own to switch between, so this only stores/reports the setting a script expects to read back, same as real mIRC's own -1 == "never set" default
+    int m_fupdateN = 0;   // /fupdate [N] -- likewise just the stored display-update-delay setting; this client already repaints incrementally rather than batching redraws, so there's no delay loop of its own for this to actually throttle
     bool ProxyAppliesToDcc() const { return m_proxyConnFor == 2 || m_proxyConnFor == 3; }
     bool ProxyExceptionMatches(const CString& host) const {   // each line of m_proxyExceptions is a wildcard host/IP mask that bypasses the proxy, same spirit as every other mask list in this client (ignore, highlight, ...)
         CString list = m_proxyExceptions; int pos = 0;
@@ -7397,6 +7515,7 @@ class CMainFrame : public CMDIFrameWnd {
     SoundChannel m_waveChan{ L"ircwave" }, m_midiChan{ L"ircmidi" }, m_mp3Chan{ L"ircmp3" };
     ISpVoice* m_spVoice = nullptr;   // /speak -- lazily created on first use; see EnsureSpVoice
     CString m_soundDirWave, m_soundDirMidi, m_soundDirMp3, m_soundDirWma, m_soundDirOgg;
+    bool m_acceptSoundRequests = true;   // /sound on|off -- real mIRC's own default is enabled; a disconnected client never actually receives a CTCP SOUND to honor this against yet, but /sound on/off itself still needs somewhere to store the setting
     // ---- Address Book (phase 1: the Users tab only -- Whois/Notify/Control/Colors/Highlight are placeholders for now) ----
     std::vector<AddressEntry> m_abook;
     // ---- File and directory identifiers: small bits of state a few of them need ----
@@ -7576,8 +7695,9 @@ class CMainFrame : public CMDIFrameWnd {
     CString m_lastExecLine;   // the raw text of whatever script line most recently started executing -- surfaced by the watchdog message in ExecNodes so "taking too long" says WHAT it was stuck on, not just that it happened
     bool m_silentCmd = false;   // true while running a "."-prefixed command -- see Dispatch's SilentGuard; individual command handlers that show their own confirmation/status line (CmdTimer's "activated", etc.) check this and skip it
     struct SilentGuard { CMainFrame* f; bool saved; SilentGuard(CMainFrame* p, bool v) : f(p), saved(p->m_silentCmd) { f->m_silentCmd = v; } ~SilentGuard() { f->m_silentCmd = saved; } };
-    int m_lastKeyVal = 0;   // $keyval: the key code from the most recent on KEYDOWN, across every custom window (mIRC keeps this as a single global, not per-window) -- see CChatWnd::onCanvasKey
-    bool m_lastKeyRepeat = false;   // $keyrpt: whether that most recent on KEYDOWN was an OS auto-repeat (key held) rather than a genuine first press -- see CCanvasWnd::OnKeyDown's comment
+    int m_lastKeyVal = 0;   // $keyval: the key code from the most recent on KEYDOWN (or codepoint from the most recent on CHAR), across every custom window (mIRC keeps this as a single global, not per-window) -- see CChatWnd::onCanvasKey
+    bool m_lastKeyRepeat = false;   // $keyrpt: whether that most recent on KEYDOWN/on CHAR was an OS auto-repeat (key held) rather than a genuine first press -- see CCanvasWnd::OnKeyDown's comment
+    CString m_lastKeyChar;   // $keychar: the actual character from the most recent on CHAR (ch.Format(L"%c", codepoint)) -- KEYDOWN/KEYUP never set this, only on CHAR does, since only on CHAR deals in resulting characters rather than raw virtual-key codes
     VarMap m_vars; std::vector<VarScope> m_scopes; bool m_varsDirty = false;   // global variables (vars.ini) and the stack of per-script local scopes
 
     static bool IsChan(const CString& s) { return !s.IsEmpty() && wcschr(L"#&+!", s[0]); }
@@ -7602,6 +7722,7 @@ class CMainFrame : public CMDIFrameWnd {
                     Note(net, L"Connection/TLS failed (status " + hex + L"). If TLS is on, the most common cause is connecting to a plaintext port; "
                          L"try the server's TLS port (often 6697) instead.", cPart);
                 }
+                FireSimpleEvent(Status(net), L"CONNECTFAIL", CString(), CString(), CString());   // on CONNECTFAIL -- the TCP/TLS connect itself never got to a working IRC connection at all (distinct from on DISCONNECT below, which is for a connection that WAS up and then dropped)
                 return;
             }
             net->conn = true; Note(net, L"Connected. Registering...");
@@ -7611,7 +7732,11 @@ class CMainFrame : public CMDIFrameWnd {
             Send(net, L"NICK " + net->nick); Send(net, L"USER " + net->o.user + L" 0 * :" + net->o.real);
         };
         net->sock.onLine = [this, net](const CString& s) { OnLine(net, s); };
-        net->sock.onDrop = [this, net]() { net->conn = false; SetState(net, L"Disconnected"); Note(net, L"* Disconnected.", cQuit); };
+        net->sock.onDrop = [this, net]() {
+            bool wasConnected = net->conn;   // on DISCONNECT only fires for a connection that was actually up (registered or mid-registration) -- a drop before that point is CONNECTFAIL's job above, not this one
+            net->conn = false; SetState(net, L"Disconnected"); Note(net, L"* Disconnected.", cQuit);
+            if (wasConnected) FireSimpleEvent(Status(net), L"DISCONNECT", CString(), CString(), CString());
+        };
     }
     void Show(CChatWnd* w, const CString& t, COLORREF c = cText, int tsOverride = -1) {
         if (!w) return;
@@ -7715,6 +7840,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
+        w->onActivate = [this](CChatWnd* c) { FireActiveEvent(c); };
         w->onNickMenu = [this](CChatWnd* c, CString nick, CPoint pt) { ShowNickMenu(c, nick, pt); };
         w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return m_hlMenuSet ? ShowHotlinkPopup(c, pt) : ShowWindowPopup(c, pt); };
         w->onHotlinkFire = [this](CChatWnd* c, const CString& word, const CString& line, int lineNo, int wordPos, int charPos, const CString& evt) { FireHotlinkEvent(c, word, line, lineNo, wordPos, charPos, evt); };
@@ -7744,6 +7870,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };
         w->onClose = [this](CChatWnd* c) { Forget(c); };
         w->onOpen = [this](CChatWnd* c, CString t) { Goto(c->net, t); };
+        w->onActivate = [this](CChatWnd* c) { FireActiveEvent(c); };
         w->onLogMenu = [this](CChatWnd* c, CPoint pt) { return m_hlMenuSet ? ShowHotlinkPopup(c, pt) : ShowCustomPopup(c, pt); };
         w->onHotlinkFire = [this](CChatWnd* c, const CString& word, const CString& line, int lineNo, int wordPos, int charPos, const CString& evt) { FireHotlinkEvent(c, word, line, lineNo, wordPos, charPos, evt); };
         w->onCanvasKey = [this](CChatWnd* c, UINT vk, bool isRepeat) {   // on KEYDOWN: fired for whichever custom window currently has keyboard focus -- see CCanvasWnd/ShowCanvas
@@ -7755,6 +7882,11 @@ class CMainFrame : public CMDIFrameWnd {
             m_lastKeyVal = (int)vk;
             CString params; params.Format(L"%d", (int)vk);
             FireWindowEvent(c, L"KEYUP", c->m_name, params);
+        };
+        w->onCanvasChar = [this](CChatWnd* c, UINT ch, bool isRepeat) {   // on CHAR: the resulting-character companion to on KEYDOWN -- see CCanvasWnd::OnChar
+            m_lastKeyVal = (int)ch; m_lastKeyRepeat = isRepeat; m_lastKeyChar.Format(L"%c", (wchar_t)ch);
+            CString params; params.Format(L"%d", (int)ch);
+            FireWindowEvent(c, L"CHAR", c->m_name, params);
         };
         w->onCanvasEvent = [this](CChatWnd* c, CPoint, const CString& evt) {   // mIRC's canvas mouse labels -- "sclick"/"uclick"/"mouse"/"leave" -- run that window's own popup.txt (or, far more commonly, its "Menu @windowname { ... }" block) item literally titled that (same convention real mIRC uses: a reserved top-level label, not a real menu entry -- ShowCustomPopup filters these back out of the visible right-click menu for the same reason). Was entirely unwired before (and, for a while, wired ONLY for "sclick" and fired on the wrong edge, button-UP instead of button-DOWN) -- a click on the canvas only ever updated $mouse.x/$mouse.y, with nothing to actually run the window's own handler, which is exactly why clicking @Tetris to pause/unpause (its "Menu @Tetris { sclick:{ ... } }") never did anything, and why PixelEditor.mrc's drag-to-draw tools (anchored on sclick, live-updated via mouse, committed on uclick/leave) couldn't draw at all even once sclick alone was wired.
             // A script almost always defines its custom window's menu with "Menu @windowname { ... }" rather than
@@ -7806,7 +7938,15 @@ class CMainFrame : public CMDIFrameWnd {
         // redundant, re-entrant close of this one -- it's already on its way out.
         if (c->m_closing) return;
         c->m_closing = true;
-        if (c->m_custom) FireWindowEvent(c, L"CLOSE", c->m_name, CString());   // on CLOSE -- fires here rather than in OnDestroy's handler directly, since this is reached both from the user clicking the system close box and from /window -c
+        // on CLOSE -- fires here rather than in OnDestroy's handler directly, since this is reached both from the
+        // user clicking the system close box and from /window -c (and now also from a query/DCC-chat/DCC-fserve
+        // window closing, not just a custom @window -- real mIRC's own docs: "Query windows: CLOSE fires when
+        // you close one. DCC chat: CLOSE fires when the session ends or you close the chat window. DCC
+        // fileserver: CLOSE fires when it closes. Custom windows: CLOSE fires when the window closes." -- and,
+        // just as explicitly, "These events do not trigger for any other types of windows," which is why channel
+        // windows (kind '#', handled by on PART instead) and the status window (kind '*') are excluded here).
+        wchar_t closeKind = HotlinkKindOf(c);
+        if (closeKind == L'@' || closeKind == L'?' || closeKind == L'=') FireWindowEvent(c, L"CLOSE", c->m_name, CString());
         Net* net = c->net;
         for (auto i = m_w.begin(); i != m_w.end(); ++i)
             if (i->second == c) { if (c->m_chan && net && net->conn) Send(net, L"PART " + c->m_name); m_w.erase(i); break; }
@@ -7850,6 +7990,12 @@ class CMainFrame : public CMDIFrameWnd {
         if (!net || !net->conn) { Note(net, L"Not connected. Use /server <host> [port]", cPart); return; }
 #endif
         l.Remove(L'\r'); l.Remove(L'\n');
+        {   // on PARSELINE:out -- fires before this client writes the line to the wire, so a matching script's $parseline(...) rewrite takes effect on what's actually sent. Real mIRC's docs note the line carries a trailing $LF for matchtext purposes on this side; emulate that with a throwaway "+ \n" copy used only for the event, then strip it back off before continuing with the real send.
+            CString outLine = l + L"\n";
+            FireParselineEvent(Status(net), L"out", outLine);
+            if (!outLine.IsEmpty() && outLine[outLine.GetLength() - 1] == L'\n') outLine = outLine.Left(outLine.GetLength() - 1);
+            l = outLine;
+        }
         DebugLine(net, L"->", l);
         CW2A conv(l, CP_UTF8);
         CStringA u((LPCSTR)conv);
@@ -7878,12 +8024,12 @@ class CMainFrame : public CMDIFrameWnd {
             net->sock.px.targetHost = host; net->sock.px.targetPort = port;
             Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L" via proxy " + m_proxyHost + L"...");
             SetState(net, L"Connecting via proxy...");
-            if (!net->sock.ConnectSmart(m_proxyHost, m_proxyPort)) Note(net, L"Connect failed", cPart);
+            if (!net->sock.ConnectSmart(m_proxyHost, m_proxyPort, m_bindIpOn ? m_bindIp : CString())) Note(net, L"Connect failed", cPart);   // /bindip: the socket that actually leaves this machine here is the one to the proxy, so the bind applies to THIS ConnectSmart call, not a separate one to the real target (the tunnel to the real target is negotiated over this same already-bound socket)
         } else {
             net->sock.px.proto = ProxyProto::None;
             Note(net, L"Connecting to " + host + (net->o.tls ? L" (TLS)" : L"") + L"...");
             SetState(net, L"Connecting to " + host + L"...");
-            if (!net->sock.ConnectSmart(host, port)) Note(net, L"Connect failed", cPart);
+            if (!net->sock.ConnectSmart(host, port, m_bindIpOn ? m_bindIp : CString())) Note(net, L"Connect failed", cPart);
         }
     }
     void ShowNickMenuLegacy(CChatWnd* c, const CString& nick, CPoint pt) {   // the built-in Whois / Query / Notice menu, used when [lpopup] is empty
@@ -7999,6 +8145,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"keyval") { val.Format(L"%d", m_lastKeyVal); return true; }   // the key code from the most recent on KEYDOWN (see m_lastKeyVal's own comment)
         if (name == L"keyrpt") { val = m_lastKeyRepeat ? L"$true" : L"$false"; return true; }   // was the most recent on KEYDOWN an OS auto-repeat (key held) rather than a fresh press -- see m_lastKeyRepeat's own comment for why this being missing broke every single-press key action in the game
+        if (name == L"keychar") { val = m_lastKeyChar; return true; }   // on CHAR only: the actual resulting character (as opposed to $keyval's raw codepoint number) -- see m_lastKeyChar
         if (name == L"show") { val = m_silentCmd ? L"$false" : L"$true"; return true; }   // $true if the currently-running alias/command was NOT called with a silencing "." prefix (see SilentGuard/m_silentCmd) -- scripts commonly use this to tell an interactive call apart from a silent internal replay of the same alias, which is exactly how PixelEditor.mrc's pe.drawdot/pe.replacecolour (and similar) decide whether to push a new undo-stack entry (an interactive draw) or not (a ".pe.drawdot ..." replay triggered by undo/redo itself) -- unimplemented, this was being left as literal, always-truthy text by the unrecognized-identifier fallback, so "if ($show) iline @pe.undo 1 ..." always took the push branch even during an undo replay, corrupting the undo stack instead of consuming it (the net effect: Ctrl+Z redrew the same pixel instead of reverting it, so nothing visibly changed).
         if (name == L"me") { val = net ? net->nick : CString(); return true; }
         if (name == L"pnick") { val = m_pnick; return true; }   // the nick/channel /play is currently sending to
@@ -8035,7 +8182,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"findfilen") { val.Format(L"%d", m_findfileN); return true; }   // same, for $findfile(...,command)
         if (name == L"mp3dir") { val = m_soundDirMp3; return true; }   // deprecated by real mIRC in favor of $sound(mp3) -- same configured folder, read straight from the same field
         if (name == L"wavedir") { val = m_soundDirWave; return true; }   // deprecated by real mIRC in favor of $sound(wave) -- same configured folder, read straight from the same field
-        if (name == L"filename") { val.Empty(); return true; }   // set only inside a matching on FILERCVD/FILESENT/PLAYEND event -- this client doesn't fire any of those three events yet (a gap in its event coverage, not this identifier specifically), so always empty (documented gap)
+        if (name == L"filename") { val = m_evFilename; return true; }   // set only inside a matching on FILESENT/FILERCVD/SENDFAIL/GETFAIL/PLAYEND/DCCSERVER(Send) handler -- see m_evFilename
         if (name == L"cd") { val.Empty(); return true; }   // the folder a user is browsing within a /fserve session, meaningful only inside a matching on SERV event -- this client's /fserve handles its built-in commands (cd/dir/get/etc) directly in C++ rather than through a scriptable on SERV hook, so there's no running event context for this to read; always empty (documented gap)
         if (name == L"away") { val = (net && net->awayTick) ? L"$true" : L"$false"; return true; }
         if (name == L"awaymsg") { val = net ? net->awayMsg : CString(); return true; }
@@ -8079,6 +8226,10 @@ class CMainFrame : public CMDIFrameWnd {
             else val.Empty();
             return true;
         }
+        if (name == L"lactive") { val = m_lactiveWin; return true; }   // on ACTIVE only: the window that was active just before this one -- see FireActiveEvent/m_lactiveWin
+        if (name == L"lactivecid") { val = m_lactiveWin.IsEmpty() ? CString() : CString(std::to_wstring(m_lactiveCid).c_str()); return true; }
+        if (name == L"lactivewid") { val = m_lactiveWin.IsEmpty() ? CString() : CString(std::to_wstring(m_lactiveWid).c_str()); return true; }
+        if (name == L"appactive") { val = m_appActive ? L"$true" : L"$false"; return true; }   // whether this application currently has OS focus -- see CMainFrame::OnActivateApp/m_appActive
         if (name == L"cmdline") { val = ::GetCommandLineW(); return true; }
         if (name == L"flinen") { val.Format(L"%d", m_flinen); return true; }
         if (name == L"notify") { val = m_notifyOn ? L"$true" : L"$false"; return true; }
@@ -8236,9 +8387,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"clevel") { val = m_evLevel; return true; }
         if (name == L"rawmsg") { val = m_evRawMsg; return true; }   // the exact, unparsed server line, only set within a matching on RAW event
         if (name == L"regerrstr") { val = m_regErrStr; return true; }   // the last $regex/$regsub/$regsubex compile error, if any -- std::regex's own error text, not literally PCRE's wording
-        if (name == L"appactive") { val = (::GetForegroundWindow() && ::GetWindowThreadProcessId(::GetForegroundWindow(), nullptr) == ::GetCurrentProcessId()) ? L"$true" : L"$false"; return true; }   // $true if any window of this process (not necessarily this specific one) currently has focus
         if (name == L"cb") { val = ReadClipboardText(); return true; }   // bare form: the full clipboard text, newlines included -- same as $cb(-1)
-        if (name == L"ial") { val = L"$true"; return true; }   // bare form: on/off status -- always on here, since this client has no /ial off equivalent to actually disable it   // the <level> number from the specific "on <level>:EVENT:..." declaration currently running -- written as-is, NOT an enforced access check (see RemoteEvent::level's own comment); empty outside an event   // the signal name that triggered the current on SIGNAL event; empty outside one
+        if (name == L"ial") { val = m_ialEnabled ? L"$true" : L"$false"; return true; }   // bare form: on/off status, now that /ial on|off (see its own comment) actually has somewhere to store it   // the <level> number from the specific "on <level>:EVENT:..." declaration currently running -- written as-is, NOT an enforced access check (see RemoteEvent::level's own comment); empty outside an event   // the signal name that triggered the current on SIGNAL event; empty outside one
         if (name == L"target") { val = !m_evChan.IsEmpty() ? m_evChan : m_evNick; return true; }   // "where the event took place" -- a channel or query's nick, for the common events (text/join/part/etc) that already track $chan/$nick; events this client doesn't give a distinct target for (like on CLOSE's own window name) aren't specifically covered
 
         if (name == L"wildsite") {   // the host portion of $address, wildcarded to *!*@host form -- empty outside an event, same as $address itself
@@ -8248,6 +8398,7 @@ class CMainFrame : public CMDIFrameWnd {
             return true;
         }
         if (name == L"knick") { val = m_evKnick; return true; }   // on KICK only: the nick who got kicked ($nick is the kicker)
+        if (name == L"ownick") { val = m_evOwnick; return true; }     // on OWNER/DEOWNER only: the nick who was given/removed owner status ($nick is who made the change)
         if (name == L"opnick") { val = m_evOpnick; return true; }     // on OP/DEOP only: the nick who was given/removed op ($nick is who made the change)
         if (name == L"vnick") { val = m_evVnick; return true; }       // on VOICE/DEVOICE only: the nick who was given/removed voice
         if (name == L"bnick") { val = m_evBnick; return true; }       // on BAN/UNBAN only: the ban mask that was set/removed (not necessarily a nick, despite the name -- matches mIRC's own naming)
@@ -8284,8 +8435,20 @@ class CMainFrame : public CMDIFrameWnd {
         }
         if (name == L"ctime") { val.Format(L"%I64d", (__int64)time(nullptr)); return true; }   // $ctime(text) -- the parenthesized form -- is in FuncValue
         if (name == L"ctimer") { val = m_ctimer; return true; }   // the name of the /timer currently running, outside one too (empty)
+        if (name == L"exiting") { val = m_exiting ? L"1" : L""; return true; }   // on EXIT only: real mIRC also uses 2 for "exiting to restart" -- this client has no restart-the-app feature, so it's always 1 (or $null, before on EXIT fires)
+        if (name == L"parsetype") { val = m_evParseType; return true; }   // on PARSELINE only: "in" or "out"
+        if (name == L"parseutf") { val = L"1"; return true; }   // on PARSELINE only: whether this client will UTF-8 en/decode the line after the event -- always true here, every line this client sends/receives already goes through CW2A(...,CP_UTF8)/its inverse regardless of what on PARSELINE does
+        if (name == L"parseline") { val = m_parseLineCur; return true; }   // on PARSELINE only, called bare with no (args) -- reads the line as it currently stands. The WITH-argument rewriting form ($parseline(new text)) needs the raw argument text/params that aren't available here -- see the "parseline" case in FuncValue just below, which IdentValue's caller tries first whenever "(" is present and only falls back to this bare case if that returns false (it never does, since FuncValue claims the name unconditionally).
         if (name == L"idle") {   // seconds since the last keyboard/mouse input anywhere on the system -- Windows tracks this natively (GetLastInputInfo), no input hook of this client's own needed
-            LASTINPUTINFO lii = { sizeof lii }; if (GetLastInputInfo(&lii)) val.Format(L"%I64d", (ULONGLONG)((GetTickCount64() - lii.dwTime) / 1000)); else val = L"0";
+            // BUGFIX (/resetidle support): GetLastInputInfo can't itself be told "pretend the user just typed", so
+            // /resetidle instead records a virtual last-input tick in m_idleResetTick and this identifier reports
+            // whichever "last input" -- real or virtual -- is more recent. A real keypress after /resetidle correctly
+            // starts lowering $idle again from that real event, since GetTickCount64() - lii.dwTime naturally drops
+            // below the (now-aging) virtual value once enough real time has passed without further input.
+            ULONGLONG now = GetTickCount64();
+            LASTINPUTINFO lii = { sizeof lii }; ULONGLONG realLast = GetLastInputInfo(&lii) ? (ULONGLONG)lii.dwTime : 0;
+            ULONGLONG effectiveLast = (m_idleResetTick > realLast) ? m_idleResetTick : realLast;
+            val.Format(L"%I64d", (ULONGLONG)((now - effectiveLast) / 1000));
             return true;
         }
         if (name == L"logstamp") { val = FormatMircDate(CTime::GetCurrentTime(), m_tsLogFmt); return true; }
@@ -8653,6 +8816,11 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- $functions(...) : $calc $round $int $chr $var ----
     // Returns false if 'name' isn't one (or its arguments are unusable), so the text is left exactly as typed.
     bool FuncValue(CChatWnd* w, const CString& name, const CString& rawArgs, const CString& prop, const CString& params, CString& val) {
+        if (name == L"parseline") {   // on PARSELINE only: $parseline(new text) -- called WITH an argument, this rewrites the line itself for the rest of this event firing AND for whatever's about to be sent/parsed afterward. FireParselineEvent reads m_parseLineRewritten back out after RunScript returns and, if set, substitutes m_parseLineRewrite for the line it's about to send on to OnLine's normal parsing / Send's normal wire-out. The bare no-args read ($parseline with no parens) is handled over in IdentValue instead -- FuncValue is only reached at all when "(" follows the name, so it always owns the WITH-argument form.
+            val = EvalIds(w, rawArgs, params);
+            m_parseLineRewrite = val; m_parseLineRewritten = true;
+            return true;
+        }
         if (name == L"width" || name == L"height") {   // $width(text,font,size[,bold]) / $height(text,font,size[,bold]) -- Tetris uses both to center/right-align drawn text
             std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
             if (p.size() < 3) return false;
@@ -12737,7 +12905,7 @@ class CMainFrame : public CMDIFrameWnd {
         // engine's property-access sugar needs more real call depth than a hand-written script alone would -- this
         // cap needs to grow to match that, not stay pinned to a limit sized for nesting as mIRC scripts actually
         // write it.
-        if (m_runStack.size() >= 500) { Show(w, L"* Aliases nested too deeply (/" + ad.name + L")", cPart); m_halt = true; return; }
+        if ((int)m_runStack.size() >= m_maxDepth) { Show(w, L"* Aliases nested too deeply (/" + ad.name + L")", cPart); m_halt = true; return; }   // was a hardcoded 500 (see the comment above for why that wide a default is needed); now /maxdepth-configurable via m_maxDepth, still defaulting to 500
         CString savedProp = m_prop; m_prop = prop; m_runStack.push_back(ad.name); m_aliasFileStack.push_back(ad.sourceFile);
         // m_depth++/-- here (not just at the handful of outer wrapper call sites) is what makes RunScript's own
         // m_depth==0 watchdog-reset check mean "truly top-level", for every path an alias can be reached from --
@@ -12984,12 +13152,13 @@ class CMainFrame : public CMDIFrameWnd {
     int m_sockBr = 0;     // what $sockbr returns -- bytes read by the last /sockread call, set fresh by every /sockread; 0 is how a script's own "sockread %x | if ($sockbr != 0) { ... goto nextline }" drain loop (the standard mIRC SOCKREAD idiom) knows the buffer is empty and stops, instead of looping forever on an unrecognized identifier that never compares equal to 0
     CString m_evLevel;    // what $clevel returns -- the <level> number from the specific "on <level>:EVENT:..." declaration that actually matched and is currently running; empty outside an event
     CString m_evRawMsg;   // what $rawmsg returns -- the exact, full, unparsed line as received from the server, only set within a matching on RAW event
-    CString m_evOpnick, m_evVnick, m_evBnick, m_evHnick;   // $opnick/$vnick/$bnick/$hnick -- the nick (op/voice/help) or ban mask that a specific on OP/DEOP/VOICE/DEVOICE/HELP/DEHELP/BAN/UNBAN event fired for; $nick in these events is still who MADE the change
+    CString m_evOpnick, m_evVnick, m_evBnick, m_evHnick, m_evOwnick;   // $opnick/$vnick/$bnick/$hnick/$ownick -- the nick (op/voice/help/owner) or ban mask that a specific on OP/DEOP/VOICE/DEVOICE/HELP/DEHELP/BAN/UNBAN/OWNER/DEOWNER event fired for; $nick in these events is still who MADE the change
     // $mode(N)[.op/.deop/.voice/.devoice/.help/.dehelp/.owner/.deowner/.ban/.unban] -- rebuilt fresh at the top of every FireModeEvents call (one whole MODE line), in the order each target appeared. m_modeAll is every targeted nick/mask across the WHOLE line (what plain $mode(N)/$mode(0) reads), even though a given on OP/VOICE/BAN event only fires for its own kind -- matches the doc's own "+ob nick test" example, where $mode(0) is 2 even though only one event (on op) actually ran. Owner's mode LETTER is looked up dynamically from the server's own 005 PREFIX= (net->prefixSymbols/prefixModes), not hardcoded, since different ircds use different letters for the '~' tier; real mIRC has no on OWNER/DEOWNER event or $ownick identifier, so owner/deowner are tracked here ONLY for $mode(N)'s own two properties.
     std::vector<CString> m_modeAll, m_modeOp, m_modeDeop, m_modeVoice, m_modeDevoice, m_modeBan, m_modeUnban, m_modeHelp, m_modeDehelp, m_modeOwner, m_modeDeowner;
     CString m_regErrStr;   // what $regerrstr returns -- the last $regex/$regsub/$regsubex compile error, if any. std::regex_error's own what() text, not literally PCRE's wording (this client uses std::regex, not PCRE), but the same role: a human-readable reason the pattern failed to compile.
     CString m_evNick, m_evChan, m_evAddress, m_evKnick, m_evNewnick, m_evName, m_evNumeric;   // what $nick, $chan, $address, $knick,
     bool m_evHaltDef = false;   // $newnick, $event, $numeric resolve to while an event's commands are running
+    CString m_evFilename;   // $filename -- set only inside a matching on FILESENT/FILERCVD/SENDFAIL/GETFAIL/PLAYEND/DCCSERVER(Send) handler, see FireSimpleEvent/FireDccServerEvent
     // ---- on HOTLINK / $hotlink / $hotline / $hotlinepos / /hotlink -- see CLogEdit::onHotlink, FireHotlinkEvent ----
     CString m_hlWordRaw, m_hlWord, m_hlMatch, m_hlEvent, m_hlLine, m_hlType;   // m_hlWordRaw keeps control codes ($hotlink(word)); m_hlWord/m_hlMatch are stripped ($1, $hotlink(match))
     int m_hlLineNo = 0, m_hlWordPos = 0, m_hlMatchPos = 0;
@@ -13003,7 +13172,8 @@ class CMainFrame : public CMDIFrameWnd {
     // PRIVMSG/NOTICE, PART, KICK, NICK, QUIT -- anywhere this file already has both a nick and a host on hand).
     // Backs $address(nick,type)/$wildsite(nick)-style lookups for nicks other than whoever triggered the current event.
     std::map<CString, CString> m_ial;
-    void IalLearn(const CString& nick, const CString& host) { if (!nick.IsEmpty() && !host.IsEmpty()) m_ial[VKey(nick)] = host; }
+    bool m_ialEnabled = true;   // /ial [on|off] -- real mIRC: off just stops NEW entries being learned (existing ones stay queryable until /ialclear), and isn't persistent across sessions, so this always starts true
+    void IalLearn(const CString& nick, const CString& host) { if (m_ialEnabled && !nick.IsEmpty() && !host.IsEmpty()) m_ial[VKey(nick)] = host; }
     void IalRename(const CString& oldNick, const CString& newNick) {
         auto it = m_ial.find(VKey(oldNick));
         if (it != m_ial.end()) { m_ial[VKey(newNick)] = it->second; m_ial.erase(it); }
@@ -13160,10 +13330,18 @@ class CMainFrame : public CMDIFrameWnd {
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
-    // CLOSE/KEYDOWN/KEYUP: matched by window name/wildcard against the where-spec, same comma-list rule as JOIN/PART
-    // (see MatchesWhereSpec) but with no nick/address/IAL concept at all -- these are custom-window events, not IRC
-    // ones. KEYDOWN/KEYUP's params is the key code as text (also mirrored into $keyval via m_lastKeyVal); CLOSE's
-    // is empty.
+    // CLOSE/KEYDOWN/KEYUP/CHAR: matched by window name/wildcard against the where-spec, same comma-list rule as
+    // JOIN/PART (see MatchesWhereSpec) but with no nick/address/IAL concept at all -- these are custom-window
+    // events, not IRC ones. KEYDOWN/KEYUP's params is the key code as text (also mirrored into $keyval via
+    // m_lastKeyVal); CHAR's params is the resulting codepoint as text (also mirrored into $keyval/$keychar via
+    // m_lastKeyVal/m_lastKeyChar), matched against its own field's comma-list of codepoints via MatchesCharSpec
+    // rather than KEYDOWN/KEYUP's free-form key-name field; CLOSE's is empty. CLOSE's own where-field is matched
+    // by MatchesCloseWhere instead of plain MatchesWhereSpec -- real mIRC documents it as accepting the same
+    // ?/@/=/!/* window-TYPE codes as on OPEN (now that CLOSE fires for query/DCC chat/DCC fserve windows too, not
+    // just custom @windows -- see Forget()), but every real-world script already seen here (Tetris's own "on
+    // *:CLOSE:@Tetris,@Tetris:{...}") instead writes a literal comma list of specific window NAMES, exactly like
+    // KEYDOWN/KEYUP's field -- so MatchesCloseWhere accepts EITHER form in the same field, rather than picking
+    // one and breaking the other.
     bool FireWindowEvent(CChatWnd* w, const CString& eventName, const CString& winName, const CString& params) {
         if (!m_remoteOn || !m_eventsOn) return false;
         m_evHaltDef = false;
@@ -13173,14 +13351,44 @@ class CMainFrame : public CMDIFrameWnd {
             for (auto& ev : m_events) {
                 if (ev.eventName != eventName || ev.haltDefaultPrefix != (pass == 0)) continue;
                 if (!IsGroupEnabled(ev.groupName)) continue;
-                if (!MatchesWhereSpec(ev.whereSpec, winName)) continue;
+                if (eventName == L"CLOSE") { if (!MatchesCloseWhere(ev.whereSpec, w ? HotlinkKindOf(w) : L'*', winName)) continue; }
+                else if (!MatchesWhereSpec(ev.whereSpec, winName)) continue;
                 if ((eventName == L"KEYDOWN" || eventName == L"KEYUP") && !MatchesKeySpec(ev.keySpec, _wtoi(params))) continue;
+                if (eventName == L"CHAR" && !MatchesCharSpec(ev.keySpec, _wtoi(params))) continue;
                 m_evChan = winName; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
                 RunScript(w, ev.lines, params, nullptr, ev.sourceFile);
                 if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
             }
         }
         m_evChan = savedChan; m_evName = savedName; m_evLevel = savedLevel;
+        return suppress;
+    }
+    // on OPEN / on QUERYOPEN -- see ParseRemoteEvents' own comment on why QUERYOPEN is folded into exactly OPEN's
+    // field layout and firing point rather than inventing a separate undocumented one. kind: '?' query window
+    // (QUERYOPEN handlers are only ever considered for this kind), '=' DCC chat, '!' DCC fileserver -- real mIRC's
+    // own docs say custom @windows never fire this at all (they're opened directly by script via /window, not as
+    // a reaction to anything), so '@' is deliberately never passed in here. matchAgainst: the triggering message
+    // text for '?' (so a handler can react before on TEXT/ACTION itself runs), or empty for '='/'!' (DCC chat/
+    // fileserver have no "first line of text" to react to -- a plain "*" matchtext field matches that the same
+    // way every other bare "*" field here does).
+    bool FireOpenEvent(CChatWnd* w, wchar_t kind, const CString& matchAgainst) {
+        if (!m_remoteOn || !m_eventsOn) return false;
+        m_evHaltDef = false;
+        CString savedName = m_evName, savedLevel = m_evLevel;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                bool isOpenName = ev.eventName == L"OPEN" || (kind == L'?' && ev.eventName == L"QUERYOPEN");
+                if (!isOpenName || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
+                if (!MatchesHotlinkWhere(ev.whereSpec, kind)) continue;
+                if (!GlobMatch(ev.matchText, matchAgainst)) continue;
+                m_evName = ev.eventName; m_evLevel.Format(L"%d", ev.level);
+                RunScript(w, ev.lines, matchAgainst, nullptr, ev.sourceFile);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
     }
     // HOTLINK: fired by CLogEdit::onHotlink for every distinct word the mouse moves over or clicks in any chat
@@ -13293,6 +13501,83 @@ class CMainFrame : public CMDIFrameWnd {
         }
         m_evNick = savedNick; m_evChan = savedChan; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
         return suppress;
+    }
+    // INPUT: on <level>:INPUT:<*#?=!@>:<commands> -- fires when text is typed into an editbox and Enter is
+    // pressed, BEFORE this client does anything else with that line (sending it as chat text, or running it as a
+    // /command). $1- is the typed line itself, same convention as on TEXT -- RunScript's 'params' argument below.
+    // $haltdef (real mIRC's documented way to stop this event's "default operation") or a bare /halt in a
+    // ^-prefixed handler suppresses OnInput's own send/dispatch of the typed line entirely, matching every other
+    // haltDefaultPrefix-gated event here (FireTextEvent, FireChannelEvent, ...).
+    bool FireInputEvent(CChatWnd* w, const CString& text) {
+        if (!m_remoteOn || !m_eventsOn) return false;   // /remote, /events
+        wchar_t kind = HotlinkKindOf(w);
+        m_evHaltDef = false;
+        CString savedName = m_evName, savedLevel = m_evLevel;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != L"INPUT" || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
+                if (!MatchesInputWhere(ev.whereSpec, kind, w->m_name)) continue;
+                m_evName = L"INPUT"; m_evLevel.Format(L"%d", ev.level);
+                RunScript(w, ev.lines, text, nullptr, ev.sourceFile);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evName = savedName; m_evLevel = savedLevel;
+        return suppress;
+    }
+    // on DCCSERVER -- on <level>:DCCSERVER:<Chat|Send|Fserve>:<commands>, fires for every incoming connection to
+    // the /dccserver listener, matched by wildcard against the literal words "Chat"/"Send"/"Fserve" (no separate
+    // where-field at all -- just level:DCCSERVER:matchtext:commands, see kNeedsMatch). This client's own
+    // /dccserver only ever classifies an accepted connection as "Chat" (see DccServerOnAccept's own comment on why
+    // Send/Fserve classification was never implemented), so matchType is always "Chat" at its one call site right
+    // now. $filename is set only for a Send (see m_evFilename); $nick/$address are the connecting peer's.
+    // /halt rejects the connection outright instead of opening/accepting it into a chat window, matching the
+    // Knowledge Base's own "/halt can also be used on the other ON DCCSERVER events to prevent anything from
+    // happening."
+    bool FireDccServerEvent(const CString& matchType, const CString& nick, const CString& address, const CString& filename) {
+        if (!m_remoteOn || !m_eventsOn) return false;
+        m_evHaltDef = false;
+        CString savedNick = m_evNick, savedAddr = m_evAddress, savedName = m_evName, savedLevel = m_evLevel, savedFilename = m_evFilename;
+        bool suppress = false;
+        for (int pass = 0; pass < 2; pass++) {
+            for (auto& ev : m_events) {
+                if (ev.eventName != L"DCCSERVER" || ev.haltDefaultPrefix != (pass == 0)) continue;
+                if (!IsGroupEnabled(ev.groupName)) continue;
+                if (!GlobMatch(ev.matchText, matchType)) continue;
+                m_evNick = nick; m_evAddress = address; m_evName = L"DCCSERVER"; m_evLevel.Format(L"%d", ev.level); m_evFilename = filename;
+                RunScript(Status(nullptr), ev.lines, filename, nullptr, ev.sourceFile);
+                if (pass == 0 && (m_halt || m_evHaltDef)) suppress = true;
+            }
+        }
+        m_evNick = savedNick; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel; m_evFilename = savedFilename;
+        return suppress;
+    }
+    // $lactive/$lactivecid/$lactivewid -- the PREVIOUSLY active window's $active/$activecid/$activewid-equivalent
+    // values, snapshotted each time FireActiveEvent runs (right before the new window overwrites them). $active/
+    // $activecid/$activewid themselves stay computed live off MDIGetActive() (see IdentValue) rather than cached,
+    // but there's no live "previous MDI child" to query the same way once it's no longer active, so the
+    // just-superseded values have to be captured and held here instead.
+    CString m_lactiveWin, m_curActiveWin; int m_lactiveCid = 0, m_curActiveCid = 0, m_lactiveWid = 0, m_curActiveWid = 0;
+    // on ACTIVE -- on <level>:ACTIVE:<*#?=!@>:<commands>, fires whenever a window becomes the active MDI child
+    // (see CChatWnd::OnMDIActivate). where-field uses the same window-type-code-plus-optional-specific-name
+    // layout as on INPUT -- MatchesInputWhere is reused as-is.
+    void FireActiveEvent(CChatWnd* w) {
+        if (!w) return;
+        m_lactiveWin = m_curActiveWin; m_lactiveCid = m_curActiveCid; m_lactiveWid = m_curActiveWid;
+        m_curActiveWin = w->m_name; m_curActiveCid = w->net ? w->net->id : 0; m_curActiveWid = w->m_cwId;
+        if (!m_remoteOn || !m_eventsOn) return;
+        wchar_t kind = HotlinkKindOf(w);
+        CString savedName = m_evName;
+        for (auto& ev : m_events) {
+            if (ev.eventName != L"ACTIVE") continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            if (!MatchesInputWhere(ev.whereSpec, kind, w->m_name)) continue;
+            m_evName = L"ACTIVE";
+            RunScript(w, ev.lines, CString(), nullptr, ev.sourceFile);
+        }
+        m_evName = savedName;
     }
     // WALLOPS: matchtext against the message, same as TEXT/ACTION/NOTICE, but no "where" to check at all --
     // WALLOPS is a server-wide operator broadcast with no channel or target concept.
@@ -13562,6 +13847,8 @@ class CMainFrame : public CMDIFrameWnd {
             IalLearn(nick, address);
             CString full = modeStr; for (size_t i = paramStart; i < params.size(); i++) full += L" " + params[i];
             FireChannelEvent(w, L"MODE", chan, nick, address, full);
+            FireChannelEvent(w, L"RAWMODE", chan, nick, address, full);   // on RAWMODE -- same payload as on MODE, for scripts that want to see every mode change unfiltered/unprocessed; this client has no other distinction between the two (no mode-processing step a script's /halt could meaningfully pre-empt beyond what on MODE's own halt already does)
+            if (address.IsEmpty()) FireChannelEvent(w, L"SERVERMODE", chan, nick, address, full);   // on SERVERMODE -- a server-SOURCED mode change: no "nick!user@host" prefix on this line at all, which is exactly the signal OnLine already derives host from (empty host = server-sourced), same convention used for on SNOTICE above
         }
         auto changes = ParseModeString(net->chanmodes, net->prefixModes, modeStr, params, paramStart);
         // Which mode LETTER means "owner" on this server -- found by position: wherever '~' sits in prefixSymbols,
@@ -13573,10 +13860,14 @@ class CMainFrame : public CMDIFrameWnd {
         m_modeAll.clear(); m_modeOp.clear(); m_modeDeop.clear(); m_modeVoice.clear(); m_modeDevoice.clear(); m_modeBan.clear(); m_modeUnban.clear(); m_modeHelp.clear(); m_modeDehelp.clear(); m_modeOwner.clear(); m_modeDeowner.clear();   // $mode(N) and friends -- this whole MODE line's own targets, rebuilt fresh each time (see their own comment)
         for (auto& ch : changes) {
             if (ch.param.IsEmpty() && (ch.modeChar == L'o' || ch.modeChar == L'v' || ch.modeChar == L'b' || ch.modeChar == L'h' || (ownerLetter && ch.modeChar == ownerLetter))) continue;   // no target parameter actually available -- nothing meaningful to fire for
-            if (ch.modeChar == L'o') { m_modeAll.push_back(ch.param); (ch.adding ? m_modeOp : m_modeDeop).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"OP" : L"DEOP", chan, nick, address, ch.param, m_evOpnick); }
+            if (ch.modeChar == L'o') {
+                m_modeAll.push_back(ch.param); (ch.adding ? m_modeOp : m_modeDeop).push_back(ch.param);
+                FireModeSubEvent(w, ch.adding ? L"OP" : L"DEOP", chan, nick, address, ch.param, m_evOpnick);
+                if (ch.adding && address.IsEmpty()) FireModeSubEvent(w, L"SERVEROP", chan, nick, address, ch.param, m_evOpnick);   // on SERVEROP -- fires ALONGSIDE on OP (not instead of it) when the server itself granted op with no user behind the MODE line, e.g. on-join auto-op from some ircds/services
+            }
             else if (ch.modeChar == L'v') { m_modeAll.push_back(ch.param); (ch.adding ? m_modeVoice : m_modeDevoice).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"VOICE" : L"DEVOICE", chan, nick, address, ch.param, m_evVnick); }
             else if (ch.modeChar == L'h') { m_modeAll.push_back(ch.param); (ch.adding ? m_modeHelp : m_modeDehelp).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"HELP" : L"DEHELP", chan, nick, address, ch.param, m_evHnick); }
-            else if (ownerLetter && ch.modeChar == ownerLetter) { m_modeAll.push_back(ch.param); (ch.adding ? m_modeOwner : m_modeDeowner).push_back(ch.param); }   // real mIRC has no on OWNER/DEOWNER event or $ownick identifier -- $mode(N).owner/.deowner are the only documented way to read this
+            else if (ownerLetter && ch.modeChar == ownerLetter) { m_modeAll.push_back(ch.param); (ch.adding ? m_modeOwner : m_modeDeowner).push_back(ch.param); FireModeSubEvent(w, ch.adding ? L"OWNER" : L"DEOWNER", chan, nick, address, ch.param, m_evOwnick); }   // real mIRC DOES document on OWNER/DEOWNER (added v5.61) and $ownick -- a prior pass here got that wrong
             else if (ch.modeChar == L'b') {
                 m_modeAll.push_back(ch.param); (ch.adding ? m_modeBan : m_modeUnban).push_back(ch.param);
                 if (ch.adding) { CString ts; ts.Format(L"%I64d", (__int64)CTime::GetCurrentTime().GetTime()); IblAdd(net, chan, ch.param, nick, ts); } else IblRemove(net, chan, ch.param);   // $ibl
@@ -13606,14 +13897,16 @@ class CMainFrame : public CMDIFrameWnd {
         if (!m_remoteOn || !m_eventsOn) return;   // /remote, /events
         IalLearn(nick, address);
         if (!newnick.IsEmpty()) IalRename(nick, newnick);
-        CString savedNick = m_evNick, savedAddr = m_evAddress, savedNewnick = m_evNewnick, savedName = m_evName, savedLevel = m_evLevel;
+        CString savedNick = m_evNick, savedAddr = m_evAddress, savedNewnick = m_evNewnick, savedName = m_evName, savedLevel = m_evLevel, savedFilename = m_evFilename;
+        bool isFileEvent = eventName == L"FILESENT" || eventName == L"FILERCVD" || eventName == L"SENDFAIL" || eventName == L"GETFAIL" || eventName == L"PLAYEND";   // $filename is only ever meaningful for these -- see m_evFilename's own comment
         for (auto& ev : m_events) {
             if (ev.eventName != eventName) continue;
             if (!IsGroupEnabled(ev.groupName)) continue;
             m_evNick = nick; m_evAddress = address; m_evNewnick = newnick; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
+            if (isFileEvent) m_evFilename = params;
             RunScript(w, ev.lines, params, nullptr, ev.sourceFile);
         }
-        m_evNick = savedNick; m_evAddress = savedAddr; m_evNewnick = savedNewnick; m_evName = savedName; m_evLevel = savedLevel;
+        m_evNick = savedNick; m_evAddress = savedAddr; m_evNewnick = savedNewnick; m_evName = savedName; m_evLevel = savedLevel; m_evFilename = savedFilename;
     }
     // on LOAD / on UNLOAD -- real mIRC fires these with no match/where field and no $nick/$address/etc context, so
     // this is simpler than FireSimpleEvent above: just run every matching handler's body. sourceFile empty fires
@@ -13621,12 +13914,18 @@ class CMainFrame : public CMDIFrameWnd {
     // mIRC firing on LOAD for everything already in the Remote file list when mIRC itself starts); a specific path
     // scopes it to just that one script's own handlers (used by /load -rs and /unload -rs), so loading or unloading
     // one script doesn't also re-fire every OTHER already-loaded script's on LOAD handler.
-    void FireScriptLoadEvent(CChatWnd* w, const CString& eventName, const CString& sourceFile) {
+    void FireScriptLoadEvent(CChatWnd* w, const CString& eventName, const CString& sourceFile, bool onePerFile = false) {
         if (!m_remoteOn || !m_eventsOn || !w) return;
+        std::vector<CString> firedFiles;   // onePerFile: on START is documented as (unlike on LOAD) capped at one handler per script file -- a second "on START:" in the same file is simply never reached
         for (auto& ev : m_events) {
             if (ev.eventName != eventName) continue;
             if (!sourceFile.IsEmpty() && ev.sourceFile.CompareNoCase(sourceFile) != 0) continue;
             if (!IsGroupEnabled(ev.groupName)) continue;
+            if (onePerFile) {
+                bool already = false; for (auto& f : firedFiles) if (f.CompareNoCase(ev.sourceFile) == 0) { already = true; break; }
+                if (already) continue;
+                firedFiles.push_back(ev.sourceFile);
+            }
             RunScript(w, ev.lines, CString(), nullptr, ev.sourceFile);
         }
     }
@@ -13901,8 +14200,11 @@ class CMainFrame : public CMDIFrameWnd {
         if (s.IsEmpty()) return;
         if (m_depth == 0) { m_halt = false; m_steps = 0; m_scriptStart = GetTickCount64(); for (auto& v : m_vhist) v.Empty(); }
         m_depth++;
-        if (s.Left(2) == L"//") { std::vector<CString> one; one.push_back(s.Mid(2)); RunScript(w, one, CString()); }   // "//cmd | cmd": a one-line script, identifiers evaluated
-        else { ScopeGuard scope(this, true); Dispatch(w, s); }
+        bool suppressed = FireInputEvent(w, s);   // on INPUT -- see FireInputEvent; $haltdef/a ^-handler's /halt stops the normal send/dispatch below entirely, same as real mIRC's documented "prevents mIRC from performing the default operation"
+        if (!suppressed) {
+            if (s.Left(2) == L"//") { std::vector<CString> one; one.push_back(s.Mid(2)); RunScript(w, one, CString()); }   // "//cmd | cmd": a one-line script, identifiers evaluated
+            else { ScopeGuard scope(this, true); Dispatch(w, s); }
+        }
         m_depth--;
     }
     void Dispatch(CChatWnd* w, CString s) {   // one finished line: plain chat text, or "/command args"
@@ -14022,6 +14324,7 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"msg" || cmd == L"m") { CString t = Word(arg); Say(net, t, arg); }
         else if (cmd == L"query" || cmd == L"q") { CString t = Word(arg); Open(net, t, false); if (!arg.IsEmpty()) Say(net, t, arg); }
         else if (cmd == L"me" && inChat) Say(net, w->m_name, arg, true);
+        else if (cmd == L"action" && inChat) Say(net, w->m_name, arg, true);   // real mIRC: "deprecated in favour of /me, which is identical" -- no target parameter, always the active window, same restriction to a real chat window (inChat)
         else if (cmd == L"notice") { CString t = Word(arg); Send(net, L"NOTICE " + t + L" :" + arg); Note(net, L"-> -" + t + L"- " + arg, cNotice); }
         else if (cmd == L"ctcp") {
             CString t = Word(arg); CString type = Word(arg); type.MakeUpper();
@@ -14031,6 +14334,26 @@ class CMainFrame : public CMDIFrameWnd {
             else if (!arg.IsEmpty()) payload += L" " + arg;
             Send(net, L"PRIVMSG " + t + L" :" + CString(wchar_t(1)) + payload + CString(wchar_t(1)));
             Note(net, L"[CTCP " + type + L" to " + t + L"]", cCTCP);
+        }
+        else if (cmd == L"finger") {   // /finger <nick> -- real mIRC's own thin wrapper that just sends a CTCP FINGER request, same wire shape as /ctcp <nick> finger with no args
+            CString t = Word(arg);
+            if (t.IsEmpty()) { Note(net, L"Usage: /finger <nick>", cPart); return; }
+            Send(net, L"PRIVMSG " + t + L" :" + CString(wchar_t(1)) + L"FINGER" + CString(wchar_t(1)));
+            Note(net, L"[CTCP FINGER to " + t + L"]", cCTCP);
+        }
+        else if (cmd == L"sound") {   // /sound [on|off|nick/channel] <file> [message] -- mIRC's own help page documents the on/off toggle and the optional target/file/message, but not the literal wire format of the request; this sends it as a CTCP SOUND, the de-facto format other clients that implement the same legacy feature use. message, if given, is also shown locally the same way an action is (the help page's own wording: "displays like an action command").
+            CString a = arg; CString first = Word(a); CString firstL = first; firstL.MakeLower();
+            if (firstL == L"on" || firstL == L"off") { m_acceptSoundRequests = (firstL == L"on"); return; }
+            // Honest rule for telling an explicit target apart from the filename: a filename always carries a '.'
+            // extension (.wav/.mid/.mp3 per the command's own syntax), and a nick or channel name never
+            // legitimately does, so whichever one `first` is decides whether a target was given at all. Falls back
+            // to the current window (chan or query) otherwise, same as real mIRC's documented default.
+            CString t, file, msg;
+            if (first.Find(L'.') < 0 && !first.IsEmpty()) { t = first; file = Word(a); msg = a; }
+            else { t = inChat ? w->m_name : CString(); file = first; msg = a; }   // inChat: same "not the status window" test /me already uses just above
+            if (t.IsEmpty() || file.IsEmpty()) { Note(net, L"Usage: /sound [on|off|nick/channel] <file> [message]", cPart); return; }
+            Send(net, L"PRIVMSG " + t + L" :" + CString(wchar_t(1)) + L"SOUND " + file + (msg.IsEmpty() ? CString() : L" " + msg) + CString(wchar_t(1)));
+            if (!msg.IsEmpty()) Say(net, t, msg, true);   // "displays like an action command" -- shown locally the same way /me's own action text is
         }
         else if (cmd == L"topic") {   // /topic [#channel] [new topic]: a named channel is optional (defaults to the current one); no topic text means query, not set
             CString a = arg; CString first = Word(a);
@@ -14351,20 +14674,82 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"amsg" || cmd == L"ame") { for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && cw->m_chan) Say(net, cw->m_name, arg, cmd == L"ame"); } }
         else if (cmd == L"qmsg" || cmd == L"qme") { for (auto& kv : m_w) { CChatWnd* cw = kv.second; if (cw->net == net && !cw->m_chan && cw->m_name != L"*status*") Say(net, cw->m_name, arg, cmd == L"qme"); } }
-        else if (cmd == L"omsg" || cmd == L"onotice") {   // STATUSMSG convention: "@#channel" as the PRIVMSG/NOTICE target delivers to ops only
+        else if (cmd == L"omsg" || cmd == L"onotice" || cmd == L"wallchops" || cmd == L"wallvoices" || cmd == L"vmsg" || cmd == L"vnotice") {
+            // STATUSMSG convention: "@#channel"/"+#channel" as the PRIVMSG/NOTICE target delivers to ops-only /
+            // voices-only respectively -- omsg/onotice were already here; wallchops/wallvoices/vmsg/vnotice are the
+            // same mechanism, just real mIRC's own other names for "send to ops" (wallchops, always a NOTICE, per
+            // its own help page) and "send to voices" (wallvoices as a NOTICE, vmsg as a PRIVMSG, vnotice as a
+            // NOTICE -- vmsg/vnotice being the voice-only counterparts of msg/notice the same way omsg/onotice are
+            // the op-only ones).
+            bool toOps = (cmd == L"omsg" || cmd == L"onotice" || cmd == L"wallchops");
+            wchar_t prefix = toOps ? L'@' : L'+';
+            bool isNotice = (cmd == L"onotice" || cmd == L"wallchops" || cmd == L"wallvoices" || cmd == L"vnotice");
             CString a = arg, first = Word(a), chan;
             if (IsChan(first)) chan = first; else { chan = w->m_chan ? w->m_name : CString(); a = arg; }
             if (chan.IsEmpty() || a.IsEmpty()) { Show(w, L"* Usage: /" + cmd + L" [#channel] <message>", cPart); return; }
-            if (cmd == L"omsg") { Send(net, L"PRIVMSG @" + chan + L" :" + a); Note(net, L"-> *" + chan + L"* " + a, cOwn); }
-            else { Send(net, L"NOTICE @" + chan + L" :" + a); Note(net, L"-> -@" + chan + L"- " + a, cNotice); }
+            CString target = CString(prefix) + chan;
+            if (isNotice) { Send(net, L"NOTICE " + target + L" :" + a); Note(net, L"-> -" + target + L"- " + a, cNotice); }
+            else { Send(net, L"PRIVMSG " + target + L" :" + a); Note(net, L"-> *" + target + L"* " + a, cOwn); }
         }
         else if (cmd == L"describe") { CString t = Word(arg); if (t.IsEmpty() || arg.IsEmpty()) Show(w, L"* Usage: /describe <nick|channel> <message>", cPart); else Say(net, t, arg, true); }
         else if (cmd == L"ctcpreply") { CString t = Word(arg), c = Word(arg); c.MakeUpper(); if (t.IsEmpty() || c.IsEmpty()) Show(w, L"* Usage: /ctcpreply <nick> <ctcp> [message]", cPart); else { Send(net, L"NOTICE " + t + L" :" + CString(wchar_t(1)) + c + (arg.IsEmpty() ? CString() : L" " + arg) + CString(wchar_t(1))); Note(net, L"[CTCP reply " + c + L" to " + t + L"]", cCTCP); } }
+        else if (cmd == L"scid" || cmd == L"scon") {   // /scid -rats<type> [ID] [command] -- $scid's own comment explains ID-vs-position (scid: net->id: scon: 1-based position in m_nets); -a runs on every connection matching -t's type filter (default: every connection) instead of a single ID/position; -s reports which connection(s) it ran on. real mIRC also lets a BARE "/scid <ID>" (no command) change which connection the REST OF THE CALLING SCRIPT runs against, restored automatically when that script returns -- this client has no such per-script "current connection" context to retarget (every command's connection is simply whatever window it's running in), so the bare form here just reports the match via -s wording instead of attempting a scope-switch it can't actually honor; -r (reset to original) is a no-op for the same reason.
+            CString a = arg; bool swA = false, swS = false; int typeFilter = 0;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) {
+                CString sw = Word(a); sw.MakeLower();
+                for (int k = 1; k < sw.GetLength(); k++) {
+                    wchar_t c = sw[k];
+                    if (c == L'a') swA = true; else if (c == L's') swS = true; else if (c == L'r') {}
+                    else if (c == L't') { CString digs; int j = k + 1; while (j < sw.GetLength() && iswdigit(sw[j])) digs += sw[j++]; typeFilter = _wtoi(digs); k = j - 1; }
+                }
+            }
+            CString idStr = swA ? CString() : Word(a);
+            CString command = a; command.Trim();
+            // type filter, approximated from what this client actually tracks (net->conn, net->state) -- real
+            // mIRC distinguishes "connecting" from "disconnected" via its own socket state machine, which this
+            // client doesn't expose as a separate flag, so a state string match stands in for it (see Net::state)
+            auto matchesType = [&](Net* n) -> bool {
+                bool isConnecting = !n->conn && n->state.Find(L"onnect") >= 0 && n->state.CompareNoCase(L"Not connected") != 0 && n->state.CompareNoCase(L"Disconnected") != 0;
+                bool isConnected = n->conn, isDisconnected = !n->conn && !isConnecting;
+                switch (typeFilter) {
+                    case 1: return isConnected;
+                    case 2: return isDisconnected || isConnecting;
+                    case 4: return isConnecting;
+                    case 5: return isConnected || isConnecting;
+                    case 6: return isDisconnected || isConnecting;
+                    case 7: return true;
+                    case 8: return isDisconnected;
+                    default: return true;   // 0 (no -t given) and 3 both mean "every connection"
+                }
+            };
+            std::vector<Net*> targets;
+            if (swA) { for (auto& np : m_nets) if (matchesType(np.get())) targets.push_back(np.get()); }
+            else {
+                double idD; if (!ParseNum(idStr, idD)) { Show(w, L"* Usage: /" + cmd + L" -rats<type> [ID] [command]", cPart); return; }
+                int N = (int)idD; Net* t = nullptr;
+                if (cmd == L"scid") { for (auto& np : m_nets) if (np->id == N) { t = np.get(); break; } }
+                else if (N >= 1 && N <= (int)m_nets.size()) t = m_nets[N - 1].get();
+                if (t) targets.push_back(t);
+            }
+            if (targets.empty()) { if (swS) Show(w, L"* /" + cmd + L": no matching connection", cPart); return; }
+            for (Net* t : targets) {
+                CChatWnd* sw2 = Status(t); if (!sw2) continue;
+                if (swS) Show(sw2, L"* " + CString(cmd == L"scid" ? L"scid: " : L"scon: ") + t->tag, cInfo);
+                if (!command.IsEmpty()) Dispatch(sw2, L"/" + command);
+            }
+        }
         else if (cmd == L"queryrn") {
             CString t = Word(arg), nn = arg; nn.Trim();
             CChatWnd* qw = Find(net, t);
             if (!qw || qw->m_chan) Show(w, L"* /queryrn: no such query window: " + t, cPart);
             else { qw->m_name = nn; qw->SetWindowText(nn); RefreshBars(); Show(qw, L"* Window renamed to " + nn, cInfo); }
+        }
+        else if (cmd == L"ial") {   // /ial [on|off] -- turns the Internal Address List on/off (no parameter just reports current status); off only stops NEW entries being learned (see IalLearn), existing ones stay queryable until /ialclear
+            CString a = arg; a.Trim(); CString al = a; al.MakeLower();
+            if (al == L"on") m_ialEnabled = true;
+            else if (al == L"off") m_ialEnabled = false;
+            else if (!al.IsEmpty()) { Show(w, L"* Usage: /ial [on|off]", cPart); return; }
+            Show(w, CString(L"* IAL is currently ") + (m_ialEnabled ? L"on" : L"off"), cInfo);
         }
         else if (cmd == L"ialmark") {   // /ialmark <nick> <name> [mark] -- attaches a named mark to a nick's IAL entry, read back via $ialmark(); an omitted mark removes that named entry instead of setting it
             CString nk = Word(arg); CString markName = Word(arg); CString markVal = arg; markVal.Trim();
@@ -14455,6 +14840,26 @@ class CMainFrame : public CMDIFrameWnd {
                 toClose.push_back(cw);
             }
             for (auto* cw : toClose) cw->DestroyWindow();   // triggers the window's own onClose -> Forget() automatically (PART if it's a channel, removed from m_w), same as clicking its X button
+        }
+        else if (cmd == L"closechats" || cmd == L"closedccs" || cmd == L"closefserves") {
+            // Real mIRC's own help marks all three of these obsolete ("essentially replaced by /close"), but they're
+            // still real commands a script can call, and each means something slightly different here: "inactive"
+            // = the DccSession behind the window has already finished (DONE/FAILED) but its window is still open --
+            // /closechats for CHAT sessions that aren't a fileserver, /closedccs for SEND/GET, /closefserves for a
+            // CHAT session with isFileServer set. A window with no DccSession at all (a plain channel/query/status/
+            // @window) is never touched by any of these three -- that's exactly what plain /close is for.
+            std::vector<CChatWnd*> toClose;
+            for (auto& kv : m_w) {
+                CChatWnd* cw = kv.second;
+                DccSession* sess = (DccSession*)cw->m_dccSession;
+                if (!sess) continue;
+                if (sess->state != DccSession::DONE && sess->state != DccSession::FAILED) continue;   // still live -- none of these three touch an active session's window
+                bool matches = (cmd == L"closechats" && sess->kind == DccSession::CHAT && !sess->isFileServer)
+                            || (cmd == L"closedccs" && (sess->kind == DccSession::SEND || sess->kind == DccSession::GET))
+                            || (cmd == L"closefserves" && sess->kind == DccSession::CHAT && sess->isFileServer);
+                if (matches) toClose.push_back(cw);
+            }
+            for (auto* cw : toClose) cw->DestroyWindow();
         }
         else if (cmd == L"clearall") {   // -snqmtgua: this client's window types are status/channel/query, so n/q/s/a are meaningful; m/t/u/g are accepted but have nothing extra to match
             CString a = arg; bool doStatus = false, doChan = false, doQuery = false, any = false;
@@ -14580,6 +14985,42 @@ class CMainFrame : public CMDIFrameWnd {
             CString ctcp; ctcp.Format(L"DCC CHAT chat %lu %u", ipInt, (unsigned)localPort);
             Send(net, L"PRIVMSG " + nick + L" :" + CString(wchar_t(1)) + ctcp + CString(wchar_t(1)));
             m_dcc.push_back(std::move(sess));
+        }
+        else if (cmd == L"dccserver") {   // /dccserver [[+-]scf] [on|off] [port] -- see m_dccServerOn's own comment for this client's chat-only scoping
+            CString a = arg; a.Trim();
+            while (!a.IsEmpty() && (a.Left(1) == L"+" || a.Left(1) == L"-")) {
+                bool add = a.Left(1) == L"+"; CString sw = Word(a); sw.MakeLower();
+                for (int i = 1; i < sw.GetLength(); i++) {
+                    if (sw[i] == L's') m_dccServerS = add; else if (sw[i] == L'c') m_dccServerC = add; else if (sw[i] == L'f') m_dccServerF = add;
+                }
+            }
+            CString onoff = Word(a); onoff.MakeLower();
+            CString portStr = a; portStr.Trim(); if (IsAllDigits(portStr)) m_dccServerPort = (UINT)_wtoi(portStr);
+            if (onoff == L"on") { if (!DccServerStart()) { CString pm; pm.Format(L"* /dccserver: couldn't listen on port %u.", m_dccServerPort); Show(w, pm, cPart); } }
+            else if (onoff == L"off") DccServerStop();
+            CString status; status.Format(L"* DCC server is %s, port %u (s=%s c=%s f=%s)", m_dccServerOn ? L"on" : L"off", m_dccServerPort, m_dccServerS ? L"on" : L"off", m_dccServerC ? L"on" : L"off", m_dccServerF ? L"on" : L"off");
+            Show(w, status, cInfo);
+        }
+        else if (cmd == L"creq" || cmd == L"sreq") {   // /creq, /sreq [+m|-m] [ask|auto|ignore] -- see m_creqMode/m_sreqMode's own comment for how these gate the incoming DCC Chat/Send accept dialogs
+            int& mode = cmd == L"creq" ? m_creqMode : m_sreqMode; bool& minimize = cmd == L"creq" ? m_creqMinimize : m_sreqMinimize;
+            CString a = arg; a.Trim();
+            while (!a.IsEmpty() && (a.Left(1) == L"+" || a.Left(1) == L"-")) { bool add = a.Left(1) == L"+"; CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'm') >= 0) minimize = add; }
+            CString modeStr = a; modeStr.Trim(); modeStr.MakeLower();
+            if (modeStr == L"ask") mode = 0; else if (modeStr == L"auto") mode = 1; else if (modeStr == L"ignore") mode = 2;
+            else if (!modeStr.IsEmpty()) { Show(w, L"* Usage: /" + cmd + L" [+m|-m] [ask|auto|ignore]", cPart); return; }
+            CString modeName = mode == 0 ? L"ask" : mode == 1 ? L"auto" : L"ignore";
+            Show(w, L"* " + CString(cmd == L"creq" ? L"DCC Chat" : L"DCC Send") + L" requests: " + modeName + (minimize ? L", auto-minimize on" : L""), cInfo);
+        }
+        else if (cmd == L"pdcc") {   // /pdcc [on|off] -- see m_dccPumpOn's own comment: stored/reported only, this client already pushes DCC Send data as fast as the socket's own write buffer allows with no artificial ack-wait of its own to "pump" past
+            CString a = arg; a.MakeLower(); a.Trim();
+            if (a.IsEmpty()) { Show(w, CString(L"* DCC send pumps are ") + (m_dccPumpOn ? L"on" : L"off") + L".", cInfo); return; }
+            if (a != L"on" && a != L"off") { Show(w, L"* Usage: /pdcc [on|off]", cPart); return; }
+            m_dccPumpOn = (a == L"on"); Show(w, CString(L"* DCC send pumps are now ") + (m_dccPumpOn ? L"on" : L"off") + L".", cInfo);
+        }
+        else if (cmd == L"gqreq") {   // /gqreq <on|off> -- see m_gqreqOn's own comment: stored/reported only, this client has no separate request queue of its own for this to actually gate
+            CString a = arg; a.MakeLower(); a.Trim();
+            if (a != L"on" && a != L"off") { Show(w, L"* Usage: /gqreq <on|off>", cPart); return; }
+            m_gqreqOn = (a == L"on"); Show(w, CString(L"* Request queuing is now ") + (m_gqreqOn ? L"on" : L"off") + L".", cInfo);
         }
         else if (cmd == L"signal") {   // /signal [-n] <name> [parameters] -- triggers every matching on SIGNAL event. Real mIRC's default (no -n) actually defers the signal until the current script finishes running, firing it immediately only with -n; this always fires immediately either way, a deliberate simplification rather than building a separate deferred-signal queue for a timing distinction most scripts won't depend on. The existing script recursion-depth guard already protects against runaway signal-triggers-signal loops, so no separate iteration cap was added on top of that.
             CString a = arg;
@@ -14971,6 +15412,52 @@ class CMainFrame : public CMDIFrameWnd {
             int newLen = (int)nD; if (newLen < 0) newLen = 0;
             bv->data.resize((size_t)newLen, 0);
         }
+        else if (cmd == L"bcopy") {   // /bcopy [-zc] <&destvar> <destpos> <&srcvar> <srcpos> <numBytes> -- copies numBytes bytes from &srcvar (starting at srcpos) into &destvar (starting at destpos); destpos/srcpos are 1-based, -1 for destpos appends at the destination's current end, -1 for numBytes copies everything from srcpos to the source's end. -z zeroes the copied source bytes afterward; -c truncates the destination to exactly destpos+numBytes-1 bytes (only meaningful when both are positive). Source and destination may be the same variable with overlapping ranges -- handled below by copying through a temporary buffer rather than BYTE-by-BYTE in place, which would otherwise corrupt an overlapping forward copy.
+            CString a = arg; bool swZ = false, swCc = false;
+            while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'z') >= 0) swZ = true; if (sw.Find(L'c') >= 0) swCc = true; }
+            CString destName = Word(a), destPosStr = Word(a), srcName = Word(a), srcPosStr = Word(a), numStr = Word(a);
+            double destPosD, srcPosD, numD;
+            if (destName.IsEmpty() || destName.Left(1) != L"&" || srcName.IsEmpty() || srcName.Left(1) != L"&" ||
+                !ParseNum(destPosStr, destPosD) || !ParseNum(srcPosStr, srcPosD) || !ParseNum(numStr, numD)) { Show(w, L"* /bcopy: insufficient parameters", cPart); return; }
+            int destPos = (int)destPosD, srcPos = (int)srcPosD, numBytes = (int)numD;
+            BinVarEntry* src = FindBinVar(srcName);
+            static const std::vector<BYTE> kEmptySrc;
+            const std::vector<BYTE>& srcData = src ? src->data : kEmptySrc;
+            size_t srcStart = (srcPos < 1) ? 0 : (size_t)(srcPos - 1);
+            size_t avail = (srcStart < srcData.size()) ? (srcData.size() - srcStart) : 0;
+            size_t count = (numBytes < 0) ? avail : (size_t)numBytes;
+            if (count > avail) count = avail;
+            std::vector<BYTE> chunk(srcData.begin() + srcStart, srcData.begin() + srcStart + count);   // copy out first -- safe even when destName==srcName and the ranges overlap
+            BinVarEntry* dest = GetOrMakeBinVar(destName);
+            size_t destStart = (destPos < 0) ? dest->data.size() : (size_t)((destPos >= 1) ? (destPos - 1) : 0);
+            if (destStart + chunk.size() > dest->data.size()) dest->data.resize(destStart + chunk.size(), 0);
+            for (size_t i = 0; i < chunk.size(); i++) dest->data[destStart + i] = chunk[i];
+            if (swCc && destPos >= 1 && numBytes >= 0) dest->data.resize((size_t)(destPos - 1 + numBytes), 0);
+            if (swZ) {   // re-find src -- GetOrMakeBinVar above may have reallocated m_binVars and invalidated the earlier `src` pointer if destName==srcName
+                BinVarEntry* src2 = FindBinVar(srcName);
+                if (src2) for (size_t i = 0; i < count && srcStart + i < src2->data.size(); i++) src2->data[srcStart + i] = 0;
+            }
+        }
+        else if (cmd == L"breplace") {   // /breplace <&var> <old1> <new1> [<old2> <new2> ...] -- replaces individual bytes in &var; each old/new is a decimal 0-255 value, or text (its first character's byte value is used, same as $asc). An odd trailing value with no partner is ignored. Pairs are applied in reverse order, and each byte position is replaced at most once (the first matching pair found wins, so later pairs can't re-match a byte an earlier pair already changed) -- matching real mIRC's own documented behavior rather than naively chaining every pair's replacement over the whole buffer in order.
+            CString a = arg; CString vn = Word(a);
+            if (vn.IsEmpty() || vn.Left(1) != L"&") { Show(w, L"* /breplace: insufficient parameters", cPart); return; }
+            std::vector<BYTE> pairs;   // flattened old,new,old,new,...
+            CString rest = a;
+            while (!rest.IsEmpty()) {
+                CString tok = Word(rest); if (tok.IsEmpty()) break;
+                double vD;
+                BYTE b = ParseNum(tok, vD) ? (BYTE)(((int)vD) & 0xFF) : (BYTE)(tok[0] & 0xFF);
+                pairs.push_back(b);
+            }
+            if (pairs.size() < 2) { Show(w, L"* /breplace: insufficient parameters", cPart); return; }
+            size_t numPairs = pairs.size() / 2;   // a trailing odd value is simply never reached by the loop below
+            BinVarEntry* bv = GetOrMakeBinVar(vn);
+            for (size_t i = 0; i < bv->data.size(); i++) {
+                for (size_t p = numPairs; p-- > 0;) {   // reverse order, stop at first match -- see comment above
+                    if (bv->data[i] == pairs[p * 2]) { bv->data[i] = pairs[p * 2 + 1]; break; }
+                }
+            }
+        }
         else if (cmd == L"fopen") {   // /fopen [-nox] <handle> <filename> -- -x (exclusive access) is accepted but not distinguished from the default (this app always opens shared read/write already)
             CString a = arg; bool createNew = false, overwrite = false;
             while (a.Left(1) == L"-" && a.GetLength() > 1) { CString sw = Word(a); sw.MakeLower(); if (sw.Find(L'n') >= 0) createNew = true; if (sw.Find(L'o') >= 0) overwrite = true; }
@@ -14998,6 +15485,66 @@ class CMainFrame : public CMDIFrameWnd {
             CString pat = Word(arg);
             if (pat.IsEmpty()) { Show(w, L"* /fclose: insufficient parameters", cPart); return; }
             m_fileHandles.erase(std::remove_if(m_fileHandles.begin(), m_fileHandles.end(), [&](FileHandleEntry& h) { if (GlobMatch(pat, h.name)) { CloseFileHandle(h); return true; } return false; }), m_fileHandles.end());
+        }
+        else if (cmd == L"flist") {   // /flist [name] -- lists all open /fopen handles, or those matching a wildcard
+            CString pat = arg; pat.Trim();
+            bool any = false;
+            for (auto& h : m_fileHandles) {
+                if (!pat.IsEmpty() && !GlobMatch(pat, h.name)) continue;
+                CString line; line.Format(L"* %s: %s (pos %d)", (LPCWSTR)h.name, (LPCWSTR)h.filename, h.file ? (int)h.file->GetPosition() : 0);
+                Show(w, line, cInfo); any = true;
+            }
+            if (!any) Show(w, L"* No open files" + (pat.IsEmpty() ? CString() : (L" matching '" + pat + L"'")) + L".", cInfo);
+        }
+        else if (cmd == L"fseek") {   // /fseek -nlwrp <name> <position|N|matchtext> -- see FileHandleEntry/m_lastFileEof's own comments for how $fopen().pos / $feof read this back afterward
+            CString a = arg; CString sw = Word(a); sw.MakeLower();
+            if (sw.Left(1) != L"-") { Show(w, L"* Usage: /fseek -nlwrp <name> <position|N|matchtext>", cPart); return; }
+            CString hname = Word(a);
+            FileHandleEntry* h = FindFileHandle(hname);
+            if (!h || !h->file) { m_lastFileErr = true; Show(w, L"* /fseek: handle '" + hname + L"' doesn't exist", cPart); return; }
+            CFile* f = h->file; m_lastFileErr = false;
+            auto toEof = [&]() { f->SeekToEnd(); m_lastFileEof = true; };
+            if (sw.Find(L'l') >= 0) {   // -l: start of line N (1-based)
+                CString nStr = a; nStr.Trim(); int target = _wtoi(nStr);
+                f->SeekToBegin(); int line = 0; bool found = false;
+                while (true) { LONGLONG before = f->GetPosition(); CString ln; if (!h->file->ReadString(ln)) break; ++line; if (line == target) { f->Seek(before, CFile::begin); found = true; break; } }
+                if (!found) toEof(); else m_lastFileEof = false;
+            } else if (sw.Find(L'n') >= 0) {   // -n: start of the next line from the current position -- ReadString's own side effect (advance past one CRLF-terminated line) IS "move to the start of the next line"
+                CString ln; if (!h->file->ReadString(ln)) toEof(); else m_lastFileEof = false;
+            } else if (sw.Find(L'w') >= 0 || sw.Find(L'r') >= 0) {   // -w/-r: start of the first line (searching forward from the current position) matching a wildcard / regex
+                CString matchText = a; matchText.Trim();
+                bool useRegex = sw.Find(L'r') >= 0;
+                std::wregex re; bool reOk = true;
+                if (useRegex) {
+                    CString patBody = matchText, flags;
+                    if (matchText.GetLength() >= 2 && matchText[0] == L'/') { int closeSlash = matchText.ReverseFind(L'/'); if (closeSlash > 0) { patBody = matchText.Mid(1, closeSlash - 1); flags = matchText.Mid(closeSlash + 1); } }
+                    try { auto reFlags = std::regex::ECMAScript; if (flags.Find(L'i') >= 0) reFlags |= std::regex::icase; re = std::wregex((LPCWSTR)patBody, reFlags); }
+                    catch (std::regex_error&) { reOk = false; }
+                }
+                bool found = false;
+                if (reOk) {
+                    while (true) {
+                        LONGLONG before = f->GetPosition(); CString ln;
+                        if (!h->file->ReadString(ln)) break;
+                        bool matched = useRegex ? std::regex_search(std::wstring((LPCWSTR)ln), re) : GlobMatch(matchText, ln);
+                        if (matched) { f->Seek(before, CFile::begin); found = true; break; }
+                    }
+                }
+                if (!found) toEof(); else m_lastFileEof = false;
+            } else if (sw.Find(L'p') >= 0) {   // -p: start of the current line; if the pointer is already exactly at a line start, start of the PREVIOUS line instead
+                LONGLONG cur = f->GetPosition();
+                f->SeekToBegin();
+                std::vector<LONGLONG> starts; starts.push_back(0);
+                while (true) { LONGLONG before = f->GetPosition(); if (before >= cur) break; CString ln; if (!h->file->ReadString(ln)) break; if (f->GetPosition() <= cur) starts.push_back(f->GetPosition()); else break; }
+                LONGLONG target = starts.back();
+                if (target == cur && starts.size() > 1) target = starts[starts.size() - 2];
+                f->Seek(target, CFile::begin); m_lastFileEof = false;
+            } else {   // no recognized switch: a plain byte position
+                CString posStr = a; posStr.Trim();
+                if (!IsAllDigits(posStr)) { Show(w, L"* Usage: /fseek -nlwrp <name> <position|N|matchtext>", cPart); return; }
+                LONGLONG size = f->GetLength(); LONGLONG pos = _wtoi64(posStr);
+                if (pos > size) { toEof(); } else { f->Seek(pos, CFile::begin); m_lastFileEof = false; }
+            }
         }
         else if (cmd == L"fwrite") {   // /fwrite [-n] <handle> <text> -- -n appends a CRLF after the text, for writing successive lines
             CString a = arg; bool addCrlf = false;
@@ -15075,6 +15622,82 @@ class CMainFrame : public CMDIFrameWnd {
         else if (cmd == L"saveini") { SaveOpts(); SaveAliases(); SaveVars(); SavePopups(); SaveRemote(); SaveLogging(); Show(w, L"* Settings saved.", cInfo); }
         else if (cmd == L"emailaddr") { arg.Trim(); net->o.email = arg; Show(w, L"* Email address set to " + arg, cInfo); }
         else if (cmd == L"fullname") { arg.Trim(); net->o.real = arg; m_defOpts.real = arg; SaveOpts(); Show(w, L"* Full name set to " + arg, cInfo); }
+        else if (cmd == L"username") {   // real mIRC: sets the username/ident field in the Connect dialog; with no parameter it instead reports the email address (an odd, but documented, real-mIRC quirk -- not this implementation's own invention)
+            arg.Trim();
+            if (arg.IsEmpty()) { Show(w, L"* " + (net ? net->o.email : m_defOpts.email), cInfo); return; }
+            if (net) net->o.user = arg;
+            m_defOpts.user = arg; SaveOpts(); Show(w, L"* Username set to " + arg, cInfo);
+        }
+        else if (cmd == L"bindip") {   // /bindip [on [IP|adapter] | off] -- see CIrcSock::ConnectSmart's bindAddr parameter for where this actually takes effect
+            CString a = arg; a.Trim(); CString sw = Word(a); sw.MakeLower();
+            if (sw.IsEmpty()) { Show(w, CString(L"* Bind IP is ") + (m_bindIpOn ? L"on" : L"off") + (m_bindIpOn && !m_bindIp.IsEmpty() ? (L": " + m_bindIp) : CString()), cInfo); return; }
+            if (sw == L"off") { m_bindIpOn = false; Show(w, L"* Bind IP is now off.", cInfo); return; }
+            if (sw == L"on") { m_bindIpOn = true; m_bindIp = a; m_bindIp.Trim(); Show(w, L"* Bind IP is now on" + (m_bindIp.IsEmpty() ? CString() : (L": " + m_bindIp)), cInfo); return; }
+            Show(w, L"* Usage: /bindip [on [IP|adapter] | off]", cPart);
+        }
+        else if (cmd == L"maxdepth") {   // /maxdepth <depth> -- real mIRC documents 1-100 and marks this deprecated/removed; this client keeps the member (and its wider default) RunAlias's nesting-depth check already relies on, see m_maxDepth's own declaration for why 500 is the default rather than mIRC's original 100
+            arg.Trim();
+            if (arg.IsEmpty() || !IsAllDigits(arg)) { Show(w, L"* Usage: /maxdepth <depth>", cPart); return; }
+            int d = _wtoi(arg); if (d < 1) d = 1;
+            m_maxDepth = d; Show(w, L"* Max alias recursion depth set to " + arg, cInfo);
+        }
+        else if (cmd == L"resetidle") {   // /resetidle [seconds] -- see $idle for how this virtual "last input" tick is combined with the real GetLastInputInfo() value
+            arg.Trim();
+            int secs = 0; if (!arg.IsEmpty()) { if (!IsAllDigits(arg)) { Show(w, L"* Usage: /resetidle [seconds]", cPart); return; } secs = _wtoi(arg); }
+            m_idleResetTick = GetTickCount64() - (ULONGLONG)secs * 1000;
+            Show(w, L"* Idle time reset" + (secs ? (L" to " + arg + L" seconds") : CString()) + L".", cInfo);
+        }
+        else if (cmd == L"setlayer") {   // /setlayer <0-255> [@window/#channel/query/windowName] -- alpha 0 = fully transparent, 255 = fully opaque; no window given = the main MDI frame
+            CString a = arg; a.Trim();
+            CString alphaStr = Word(a);
+            if (alphaStr.IsEmpty() || !IsAllDigits(alphaStr)) { Show(w, L"* Usage: /setlayer <0-255> [@window/#channel/query/windowName]", cPart); return; }
+            int alpha = _wtoi(alphaStr); if (alpha < 0) alpha = 0; if (alpha > 255) alpha = 255;
+            CString wn = a; wn.Trim();
+            HWND hTarget = nullptr;
+            if (wn.IsEmpty()) hTarget = GetSafeHwnd();   // the main MDI frame itself
+            else { for (auto& kv : m_w) if (kv.second->m_name.CompareNoCase(wn) == 0) { hTarget = kv.second->GetSafeHwnd(); break; }
+                   if (!hTarget) { CCustomDialogWnd* dw = FindOpenDialog(wn); if (dw) hTarget = dw->GetSafeHwnd(); } }
+            if (!hTarget) { Show(w, L"* /setlayer: window not found.", cPart); return; }
+            LONG_PTR ex = ::GetWindowLongPtr(hTarget, GWL_EXSTYLE);
+            ::SetWindowLongPtr(hTarget, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+            ::SetLayeredWindowAttributes(hTarget, 0, (BYTE)alpha, LWA_ALPHA);
+        }
+        else if (cmd == L"fsend") {   // /fsend [on|off|N] -- see m_fsendN/m_fsendOn's own comment: stored/reported only, this client has no separate "slow" DCC send path for a "fast" one to switch away from
+            CString a = arg; a.Trim(); CString al = a; al.MakeLower();
+            if (al.IsEmpty()) { Show(w, L"* Fast DCC send is " + (m_fsendN >= 0 ? (CString(L"set to ") + a) : CString(m_fsendOn ? L"on" : L"off")), cInfo); return; }
+            if (al == L"on" || al == L"off") { m_fsendOn = (al == L"on"); m_fsendN = -1; Show(w, CString(L"* Fast DCC send is now ") + (m_fsendOn ? L"on" : L"off") + L".", cInfo); return; }
+            if (!IsAllDigits(a)) { Show(w, L"* Usage: /fsend [on|off|N]", cPart); return; }
+            int n = _wtoi(a); if (n < 0) n = 0; if (n > 100) n = 100;
+            m_fsendN = n; Show(w, L"* Fast DCC send set to " + a + L".", cInfo);
+        }
+        else if (cmd == L"fupdate") {   // /fupdate [N] -- see m_fupdateN's own comment: stored/reported only
+            arg.Trim();
+            if (arg.IsEmpty()) { CString s; s.Format(L"* Display update delay is set to %d.", m_fupdateN); Show(w, s, cInfo); return; }
+            if (!IsAllDigits(arg)) { Show(w, L"* Usage: /fupdate [N]", cPart); return; }
+            int n = _wtoi(arg); if (n < 0) n = 0; if (n > 100) n = 100;
+            m_fupdateN = n; Show(w, L"* Display update delay set to " + arg + L".", cInfo);
+        }
+        else if (cmd == L"didtok") {   // /didtok <name> <id> <C> <text> -- tokenizes text by the ASCII code C and adds each piece to the dialog control as its own item/line, same net effect as one /did -a per token
+            CString a = arg; a.TrimLeft();
+            CString name = Word(a); CString idStr = Word(a); CString cStr = Word(a);
+            if (name.IsEmpty() || idStr.IsEmpty() || !IsAllDigits(cStr)) { Show(w, L"* Usage: /didtok <name> <id> <C> <text>", cPart); return; }
+            int id = _wtoi(idStr); wchar_t delim = (wchar_t)_wtoi(cStr);
+            CCustomDialogWnd* dw = FindOpenDialog(name);
+            if (!dw) return;   // same silent no-op as /did on a dialog that isn't open
+            CString kind = dw->CtrlKind(id); bool isList = kind == L"list", isCombo = kind == L"combo";
+            CString text = a; int start = 0;
+            while (start <= text.GetLength()) {
+                int idx = text.Find(delim, start);
+                CString piece = idx < 0 ? text.Mid(start) : text.Mid(start, idx - start);
+                if (!piece.IsEmpty()) {
+                    if (isList) dw->SendDlgItemMessage(dw->CtrlIdOf(id), LB_ADDSTRING, 0, (LPARAM)(LPCWSTR)piece);
+                    else if (isCombo) dw->SendDlgItemMessage(dw->CtrlIdOf(id), CB_ADDSTRING, 0, (LPARAM)(LPCWSTR)piece);
+                    else { CWnd* c = dw->GetDlgItem(dw->CtrlIdOf(id)); if (c) { CString cur; c->GetWindowText(cur); if (!cur.IsEmpty()) cur += L"\r\n"; cur += piece; c->SetWindowText(cur); } }
+                }
+                if (idx < 0) break;
+                start = idx + 1;
+            }
+        }
         else if (cmd == L"ebeeps") { CString a = arg; a.MakeLower(); a.Trim(); m_ebeepsOn = a.IsEmpty() ? !m_ebeepsOn : (a == L"on"); Show(w, CString(L"* Event beeps are now ") + (m_ebeepsOn ? L"on" : L"off") + L".", cInfo); }
         else if (cmd == L"strip") {   // +-buriec: this client has one global "strip mIRC control codes on display" switch, not per-code-type toggles
             CString a = arg; a.Trim(); bool turnOn = a.Find(L'+') >= 0 && a.Find(L'-') < 0;
@@ -15103,6 +15726,40 @@ class CMainFrame : public CMDIFrameWnd {
             }
             else if (a.Left(2).CompareNoCase(L"-l") == 0) { /* reload from ini: colors are already loaded at startup and kept current, nothing extra to do */ }
             else Show(w, L"* Usage: /color -s <scheme name>  (per-index 0-15 palette editing isn't implemented -- that palette is fixed in this client)", cPart);
+        }
+        else if (cmd == L"colour") {   // /colour <name> <N> | <N> <RGB> | -lrs [N/scheme name] -- the British spelling of real mIRC's own command, with a slightly wider syntax than /color above: it can additionally recolor one named Colors-dialog item (by 0-15 palette index) without switching the WHOLE scheme via -s
+            CString a = arg; a.TrimLeft();
+            if (a.Left(2).CompareNoCase(L"-s") == 0 || a.Left(2).CompareNoCase(L"-l") == 0 || a.Left(2).CompareNoCase(L"-r") == 0) {
+                // -s/-l behave exactly like /color's own; -r (reset palette index N to default) isn't implemented for the
+                // same reason /color's own comment gives: the 0-15 chat-text palette is a fixed constant table here, not
+                // a runtime-editable one.
+                if (a.Left(2).CompareNoCase(L"-s") == 0) {
+                    CString name = a.Mid(2); name.Trim(); bool found = false;
+                    for (size_t i = 0; i < m_schemes.size(); i++) if (m_schemes[i].name.CompareNoCase(name) == 0) { m_curScheme = (int)i; PushSchemeColors(m_schemes[i]); found = true; break; }
+                    if (!found) Show(w, L"* /colour -s: no such scheme: " + name, cPart);
+                } else if (a.Left(2).CompareNoCase(L"-r") == 0) Show(w, L"* /colour -r: the 0-15 palette is fixed in this client, not runtime-editable.", cPart);
+                return;
+            }
+            CString first = Word(a), second = a; second.Trim();
+            double nD;
+            if (ParseNum(first, nD) && second.Find(L',') >= 0) { Show(w, L"* /colour <N> <RGB>: the 0-15 palette is fixed in this client, not runtime-editable.", cPart); return; }
+            // <name> <N>: recolor one named scheme item -- maps real mIRC's Colors-dialog item names onto this
+            // client's own ColorScheme fields; ListBox/TreeBar/InActive/Notify have no matching field here (this
+            // client's 19-item scheme doesn't track those UI surfaces separately) and are reported as such rather
+            // than silently doing nothing.
+            CString nameL = first; nameL.MakeLower();
+            if (!IsAllDigits(second) || _wtoi(second) < 0 || _wtoi(second) > 15) { Show(w, L"* Usage: /colour <name> <N>  (N is a 0-15 palette index)", cPart); return; }
+            COLORREF rgb = kMircPalette[_wtoi(second)];
+            ColorScheme& s = CurScheme();
+            COLORREF* field = nameL == L"normal" ? &s.normal : nameL == L"own" ? &s.own : nameL == L"notice" ? &s.notice : nameL == L"other" ? &s.other
+                : nameL == L"info" ? &s.info : nameL == L"info2" ? &s.info2 : nameL == L"action" ? &s.action : nameL == L"wallops" ? &s.wallops
+                : nameL == L"whois" ? &s.whois : nameL == L"ctcp" ? &s.ctcp : nameL == L"highlight" ? &s.highlight : nameL == L"invite" ? &s.invite
+                : nameL == L"join" ? &s.join : nameL == L"part" ? &s.part : nameL == L"quit" ? &s.quit : nameL == L"mode" ? &s.mode
+                : nameL == L"topic" ? &s.topic : nameL == L"kick" ? &s.kick : nameL == L"background" ? &s.chatBg : nameL == L"editbox" ? &s.editBg
+                : nullptr;
+            if (!field) { Show(w, L"* /colour: '" + first + L"' isn't a recognized (or supported) color item.", cPart); return; }
+            *field = rgb; PushSchemeColors(s); SaveColors();
+            Show(w, L"* " + first + L" color set.", cInfo);
         }
         else if (cmd == L"showmirc") {   // -mnrstxoplf
             CString a = arg; a.MakeLower();
@@ -15498,7 +16155,7 @@ class CMainFrame : public CMDIFrameWnd {
                 int posN = 0; CString numPart = sw.Mid(3); if (!numPart.IsEmpty() && IsAllDigits(numPart)) posN = _wtoi(numPart);
                 InsertIntoFileList(m_rfiles, path, posN); SaveFileList(L"rfiles", m_rfiles); LoadRemote();
                 Show(w, L"* Loaded script file: " + path, cInfo);
-                if (cmd == L"load") FireScriptLoadEvent(w, L"LOAD", path);   // /reload is documented to skip on LOAD (that's the whole point of /reload over /load -rs) -- /load itself fires it, scoped to just the file that was loaded
+                if (cmd == L"load") { FireScriptLoadEvent(w, L"LOAD", path); FireScriptLoadEvent(w, L"START", path, true); }   // /reload is documented to skip on LOAD/on START (that's the whole point of /reload over /load -rs) -- /load itself fires both, scoped to just the file that was loaded
                 return;
             }
             Show(w, L"* Usage: /" + cmd + L" <-aN|-pscqnm|-ruvsN> <filename>", cPart);
@@ -15531,6 +16188,82 @@ class CMainFrame : public CMDIFrameWnd {
             }
             Show(w, L"* Usage: /unload <-a|-nrs> <filename>", cPart);
         }
+        else if (cmd == L"add") {   // /add [-apuce] <file.ini> -- real mIRC: REPLACES the currently loaded section(s) with those in file.ini (unlike /load, which adds file.ini alongside whatever's already loaded). -u/-c/-e (remote users/commands/events) all live in the same m_rfiles/LoadRemote mechanism in this client -- there's no separate storage to tell them apart, so all three just replace m_rfiles with this one file.
+            CString a = arg; a.TrimLeft();
+            if (a.Left(1) != L"-") { Show(w, L"* Usage: /add [-apuce] <file.ini>", cPart); return; }
+            CString sw = Word(a); sw.MakeLower();
+            CString fname = a; fname.Trim();
+            if (fname.IsEmpty()) { Show(w, L"* Usage: /add [-apuce] <file.ini>", cPart); return; }
+            CString path = IniPath(fname);
+            CString what;
+            if (sw.Find(L'a') >= 0) { m_afiles.assign(1, path); SaveFileList(L"afiles", m_afiles); LoadAliases(); what = L"Aliases"; }
+            if (sw.Find(L'p') >= 0) { for (int s = 0; s < 5; s++) { m_popPath[s] = path; m_popRaw[s] = ReadIniSectionLines(path, kPopSec[s]); } SaveFileList(L"pfiles", std::vector<CString>(m_popPath, m_popPath + 5)); RebuildMenuBarPopups(); what = L"Popups"; }
+            if (sw.Find(L'u') >= 0 || sw.Find(L'c') >= 0 || sw.Find(L'e') >= 0) { m_rfiles.assign(1, path); SaveFileList(L"rfiles", m_rfiles); LoadRemote(); if (what.IsEmpty()) what = sw.Find(L'u') >= 0 ? L"Users" : sw.Find(L'c') >= 0 ? L"Commands" : L"Events"; }
+            if (what.IsEmpty()) { Show(w, L"* Usage: /add [-apuce] <file.ini>", cPart); return; }
+            Show(w, L"* Added: " + what + L" from " + path, cInfo);
+        }
+        else if (cmd == L"auto") {   // /auto -rw <nick/address> [#channels] [type] [network] | /auto <on/off> -- the predecessor real mIRC itself says /aop superseded; same list/on-flag this client's own /aop already uses
+            CmdAutoList(w, arg, m_aopList, m_aopOn, L"Auto-Op");
+        }
+        else if (cmd == L"commands") {   // /commands [on|off] -- real mIRC: turns CTCP event processing on/off; superseded by /ctcps. This client has no separate "/ctcps" of its own either, so this just gates the one CTCP-handling entry point (OnCtcpLine) directly.
+            CString a = arg; a.MakeLower(); a.Trim();
+            if (a.IsEmpty()) { Show(w, CString(L"* CTCP processing is ") + (m_ctcpProcessingOn ? L"on" : L"off") + L".", cInfo); return; }
+            if (a != L"on" && a != L"off") { Show(w, L"* Usage: /commands [on|off]", cPart); return; }
+            m_ctcpProcessingOn = (a == L"on"); Show(w, CString(L"* CTCP processing is now ") + (m_ctcpProcessingOn ? L"on" : L"off") + L".", cInfo);
+        }
+        else if (cmd == L"fnord") {   // easter egg: real mIRC prints "Nothing to see here." in the background color, so it's invisible against the window -- same spirit as this client's existing /xyzzy ("Nothing Happens") and /registration jokes just below. AddLine (see its own ^C/code-3 parsing) honors a literal "\x03NN,NN" fg,bg pair in the text itself, so picking the 0-15 palette index closest to the current chat background and using it for BOTH fg and bg reproduces the same "technically there, invisible against the background" trick.
+            ColorScheme& s = CurScheme();
+            COLORREF bg = s.chatBg == CLR_NONE ? RGB(255,255,255) : s.chatBg;
+            int bestIdx = 0; long bestDist = -1;
+            for (int i = 0; i < 16; i++) {
+                COLORREF p = kMircPalette[i];
+                long dr = (long)GetRValue(p) - GetRValue(bg), dg = (long)GetGValue(p) - GetGValue(bg), db = (long)GetBValue(p) - GetBValue(bg);
+                long dist = dr * dr + dg * dg + db * db;
+                if (bestDist < 0 || dist < bestDist) { bestDist = dist; bestIdx = i; }
+            }
+            CString idxStr; idxStr.Format(L"%02d", bestIdx);
+            Show(w, CString(wchar_t(3)) + idxStr + L"," + idxStr + L"Nothing to see here.", cText);
+        }
+        else if (cmd == L"philosophy" || cmd == L"timeapi") {   // both appear in real mIRC's own command index with no documented syntax or behavior recoverable from any available reference (possibly an obscure/undocumented internal command, or a stub never fully released) -- rather than invent behavior for an unknown command, this just accepts it as a recognized no-op so a script calling it doesn't fall through to "unknown command" / raw-to-server
+            Show(w, L"* /" + cmd + L": no documented behavior for this command could be confirmed; accepted as a no-op.", cInfo);
+        }
+        else if (cmd == L"updatenl") {   // real mIRC: forces an immediate IAL/nicklist refresh instead of waiting for the current script to finish -- meant for on QUIT/KICK/PART, where $nick($chan,0) etc. would otherwise read a stale count until the script returns. This client already applies PART/KICK/QUIT to the in-memory nicklist synchronously (not deferred to end-of-script), so there's no separate deferred-update queue for this to flush -- accepted as a no-op for that reason.
+            Show(w, L"* Nicklist/IAL already update immediately in this client -- /updatenl is a no-op here.", cInfo);
+        }
+        else if (cmd == L"save") {   // /save -p<scqnm> <filename> | /save -r<uv> <filename> -- writes ONE section (popups by window-type letter, or remote users/vars) to filename, in this client's own ini-section-line format (the same one /load -p*/-r* reads back), rather than real mIRC's nested menu{}-block .mrc text -- round-trips correctly through this client's own /load, which is this feature's actual purpose for a script
+            CString a = arg; a.TrimLeft();
+            if (a.Left(1) != L"-") { Show(w, L"* Usage: /save -p<scqnm> <filename>  or  /save -r<uv> <filename>", cPart); return; }
+            CString sw = Word(a); sw.MakeLower();
+            CString fname = a; fname.Trim();
+            if (fname.IsEmpty()) { Show(w, L"* Usage: /save -p<scqnm> <filename>  or  /save -r<uv> <filename>", cPart); return; }
+            CString path = IniPath(fname);
+            if (sw.Left(2) == L"-p" && sw.GetLength() >= 3) {
+                wchar_t sec = sw[2];
+                int secIdx = sec == L's' ? 0 : sec == L'c' ? 1 : sec == L'q' ? 2 : sec == L'n' ? 3 : sec == L'm' ? 4 : -1;
+                if (secIdx < 0) { Show(w, L"* Usage: /save -ps|-pc|-pq|-pn|-pm <filename>", cPart); return; }
+                for (size_t i = 0; i < m_popRaw[secIdx].size(); i++) { CString key; key.Format(L"n%d", (int)i); WritePrivateProfileStringW(kPopSec[secIdx], key, m_popRaw[secIdx][i], path); }
+                Show(w, L"* Saved popups to " + path, cInfo);
+                return;
+            }
+            if (sw == L"-rv") {   // same "n0=name value" line format SaveVars() itself writes, so /load -rv on the result round-trips correctly
+                int i = 0; for (auto& kv : m_vars) { if (kv.second.noSave) continue; CString key; key.Format(L"n%d", i++); WritePrivateProfileStringW(L"variables", key, kv.second.name + L" " + kv.second.value, path); }
+                Show(w, L"* Saved variables to " + path, cInfo);
+                return;
+            }
+            if (sw == L"-ru") {
+                int i = 0; for (auto& e : m_ignoreList) { CString key; key.Format(L"n%d", i++); WritePrivateProfileStringW(L"users", key, e.mask, path); }
+                Show(w, L"* Saved users to " + path, cInfo);
+                return;
+            }
+            Show(w, L"* Usage: /save -p<scqnm> <filename>  or  /save -r<uv> <filename>", cPart);
+        }
+        else if (cmd == L"dqwindow") {   // /dqwindow [on|off|show|hide|min|close] -- real mIRC's dedicated-query-window system, which redirects every incoming query into one shared window instead of opening a separate window per nick. This client always opens a separate window per query (see Dispatch's own "/query" handling) with no such redirection mode built, so this is reported/stored only, same as /fsend's own m_fsendN -- show/hide/min/close are accepted but have no window of their own to act on while the feature itself is off.
+            CString a = arg; a.MakeLower(); a.Trim();
+            if (a.IsEmpty()) { Show(w, CString(L"* Dedicated query window is ") + (m_dqWindowOn ? L"on" : L"off") + L".", cInfo); return; }
+            if (a == L"on" || a == L"off") { m_dqWindowOn = (a == L"on"); Show(w, CString(L"* Dedicated query window is now ") + (m_dqWindowOn ? L"on" : L"off") + L".", cInfo); return; }
+            if (a == L"show" || a == L"hide" || a == L"min" || a == L"close") { Show(w, L"* /dqwindow " + a + L": no dedicated query window exists in this client to act on (every query opens its own separate window).", cPart); return; }
+            Show(w, L"* Usage: /dqwindow [on|off|show|hide|min|close]", cPart);
+        }
         else if (cmd == L"registration") Note(net, L"Hahahaha No need to register :)  This is Free and Open Sourced IRC Client.  https://github.com/ELY3M/IRC-Client");
         else if (cmd == L"xyzzy") Note(net, "Nothing Happens");
         else if (cmd == L"help") Note(net, L"/server [-m] host [+port = TLS] (-m connects a second, independent network) /nick /join /part /list [#chan|pattern] [-min N] [-max N] [-n] /msg /query /me /notice /topic /channel /run /colors /logging /timestamp /play /playctrl /dns /window /aline /cline /dline /iline /rline /sline /renwin /timer /timers /identd /tray /tips /tip /titlebar /splay /vol /abook /notify /ignore /aop /avoice /protect /cnick /highlight /ctcp /quit /clear /echo /say /alias /unalias /set /unset /unsetall /inc /dec /var /raw /disconnect /exit /mnick /anick /tnick /partall /hop /beep /amsg /ame /qmsg /qme /omsg /onotice /describe /ctcpreply /queryrn /ban /pop /pvoice /ajinvite /autojoin /donotdisturb /menubar /toolbar /switchbar /markasread /close /clearall /flash /findtext /linesep /tokenize /mkdir /rmdir /remove /rename /copy /copyini /remini /writeini /flushini /saveini /emailaddr /fullname /ebeeps /strip /font /color /showmirc /winhelp /background /log /logview /localinfo /debug /loadbuf /savebuf /perform /write; use //cmd to evaluate $identifiers ($me $chan $network $os $date $time $1- ...); other /cmds (mode, kick, whois...) go to the server as-is");
@@ -15558,7 +16291,9 @@ class CMainFrame : public CMDIFrameWnd {
     // ---- server input ----
     void OnLine(Net* net, const CString& raw) {
         DebugLine(net, L"<-", raw);
-        CString l = raw, prefix, trail; bool hasT = false;
+        CString rawLine = raw;
+        FireParselineEvent(Status(net), L"in", rawLine);   // on PARSELINE:in -- fires before this client does ANY parsing of the incoming line (prefix/command/params), so a matching script's $parseline(...) rewrite takes effect for everything below, exactly like real mIRC's "runs before the line is processed" behavior
+        CString l = rawLine, prefix, trail; bool hasT = false;
         if (l.Left(1) == L":") { int sp = l.Find(L' '); if (sp < 0) return; prefix = l.Mid(1, sp - 1); l = l.Mid(sp + 1); }
         int t = l.Find(L" :"); if (t >= 0) { trail = l.Mid(t + 2); l = l.Left(t); hasT = true; }
         std::vector<CString> p; int pos = 0;
@@ -15588,13 +16323,15 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         if (m_cc && HandleCCNumeric(net, cmd, p)) return;   // 324 mode reply, 367/348/346/728 list entries and their end markers
-        if (cmd == L"PING") { Send(net, L"PONG :" + P(0)); }
+        if (cmd == L"PING") { FireSimpleEvent(Status(net), L"PING", CString(), CString(), P(0)); Send(net, L"PONG :" + P(0)); }   // on PING -- real mIRC: this really is the raw server PING, not some internal keepalive-timer concept; fired before replying so a halt (if this client's own FireSimpleEvent respected one, which it currently doesn't for this shared helper) couldn't skip the PONG anyway -- the PONG reply is not optional at the protocol level
+        else if (cmd == L"PONG") { FireSimpleEvent(Status(net), L"PONG", CString(), CString(), P(0) + (p.size() > 1 ? L" " + P(1) : CString())); }   // on PONG -- this client previously had NO incoming-PONG handling at all (fell through to the generic unrecognized-line path); real mIRC's on PONG covers the server's reply to mIRC's own internal keep-alive PING
         else if (cmd == L"PRIVMSG" || cmd == L"NOTICE") {
             CString tgt = P(0), txt = P(1); bool notice = cmd == L"NOTICE";
             bool priv = tgt.CompareNoCase(net->nick) == 0;
             bool ctcp = !txt.IsEmpty() && txt[0] == 1;
             if (ctcp) txt.Trim(CString(wchar_t(1)));
-            if (ctcp && txt.Left(4) == L"DCC ") { if (!notice) HandleDccCtcp(net, nick, host, txt.Mid(4)); return; }   // DCC requests arrive as a PRIVMSG CTCP, never a NOTICE
+            if (ctcp && txt.Left(4) == L"DCC ") { if (!notice) HandleDccCtcp(net, nick, host, txt.Mid(4)); return; }   // DCC requests arrive as a PRIVMSG CTCP, never a NOTICE -- /commands [on|off] (below) only gates the non-DCC CTCP branch just below, same scope real mIRC's own "CTCP event processing on/off" has
+            if (ctcp && !m_ctcpProcessingOn && txt.Left(6) != L"ACTION") return;   // /commands off -- real mIRC: ignore every non-DCC, non-ACTION CTCP entirely (no on CTCP event, no built-in VERSION/PING/TIME/FINGER reply); ACTION (/me) is excluded, same as real mIRC treats it as ordinary chat rather than "a CTCP request" for this purpose
             if (ctcp && txt.Left(6) != L"ACTION") {
                 // Any CTCP other than ACTION (VERSION, PING, TIME, and replies to them) is protocol noise,
                 // not a conversation: goes to the Status window only, in red, and never opens a query window
@@ -15633,6 +16370,7 @@ class CMainFrame : public CMDIFrameWnd {
                 return;
             }
             bool queryOpen = priv && Find(net, nick) != nullptr;   // "private messages ... will not be ignored even if their address matches" while a /query is open
+            bool newQuery = priv && !notice && !queryOpen;   // this PRIVMSG is about to create a brand-new query window for 'nick' -- see on OPEN/QUERYOPEN just below
             wchar_t ignType = notice ? L'n' : (priv ? L'p' : L'c');
             if (!(ignType == L'p' && queryOpen) && IsIgnored(net, nick, prefix, ignType)) return;   // fully suppressed: not shown, no tip, nothing
             if (IsIgnored(net, nick, prefix, L'k') || m_stripCodes) txt = Strip(txt);   // "strip control codes" -- the message still shows, just without mIRC color/style codes; m_stripCodes is the global /strip setting
@@ -15644,7 +16382,15 @@ class CMainFrame : public CMDIFrameWnd {
             COLORREF hlColor = hle ? MircColor(_wtoi(hle->colorStr)) : cText;
             CString evName = ctcp ? L"ACTION" : (notice ? L"NOTICE" : L"TEXT");
             CString evBody = ctcp ? txt.Mid(6) : txt;
-            bool evSuppress = FireTextEvent(w, evName, priv, priv ? nick : tgt, nick, host, evBody);
+            // on OPEN ("?" window type) / on QUERYOPEN -- fires right after this query window is created, with the
+            // triggering message as its matchtext, BEFORE on TEXT/ACTION itself fires -- a halting handler here
+            // suppresses TEXT/ACTION entirely, not just their display, same as the Knowledge Base's real-mIRC
+            // source material documents ("Halting an ^ OPEN event from a private message also prevents on
+            // TEXT/ACTION from firing"). Only fires once, the moment the query window is newly created -- not on
+            // every later message to that same already-open query.
+            bool evSuppress = newQuery && FireOpenEvent(w, L'?', txt);
+            if (!evSuppress) evSuppress = FireTextEvent(w, evName, priv, priv ? nick : tgt, nick, host, evBody);
+            if (notice && nick.IsEmpty()) evSuppress = FireTextEvent(w, L"SNOTICE", true, CString(), nick, host, evBody) || evSuppress;   // on SNOTICE -- a server notice (no nick!user@host prefix, same server-sourced signal already used for the Local Settings lookup just below) fires this IN ADDITION to the ordinary on NOTICE just above, matching real mIRC's own documented overlap between the two
             UrlCatch(w, nick, evBody);   // /url on: scan every incoming TEXT/ACTION/NOTICE for URL-looking words, independent of whether a ^-event suppressed the line's own display
             if (evSuppress) { /* a ^-event halted the default display for this message */ }
             else if (ctcp) Show(w, L"* " + nick + txt.Mid(6), hle ? hlColor : (colorMsg ? ResolveNickColor(*cne, nick) : cAction));   // ACTION (/me): a real chat message, so it still uses the normal window
@@ -15683,8 +16429,17 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"INVITE") {
             if (!IsIgnored(net, nick, prefix, L'i')) {
-                Note(net, nick + L" invites you to join " + P(1), cInvite);
-                if (m_ajInviteOn) Send(net, L"JOIN " + P(1));   // /ajinvite on
+                // BUGFIX: on INVITE was never actually implemented -- this whole branch just echoed the invite and
+                // handled /ajinvite directly, with no m_events lookup at all, so a script's own "on INVITE:" handler
+                // (e.g. to auto-join only specific channels/networks, or log invites) silently never ran. Wired up
+                // the same way JOIN/PART/TOPIC are just below: $chan = the channel invited to (P(1)), $nick/$address
+                // = the inviter, matched against whereSpec the same way; a ^-prefixed handler's /halt can suppress
+                // both the status-window echo and /ajinvite's auto-join, same suppress semantics as JOIN/PART/TOPIC.
+                bool suppress = FireChannelEvent(Status(net), L"INVITE", P(1), nick, prefix, CString());
+                if (!suppress) {
+                    Note(net, nick + L" invites you to join " + P(1), cInvite);
+                    if (m_ajInviteOn) Send(net, L"JOIN " + P(1));   // /ajinvite on
+                }
             }
         }
         else if (cmd == L"JOIN") {
@@ -16025,7 +16780,33 @@ class CMainFrame : public CMDIFrameWnd {
             sw->SetWindowText(L"Status - [" + COnlineTimerDlg::FormatElapsed(secs) + L"]");
         }
     }
+    bool m_exiting = false;   // $exiting -- set just before on EXIT fires, see OnClose()
+    CString m_parseLineCur, m_parseLineRewrite, m_evParseType; bool m_parseLineRewritten = false;   // on PARSELINE / $parseline/$parsetype -- see FireParselineEvent
+    // on PARSELINE -- fires for every line sent or received, in or out, matched against matchtext the same way on
+    // TEXT is (the field layout is identical: level:parseline:in|out|*:matchtext:commands, reusing whereSpec for
+    // the in/out/* selector and matchText for the pattern, same as the existing generic event parser already
+    // splits any other 4-colon-field event). $parseline inside the event body both reads the current line and, by
+    // being called WITH an argument, rewrites it (see the $parseline identifier itself) -- line is passed by
+    // reference so a rewrite takes effect for every later-matching handler in the same pass, and for the caller
+    // once this returns.
+    void FireParselineEvent(CChatWnd* w, const CString& type, CString& line) {
+        if (!m_remoteOn || !m_eventsOn || m_events.empty()) return;
+        CString savedType = m_evParseType;
+        for (auto& ev : m_events) {
+            if (ev.eventName != L"PARSELINE") continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            CString whereL = ev.whereSpec; whereL.MakeLower();
+            if (!(whereL.IsEmpty() || whereL == L"*" || whereL == type)) continue;
+            if (!ev.matchText.IsEmpty() && !GlobMatch(ev.matchText, line)) continue;   // empty matchtext (e.g. "*" or blank) means match every line, same convention as FireDccLineEvent -- GlobMatch("", nonEmptyLine) would otherwise always return false
+            m_evParseType = type; m_parseLineCur = line; m_parseLineRewritten = false;
+            RunScript(w, ev.lines, line, nullptr, ev.sourceFile);
+            if (m_parseLineRewritten) line = m_parseLineRewrite;
+        }
+        m_evParseType = savedType;
+    }
     afx_msg void OnClose() {   // banks whatever's left of the current online-timer session before the app actually closes
+        m_exiting = true;
+        FireSimpleEvent(Status(m_nets.empty() ? nullptr : m_nets[0].get()), L"EXIT", CString(), CString(), CString());   // on EXIT -- real mIRC fires this right before actually shutting down, so a script gets one last chance to clean up/save state; fired here before any of this function's own teardown work runs
         if (m_otSessionStart) { m_otTotalBanked += OtCurrentSeconds(); m_otSessionStart = 0; }
         SaveOnlineTimer();
         FlushVars();   // PERF: vars.ini writes are now debounced (see FlushVars()'s own note) -- make sure nothing from the last <500ms is lost on exit
@@ -16054,6 +16835,26 @@ class CMainFrame : public CMDIFrameWnd {
             }
         }
         CMDIFrameWnd::OnSysCommand(nID, lParam);
+    }
+    // mIRC's "on APPACTIVE" -- fires whenever this whole application gains or loses focus relative to every
+    // OTHER app on the desktop (switching away to/from some other program with Alt+Tab, clicking another app's
+    // window, etc.) -- distinct from "on ACTIVE" above, which is about switching between THIS app's OWN MDI child
+    // windows. $appactive (see IdentValue) reports the current boolean state this sets.
+    bool m_appActive = true;   // $appactive
+    afx_msg void OnActivateApp(BOOL bActive, DWORD dwThreadID) {
+        CMDIFrameWnd::OnActivateApp(bActive, dwThreadID);
+        m_appActive = bActive != 0;
+        FireAppActiveEvent();
+    }
+    void FireAppActiveEvent() {
+        if (!m_remoteOn || !m_eventsOn) return;
+        for (auto& ev : m_events) {
+            if (ev.eventName != L"APPACTIVE") continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            CString savedName = m_evName; m_evName = L"APPACTIVE";
+            RunScript(Status(nullptr), ev.lines, CString(), nullptr, ev.sourceFile);
+            m_evName = savedName;
+        }
     }
     // ---- System tray ----
     void LoadTraySettings() {
@@ -16394,12 +17195,17 @@ class CMainFrame : public CMDIFrameWnd {
         ch.playing = true; ch.paused = false;
         return CString();
     }
-    void TriggerSoundEvent(const CString& type, const CString& file) {   // this app has no formal "on EVENT" system, so the closest match to mIRC's "sound event" is: run an alias literally named "sound", if one is defined
-        AliasDef* ad = FindAlias(L"sound");
-        if (!ad) return;
+    void TriggerSoundEvent(const CString& type, const CString& file) {   // real mIRC: on WAVEEND/MIDIEND/MP3END (type-specific) AND on SONGEND (fires for every /splay completion regardless of type, per its own doc text -- "triggers whenever a file has finished playing via the /splay command", with no type restriction unlike the other three) both fire here
         CChatWnd* w = nullptr; for (auto& kv : m_w) if (kv.second->m_name == L"*status*") { w = kv.second; break; }
         if (!w) w = m_w.empty() ? nullptr : m_w.begin()->second;
-        if (w) RunAlias(w, *ad, type + L" " + file);
+        if (!w) return;
+        CString eventName = type == L"wave" ? L"WAVEEND" : type == L"midi" ? L"MIDIEND" : L"MP3END";
+        FireSimpleEvent(w, eventName, CString(), CString(), file);
+        FireSimpleEvent(w, L"SONGEND", CString(), CString(), file);
+        // Kept for backward compatibility with scripts that relied on this client's OWN prior (non-standard)
+        // convention of an alias literally named "sound" standing in for a real on-EVENT system, from before one
+        // existed here.
+        if (AliasDef* ad = FindAlias(L"sound")) RunAlias(w, *ad, type + L" " + file);
     }
     void SoundTick() {   // advances queues and fires the sound event, piggybacking on the regular ~500ms tick
         SoundChannel* chans[3] = { &m_waveChan, &m_midiChan, &m_mp3Chan };
@@ -16776,10 +17582,12 @@ class CMainFrame : public CMDIFrameWnd {
         ShowNotifyMessage(net, msg);
         PlayNotifySound(e.soundJoin);
         if (e.doWhois) Send(net, L"WHOIS " + e.nick);
+        FireSimpleEvent(Status(net), L"NOTIFY", e.nick, CString(), CString());   // real mIRC: on NOTIFY fires when a watched nick comes online; real mIRC also supports an optional nickname matchtext on the event itself, which FireSimpleEvent (shared with QUIT/NICK/CONNECT) doesn't filter on -- same simplification those three already make, so every on NOTIFY handler runs regardless of which nick came online, with $nick telling the script which one it actually was
     }
     void NotifyUserOffline(Net* net, NotifyEntry& e) {
         ShowNotifyMessage(net, e.nick + L" has left IRC" + (e.note.IsEmpty() ? CString() : L" (" + e.note + L")"));
         PlayNotifySound(e.soundPart);
+        FireSimpleEvent(Status(net), L"UNOTIFY", e.nick, CString(), CString());   // same simplification as on NOTIFY above
     }
     // Polls each connected network for the notify list's nicks via ISON, every ~60 seconds (mIRC's own "once every
     // minute or so" baseline) -- this app doesn't implement the newer, server-specific IRCv3 WATCH extension that
@@ -17456,6 +18264,63 @@ class CMainFrame : public CMDIFrameWnd {
     // other DCC fix (the port range above, local-IP detection) only helps when it's the PEER who can't be reached.
     bool m_dccUsePassive = false;
     int m_dccNextPassiveToken = 1;   // just needs to be unique among our own outstanding passive offers, not globally -- a simple incrementing counter is enough
+    // /creq, /sreq: real mIRC's command-line equivalents of the DCC Chat/Send options dialog's "on receiving a
+    // request" radio group. 0=ask (show the Accept/Ignore/Cancel dialog, same as this client's own prior
+    // hardcoded behavior), 1=auto (accept immediately, no dialog), 2=ignore (silently drop, no dialog, nothing
+    // added to the persistent /ignore list -- unlike clicking that same dialog's own "Ignore" button). The "+m/-m"
+    // switch (auto-minimize the resulting window) is tracked separately since it applies in all three modes, not
+    // just "ask".
+    int m_creqMode = 0; bool m_creqMinimize = false;
+    int m_sreqMode = 0; bool m_sreqMinimize = false;
+    // /gqreq [on|off]: real mIRC's global-queue-for-requests toggle (serializes several active agents'/scripts'
+    // DCC-ish requests so they're handled one at a time, in order, instead of racing). This client has no such
+    // queue of its own to begin with -- every CTCP/DCC request here is handled synchronously, inline, the moment
+    // its line arrives, which already IS "one at a time, in order" with no separate queue needed -- so this is
+    // stored/reported only, same rationale as m_fsendN/m_fupdateN above.
+    bool m_gqreqOn = true;
+    bool m_ctcpProcessingOn = true;   // /commands [on|off] -- gates the non-DCC/non-ACTION CTCP branch in the PRIVMSG/NOTICE handler, see its own comment there
+    bool m_dqWindowOn = false;   // /dqwindow [on|off|...] -- stored/reported only, see its own command-handler comment
+    bool m_dccPumpOn = false;   // /pdcc [on|off] -- see its own command-handler comment: stored/reported only
+    // /dccserver [[+-]scf] [on|off] [port] -- a single persistent listening socket (default port 59) that accepts
+    // DCC connections without a prior CTCP negotiation, for bots/scripts that expect to dial straight into a known
+    // port rather than wait for a DCC CHAT/SEND offer first. Real mIRC's own dccserver negotiates a short handshake
+    // on accept to figure out whether the connecting peer wants Chat, Send or Fserve; that handshake isn't
+    // publicly documented in enough detail to reproduce faithfully here, so this scopes to what's unambiguous:
+    // the listen socket itself, the on/off and port state, and (when 'c' is enabled) opening an accepted
+    // connection straight into a DCC chat window -- 's'/'f' are accepted and stored like real mIRC's own switches,
+    // but an accepted connection isn't further classified into Send/Fserve, the same "accepted-but-not-fully-
+    // implemented switch" scoping already used elsewhere in this file (e.g. /sockudp's -b, documented in its own
+    // comment).
+    bool m_dccServerOn = false; bool m_dccServerS = false, m_dccServerC = false, m_dccServerF = false;
+    UINT m_dccServerPort = 59;
+    std::unique_ptr<CDccSock> m_dccServerSock;
+    void DccServerStop() { if (m_dccServerSock) { m_dccServerSock->Close(); m_dccServerSock.reset(); } m_dccServerOn = false; }
+    bool DccServerStart() {
+        DccServerStop();
+        m_dccServerSock = std::make_unique<CDccSock>();
+        if (!m_dccServerSock->Create(m_dccServerPort, SOCK_STREAM) || !m_dccServerSock->Listen()) { m_dccServerSock.reset(); return false; }
+        m_dccServerSock->onAccept = [this]() { DccServerOnAccept(); };
+        m_dccServerOn = true;
+        return true;
+    }
+    void DccServerOnAccept() {   // mirrors DccChatPeerConnected's own accept-into-live-socket pattern, just against the one shared m_dccServerSock listener instead of a per-session one
+        if (!m_dccServerC) { CDccSock tmp; m_dccServerSock->Accept(tmp); tmp.Close(); return; }   // chat-only scoping (see m_dccServerOn's own comment) -- a connection arriving with only 's'/'f' enabled has nothing to hand it to yet, so it's accepted-then-closed rather than left hanging and re-signaling forever
+        auto newSock = std::make_unique<CDccSock>();
+        if (!m_dccServerSock->Accept(*newSock)) return;
+        CString peerIp; UINT peerPort = 0; newSock->GetPeerName(peerIp, peerPort);
+        CString acceptNick = peerIp.IsEmpty() ? CString(L"Unknown") : peerIp;
+        if (FireDccServerEvent(L"Chat", acceptNick, peerIp, CString())) { newSock->Close(); return; }   // on DCCSERVER -- a halting handler rejects the connection outright, before it's ever handed to a chat window
+        auto sess = std::make_unique<DccSession>();
+        sess->kind = DccSession::CHAT; sess->net = nullptr; sess->nick = acceptNick; sess->address = peerIp; sess->weOffered = false;
+        sess->live = std::move(newSock);
+        CChatWnd* w = OpenDccChatWindow(sess->nick);
+        w->m_dccSession = sess.get(); sess->win = w;
+        DccSession* raw = sess.get();
+        WireDccChatSocket(raw);
+        sess->state = DccSession::ACTIVE;
+        Show(w, L"Incoming /dccserver connection from " + sess->nick, cJoin);
+        m_dcc.push_back(std::move(sess));
+    }
     void LoadDccSettings() {
         CWinApp* a = AfxGetApp();
         m_dccShowFileWarning = a->GetProfileInt(L"DCC", L"ShowFileWarning", 1) != 0;
@@ -17504,6 +18369,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->net = nullptr; w->m_dccProgress = true;
         w->onInput = [this](CChatWnd* c, CString s) { OnInput(c, s); };   // no editbox is shown, but kept wired for consistency (e.g. a /close typed via some other path)
         w->onClose = [this](CChatWnd* c) { DccSessionForgetWindow(c); Forget(c); };
+        w->onActivate = [this](CChatWnd* c) { FireActiveEvent(c); };
         w->onDccBtn = [this](CChatWnd* c, int which) { OnDccProgressBtn(c, which); };
         w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
         w->tsFormat = [this]() { return m_tsEventFmt; };
@@ -17551,6 +18417,9 @@ class CMainFrame : public CMDIFrameWnd {
             DccProgressSetStatus(sess, text);
             sess->win->DccShowFinishedButtons(true);
         }
+        // on FILESENT/on FILERCVD -- the one place a SEND/GET session actually finishes successfully, shared by
+        // every completion path (ack-complete send, receive-complete get) via this single function.
+        FireSimpleEvent(Status(sess->net), sess->kind == DccSession::SEND ? L"FILESENT" : L"FILERCVD", sess->nick, sess->address, sess->filename);
     }
     void DccProgressFail(DccSession* sess, const CString& reason) {
         sess->state = DccSession::FAILED;
@@ -17560,6 +18429,12 @@ class CMainFrame : public CMDIFrameWnd {
             DccProgressSetStatus(sess, (isSend ? CString(L"Sending: ") : CString(L"Receiving: ")) + sess->filename + L"\r\n\r\nStatus:   Failed - " + reason);
             sess->win->DccShowFinishedButtons(false);   // no "Open" (nothing complete), but Open Folder/Close still make sense
         }
+        // on SENDFAIL/on GETFAIL -- this is the single shared failure point for every SEND/GET failure mode (cancel,
+        // write error, connection dropped early, accept/connect/reopen failed, malformed passive reply). This
+        // function is SEND/GET-only in practice (DCC Chat failures go straight to Show(), never through here), but
+        // the kind check is kept explicit rather than assumed.
+        if (sess->kind == DccSession::SEND || sess->kind == DccSession::GET)
+            FireSimpleEvent(Status(sess->net), sess->kind == DccSession::SEND ? L"SENDFAIL" : L"GETFAIL", sess->nick, sess->address, sess->filename);
     }
     void OnDccProgressBtn(CChatWnd* w, int which) {
         DccSession* sess = (DccSession*)w->m_dccSession;
@@ -17768,6 +18643,7 @@ class CMainFrame : public CMDIFrameWnd {
         w->net = nullptr;
         w->onInput = [this](CChatWnd* c, CString s) { OnDccChatInput(c, s); };
         w->onClose = [this](CChatWnd* c) { DccSessionForgetWindow(c); Forget(c); };
+        w->onActivate = [this](CChatWnd* c) { FireActiveEvent(c); };
         w->tsEnabled = [this, w]() { return w->m_tsMode == -1 ? m_tsGlobalOn : (w->m_tsMode == 1); };
         w->tsFormat = [this]() { return m_tsEventFmt; };
         w->m_seq = ++m_seqn;
@@ -17821,14 +18697,19 @@ class CMainFrame : public CMDIFrameWnd {
             CString ip = DccMapSelfIp(net, DccParseIpToken(ipTok));
             UINT port = (UINT)_wtoi(portTok);
             if (ip.IsEmpty() || port == 0) { Show(Status(net), L"* Malformed DCC CHAT request from " + nick, cPart); return; }
-            CDccChatAcceptDlg dlg(this, nick, host);
-            int r = dlg.DoModal();
-            if (r == IDCANCEL) return;
-            if (r == IDNO) {   // Ignore: add this address to the ignore list's DCC type specifically, leaving their normal chat untouched
-                IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
-                e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
-                m_ignoreList.push_back(e); SaveIgnore();
-                return;
+            if (m_creqMode == 2) return;   // /creq ignore -- silently drop, no dialog, nothing added to the persistent /ignore list
+            bool minimizeWin = m_creqMinimize;
+            if (m_creqMode != 1) {   // mode 0 ("ask", the original hardcoded behavior) -- /creq auto (mode 1) falls straight through to acceptance below instead
+                CDccChatAcceptDlg dlg(this, nick, host);
+                int r = dlg.DoModal();
+                if (r == IDCANCEL) return;
+                if (r == IDNO) {   // Ignore: add this address to the ignore list's DCC type specifically, leaving their normal chat untouched
+                    IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
+                    e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
+                    m_ignoreList.push_back(e); SaveIgnore();
+                    return;
+                }
+                minimizeWin = dlg.minimizeWindow;
             }
             auto sess = std::make_unique<DccSession>();
             sess->kind = DccSession::CHAT; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false; sess->state = DccSession::CONNECTING;
@@ -17839,7 +18720,7 @@ class CMainFrame : public CMDIFrameWnd {
             sess->win = w;
             Show(w, L"Chat with " + nick, cJoin);
             Show(w, L"Trying to connect...", cPart);
-            if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+            if (minimizeWin) w->ShowWindow(SW_SHOWMINIMIZED);
             DccSession* raw = sess.get();
             sess->sock->onConnect = [this, raw](int e) { DccChatConnectResult(raw, e); };
             DccConnectOut(sess->sock.get(), ip, port);
@@ -17872,25 +18753,30 @@ class CMainFrame : public CMDIFrameWnd {
                 }
             }
             if (ip.IsEmpty() || fname.IsEmpty() || (port == 0 && tokenTok.IsEmpty())) { Show(Status(net), L"* Malformed DCC SEND request from " + nick, cPart); return; }
-            if (m_dccShowFileWarning) {
-                CDccFileWarningDlg warnDlg(this); warnDlg.alwaysShow = m_dccShowFileWarning;
-                warnDlg.DoModal();   // only has an OK (and Help) button -- nothing to decline here, it's purely informational
-                m_dccShowFileWarning = warnDlg.alwaysShow; SaveDccSettings();
-            }
-            CDccGetAcceptDlg dlg(this, nick, host, fname, DccFormatBytes(size), DccDownloadPath(fname));
-            int r = dlg.DoModal();
-            if (r == IDCANCEL) return;
-            if (r == IDNO) {
-                IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
-                e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
-                m_ignoreList.push_back(e); SaveIgnore();
-                return;
+            if (m_sreqMode == 2) return;   // /sreq ignore -- silently drop, no dialog, nothing added to the persistent /ignore list
+            CString savePath = DccDownloadPath(fname); bool minimizeWin = m_sreqMinimize;
+            if (m_sreqMode != 1) {   // mode 0 ("ask", the original hardcoded behavior) -- /sreq auto (mode 1) skips straight to acceptance below with the default save path
+                if (m_dccShowFileWarning) {
+                    CDccFileWarningDlg warnDlg(this); warnDlg.alwaysShow = m_dccShowFileWarning;
+                    warnDlg.DoModal();   // only has an OK (and Help) button -- nothing to decline here, it's purely informational
+                    m_dccShowFileWarning = warnDlg.alwaysShow; SaveDccSettings();
+                }
+                CDccGetAcceptDlg dlg(this, nick, host, fname, DccFormatBytes(size), DccDownloadPath(fname));
+                int r = dlg.DoModal();
+                if (r == IDCANCEL) return;
+                if (r == IDNO) {
+                    IgnoreEntry e; int at = host.Find(L'@'); e.mask = L"*!*@" + (at >= 0 ? host.Mid(at + 1) : host);
+                    e.p = e.c = e.n = e.t = e.i = e.k = e.s = e.h = e.y = false; e.d = true;
+                    m_ignoreList.push_back(e); SaveIgnore();
+                    return;
+                }
+                savePath = dlg.savePath; minimizeWin = dlg.minimizeWindow;
             }
             auto sess = std::make_unique<DccSession>();
             sess->kind = DccSession::GET; sess->net = net; sess->nick = nick; sess->address = host; sess->weOffered = false;
-            sess->filename = fname; sess->localPath = dlg.savePath; sess->fileSize = size;
+            sess->filename = fname; sess->localPath = savePath; sess->fileSize = size;
             sess->file = std::make_unique<CFile>();
-            if (!sess->file->Open(dlg.savePath, CFile::modeCreate | CFile::modeWrite)) { Show(Status(net), L"* DCC Get: couldn't create " + dlg.savePath, cPart); return; }
+            if (!sess->file->Open(savePath, CFile::modeCreate | CFile::modeWrite)) { Show(Status(net), L"* DCC Get: couldn't create " + savePath, cPart); return; }
             CChatWnd* w = OpenDccProgressWindow(L"Get " + nick + L" " + fname);
             w->m_dccSession = sess.get(); sess->win = w;
             DccSession* raw = sess.get();
@@ -17901,9 +18787,9 @@ class CMainFrame : public CMDIFrameWnd {
                 if (!DccBindListenPort(sess->sock.get())) { Show(Status(net), L"* DCC Get: couldn't start listening (every port tried was unavailable).", cPart); return; }
                 CString localAddr; UINT localPort; sess->sock->GetSockName(localAddr, localPort);
                 sess->state = DccSession::LISTENING;
-                DccProgressSetStatus(raw, L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + dlg.savePath +
+                DccProgressSetStatus(raw, L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + savePath +
                     L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Awaiting connection...");
-                if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+                if (minimizeWin) w->ShowWindow(SW_SHOWMINIMIZED);
                 sess->sock->onAccept = [this, raw]() { DccGetPeerConnected(raw); };
                 CString replyFname = fname; replyFname.Replace(L' ', L'_');
                 CString reply; reply.Format(L"DCC SEND %s %lu %u %llu %s", (LPCWSTR)replyFname, DccIpToUint(DccLocalIp(net)), (unsigned)localPort, size, (LPCWSTR)tokenTok);
@@ -17912,9 +18798,9 @@ class CMainFrame : public CMDIFrameWnd {
                 sess->sock = std::make_unique<CDccSock>();
                 sess->sock->Create();
                 sess->state = DccSession::CONNECTING;
-                DccProgressSetStatus(raw, L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + dlg.savePath +
+                DccProgressSetStatus(raw, L"Receiving: " + fname + L"\r\nFrom:      " + nick + L"\r\nTo:        " + savePath +
                     L"\r\n\r\nReceived:\r\nRate:\r\nStatus:    Connecting...");
-                if (dlg.minimizeWindow) w->ShowWindow(SW_SHOWMINIMIZED);
+                if (minimizeWin) w->ShowWindow(SW_SHOWMINIMIZED);
                 sess->sock->onConnect = [this, raw](int e) { DccGetConnectResult(raw, e); };
                 DccConnectOut(sess->sock.get(), ip, port);
             }
@@ -17930,6 +18816,7 @@ class CMainFrame : public CMDIFrameWnd {
         WireDccChatSocket(sess);
         sess->state = DccSession::ACTIVE;
         if (sess->win) { Show(sess->win, L"-", cText); Show(sess->win, L"DCC Chat connection established", cJoin); }
+        FireOpenEvent(sess->win, sess->isFileServer ? L'!' : L'=', CString());   // on OPEN ("!"/"=" window types) -- fires once the DCC chat/fserve connection is actually established, same as real mIRC
         if (sess->isFileServer && !sess->fsWelcomeFile.IsEmpty()) FsSendFile(sess, sess->fsWelcomeFile);
     }
     void DccChatConnectResult(DccSession* sess, int e) {   // connecting side
@@ -17938,10 +18825,26 @@ class CMainFrame : public CMDIFrameWnd {
         WireDccChatSocket(sess);
         sess->state = DccSession::ACTIVE;
         if (sess->win) { Show(sess->win, L"-", cText); Show(sess->win, L"DCC Chat connection established", cJoin); }
+        FireOpenEvent(sess->win, sess->isFileServer ? L'!' : L'=', CString());   // on OPEN -- see DccChatPeerConnected's matching call just above
     }
     void WireDccChatSocket(DccSession* sess) {
         sess->live->onData = [this, sess](const char* data, int n) { DccChatOnData(sess, data, n); };
         sess->live->onClose = [this, sess]() { DccChatOnClose(sess); };
+    }
+    // on CHAT / on SERV -- matched by matchText against the line only (no window-type/where-spec concept the way
+    // JOIN/PART/TEXT etc. have, since both of these are inherently scoped to one already-open DCC chat/fserve
+    // window): shared by DccChatOnData just below for both event names.
+    void FireDccLineEvent(CChatWnd* w, const CString& eventName, const CString& nick, const CString& address, const CString& line) {
+        if (!m_remoteOn || !m_eventsOn) return;
+        CString savedNick = m_evNick, savedAddr = m_evAddress, savedName = m_evName, savedLevel = m_evLevel;
+        for (auto& ev : m_events) {
+            if (ev.eventName != eventName) continue;
+            if (!IsGroupEnabled(ev.groupName)) continue;
+            if (!ev.matchText.IsEmpty() && !GlobMatch(ev.matchText, line)) continue;
+            m_evNick = nick; m_evAddress = address; m_evName = eventName; m_evLevel.Format(L"%d", ev.level);
+            RunScript(w, ev.lines, line, nullptr, ev.sourceFile);
+        }
+        m_evNick = savedNick; m_evAddress = savedAddr; m_evName = savedName; m_evLevel = savedLevel;
     }
     void DccChatOnData(DccSession* sess, const char* data, int n) {
         sess->inbuf.append(data, n);
@@ -17950,8 +18853,8 @@ class CMainFrame : public CMDIFrameWnd {
             std::string lineA = sess->inbuf.substr(0, pos); sess->inbuf.erase(0, pos + 1);
             if (!lineA.empty() && lineA.back() == '\r') lineA.pop_back();
             CString line = CString(CA2W(lineA.c_str(), CP_UTF8));
-            if (sess->isFileServer) FsHandleCommand(sess, line);
-            else if (sess->win) { sess->win->m_lastMsgTick = ::GetTickCount64(); Show(sess->win, L"<" + sess->nick + L"> " + line, cText); }
+            if (sess->isFileServer) { FireDccLineEvent(sess->win, L"SERV", sess->nick, sess->address, line); FsHandleCommand(sess, line); }
+            else { FireDccLineEvent(sess->win, L"CHAT", sess->nick, sess->address, line); if (sess->win) { sess->win->m_lastMsgTick = ::GetTickCount64(); Show(sess->win, L"<" + sess->nick + L"> " + line, cText); } }
         }
     }
     // Resolves a user-supplied relative path (from a fileserver "cd" or "get") against the session's current
@@ -18345,6 +19248,8 @@ class CMainFrame : public CMDIFrameWnd {
         if (it.dueAt == 0) it.dueAt = now;
         if (now < it.dueAt) return;
         if (it.pos >= it.lines.size()) {
+            CChatWnd* w = Find(it.net, it.target); if (!w) w = Status(it.net);
+            FireSimpleEvent(w, L"PLAYEND", CString(), CString(), it.fname);   // on PLAYEND -- fires once this /play queue item has sent every one of its lines
             if (it.clipTemp) ::DeleteFileW(it.fname);
             m_playQueue.erase(m_playQueue.begin());
             if (m_playQueue.empty()) StopPlayTimer();
@@ -18570,6 +19475,16 @@ class CMainFrame : public CMDIFrameWnd {
             }
 #endif
             s->sock->Write(out);   // TLS-aware: encrypts first when this socket was opened with -e, otherwise identical to the old direct Send()
+            // on SOCKWRITE -- real mIRC fires this for EVERY /sockwrite send, success or failure (distinguished by
+            // $sockerr: 0 success, non-zero/non-empty an error), not only on an outright failure. This used to not
+            // fire at all for /sockwrite (only /sockudp's own send path fired it, and only on failure -- see that
+            // branch's matching fix) -- a script's own "on *:sockwrite:name:{ if ($sockerr) ... }" idiom (the
+          // exact pattern real mIRC's own docs recommend) never ran at all for a plain TCP socket. Write() above
+            // is a fire-and-forget queue/encrypt call with no synchronous failure to report, so this always clears
+            // $sockerr first -- an actual mid-stream socket failure still gets reported separately via the normal
+            // on SOCKCLOSE path when the connection actually drops.
+            m_sockErr.Empty();
+            FireSockEvent(ActiveOrStatus(), L"SOCKWRITE", s->name, CString());
         }
         else if (cmd == L"sockread") {
             // Real mIRC's /sockread takes only the ONE var argument -- it has no socket-name parameter at all,
@@ -18672,7 +19587,13 @@ class CMainFrame : public CMDIFrameWnd {
             std::string out(utf8.GetString(), utf8.GetLength());
             if (swN) out += "\r\n";   // -n here means APPEND a CRLF, per /sockudp's own doc wording -- the opposite sense from /sockwrite's -n
             int sent = m_socks.back()->sock->SendTo(out.data(), (int)out.size(), (UINT)port, ipaddr);
-            if (sent == SOCKET_ERROR) { m_sockErr = L"Unable to send"; FireSockEvent(ActiveOrStatus(), L"SOCKWRITE", name, CString()); }
+            // on SOCKWRITE -- fires for this send regardless of outcome, same as /sockwrite's own TCP path just
+            // above; this used to only fire on the FAILURE branch, so a script's $sockerr==0 success check inside
+            // its own "on *:sockwrite:..." handler could never actually run for a /sockudp send that worked. (A
+            // separate, now-removed "on UDPWRITE" existed in old mIRC versions for exactly this, but mIRC 7.33
+            // folded UDP writes into plain on SOCKWRITE -- see the KB's own compatibility note on that page.)
+            m_sockErr = (sent == SOCKET_ERROR) ? CString(L"Unable to send") : CString();
+            FireSockEvent(ActiveOrStatus(), L"SOCKWRITE", name, CString());
             if (swZ) RemoveSock(name, L"sockudp-fire-and-forget");   // -z: don't wait around for a reply
         }
         else if (cmd == L"sockpause") {   // /sockpause [-r] <name>
@@ -19620,6 +20541,7 @@ class CMainFrame : public CMDIFrameWnd {
     }
     void ReportDnsResult(const DnsRequest& r) {
         CChatWnd* w = Find(r.net, r.winName); if (!w) w = Status(r.net);
+        FireSimpleEvent(w, L"DNS", CString(), CString(), CString());   // on DNS -- fires once a /dns job finishes (success or error); the script reads the result via $dns/$iaddress/$naddress/$raddress etc rather than through params here, same as real mIRC
         if (!r.error.IsEmpty()) { Show(w, L"* DNS: " + r.query + L" - " + r.error, cPart); return; }
         if (r.multi) {
             Show(w, L"* DNS records for " + r.query + L":", cInfo);
@@ -20547,12 +21469,14 @@ public:
         Note(net, L"IRC ready. Not connected use File > Connect, the toolbar, or /server [-m] host [+port] to connect. "
              L"Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
         FireScriptLoadEvent(startupStatus, L"LOAD", CString());   // real mIRC fires on LOAD for every script already in the Remote file list when mIRC itself starts, before any server connection -- sourceFile empty means every script, not just one
+        FireScriptLoadEvent(startupStatus, L"START", CString(), true);   // on START: same startup moment as on LOAD above, capped at one handler per script file (see FireScriptLoadEvent's onePerFile)
     }
 };
 
 BEGIN_MESSAGE_MAP(CMainFrame, CMDIFrameWnd)
     ON_WM_CLOSE()
     ON_WM_SYSCOMMAND()
+    ON_WM_ACTIVATEAPP()
     ON_MESSAGE(WM_APP + 50, OnDnsResult)
     ON_MESSAGE(WM_APP + 51, OnIdentdRequest)
     ON_MESSAGE(WM_APP + 52, OnTrayNotify)
