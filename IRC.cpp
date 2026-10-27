@@ -853,7 +853,7 @@ public:
 // ---------------- Connect / options dialog (template built in memory, no .rc) ----------------
 enum { IDM_CONNECT = 9001, IDM_DISCONNECT, IDM_CASCADE, IDM_TILE, IDM_EXIT, IDM_SWTOP, IDM_SWBOTTOM, IDM_FONT, IDM_SERVERS, IDM_CHANFAVS, IDM_ABOUT, IDM_ALIASES, IDM_COLORS, IDM_LOGGING, IDM_ONLINETIMER, IDM_IDENTD, IDM_LOCALSETTINGS, IDM_DCCOPTIONS, IDM_TRAY, IDM_TIPS, IDM_ABOOK, IDM_POPEDIT0, IDM_POPEDIT1, IDM_POPEDIT2, IDM_POPEDIT3, IDM_POPEDIT4, IDM_SCRIPTEDITOR,
     IDM_SWLEFT, IDM_SWRIGHT, IDM_LOCKBARS, IDM_TBPOSTOP, IDM_TBPOSLEFT, IDM_TBPOSBOTTOM, IDM_TBPOSRIGHT, IDM_URLLIST, IDM_PROXY,
-       IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX, IDC_ANICK };
+       IDC_HOST = 101, IDC_PORT, IDC_NICK, IDC_USER, IDC_REAL, IDC_PASS, IDC_JOIN, IDC_TLS, IDC_LAX, IDC_ANICK, IDC_EMAIL };
 struct Opts {
     CString host = L"irc.libera.chat", nick = L"YourNickname", user = L"irc", real = L"IRC user", pass, autojoin;
     CString anick;   // $anick / /connect's "Alt nick" field -- tried once, automatically, if the primary nick is taken (433) during registration; empty means no alt nick configured, same as real mIRC leaving it blank
@@ -878,16 +878,17 @@ class CConnDlg : public CDialog {
 public:
     CConnDlg(Opts& op, CWnd* parent) : o(op) {
         W(DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU); W(0);
-        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(232); t.push_back(200);   // cdit, x, y, cx, cy
+        t.push_back(0); t.push_back(0); t.push_back(0); t.push_back(232); t.push_back(216);   // cdit, x, y, cx, cy
         t.push_back(0); t.push_back(0); S(L"Connect to IRC server"); t.push_back(9); S(DEFAULT_FONT); //was Segoe UI
         Row(6, L"Server", IDC_HOST); Row(22, L"Port", IDC_PORT, ES_NUMBER); Row(38, L"Nickname", IDC_NICK);
         Row(54, L"Alt Nickname", IDC_ANICK);
-        Row(70, L"User name", IDC_USER); Row(86, L"Real name", IDC_REAL); Row(102, L"Password", IDC_PASS, ES_PASSWORD);
-        Row(118, L"Auto-join", IDC_JOIN);
-        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 136, 150, 10, IDC_TLS, 0x0080, L"Use TLS (SSL) encryption");
-        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 150, 150, 10, IDC_LAX, 0x0080, L"Accept invalid certificates");
-        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 110, 176, 50, 14, IDOK, 0x0080, L"Connect");
-        Item(BS_PUSHBUTTON | WS_TABSTOP, 166, 176, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+        Row(70, L"User name", IDC_USER); Row(86, L"Real name", IDC_REAL);
+        Row(102, L"Email address", IDC_EMAIL); Row(118, L"Password", IDC_PASS, ES_PASSWORD);   // Email: not sent over IRC -- stored for $email/$emailaddr only
+        Row(134, L"Auto-join", IDC_JOIN);
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 152, 150, 10, IDC_TLS, 0x0080, L"Use TLS (SSL) encryption");
+        Item(BS_AUTOCHECKBOX | WS_TABSTOP, 72, 166, 150, 10, IDC_LAX, 0x0080, L"Accept invalid certificates");
+        Item(BS_DEFPUSHBUTTON | WS_TABSTOP, 110, 192, 50, 14, IDOK, 0x0080, L"Connect");
+        Item(BS_PUSHBUTTON | WS_TABSTOP, 166, 192, 50, 14, IDCANCEL, 0x0080, L"Cancel");
         t[4] = (WORD)cnt;
         InitModalIndirect((LPCDLGTEMPLATE)t.data(), parent);
     }
@@ -895,7 +896,7 @@ public:
         CDialog::OnInitDialog();
         SetDlgItemText(IDC_HOST, o.host); SetDlgItemInt(IDC_PORT, o.port); SetDlgItemText(IDC_NICK, o.nick);
         SetDlgItemText(IDC_ANICK, o.anick);
-        SetDlgItemText(IDC_USER, o.user); SetDlgItemText(IDC_REAL, o.real); SetDlgItemText(IDC_PASS, o.pass);
+        SetDlgItemText(IDC_USER, o.user); SetDlgItemText(IDC_REAL, o.real); SetDlgItemText(IDC_EMAIL, o.email); SetDlgItemText(IDC_PASS, o.pass);
         SetDlgItemText(IDC_JOIN, o.autojoin); CheckDlgButton(IDC_TLS, o.tls); CheckDlgButton(IDC_LAX, o.lax);
         return TRUE;
     }
@@ -909,7 +910,7 @@ public:
     void OnOK() override {
         GetDlgItemText(IDC_HOST, o.host); o.host.Trim(); if (o.host.IsEmpty()) return;
         o.port = GetDlgItemInt(IDC_PORT); GetDlgItemText(IDC_NICK, o.nick); GetDlgItemText(IDC_ANICK, o.anick); o.anick.Trim(); GetDlgItemText(IDC_USER, o.user);
-        GetDlgItemText(IDC_REAL, o.real); GetDlgItemText(IDC_PASS, o.pass); GetDlgItemText(IDC_JOIN, o.autojoin);
+        GetDlgItemText(IDC_REAL, o.real); GetDlgItemText(IDC_EMAIL, o.email); o.email.Trim(); GetDlgItemText(IDC_PASS, o.pass); GetDlgItemText(IDC_JOIN, o.autojoin);
         o.tls = IsDlgButtonChecked(IDC_TLS); o.lax = IsDlgButtonChecked(IDC_LAX);
         if (o.port <= 0 || o.port > 65535) o.port = o.tls ? 6697 : 6667;
         if (o.nick.IsEmpty()) o.nick = L"IRCClient";
@@ -3124,6 +3125,8 @@ struct Net {
     CListWnd* listWnd = nullptr;   // this network's open /list results window, if any (one at a time, reused on repeat /list)
     CString network;               // from the server's 005 ISUPPORT "NETWORK=" token, for $network (empty if the server doesn't say)
     std::vector<CString> notifyPending;   // the nicks most recently ISON-queried on this network, so the 303 reply can be matched back up -- see NotifyTick / the "303" handler
+    CString chantypes = L"#";   // from 005 CHANTYPES=, for $chantypes
+    int modespl = 3;            // from 005 MODES=, for $modespl
     CString debugTarget;   // /debug: a @window name (or empty) that this connection's state is noted in -- see Dispatch's "debug" command
     ULONGLONG connectTick = 0;   // GetTickCount64() at 001 (registration complete) -- $uptime(server)
     bool triedAltNick = false;   // whether this connection has already fallen back to o.anick once during registration -- a second 433 after that just keeps appending "_", same as when no alt nick is configured at all
@@ -7691,6 +7694,7 @@ class CMainFrame : public CMDIFrameWnd {
     };
     int m_modalNestLevel = 0;
     struct ExecCtx; ExecCtx* m_curCtx = nullptr;   // the currently-executing script line's ExecCtx, so /tokenize (handled deep inside Dispatch, which otherwise never sees ExecCtx) can replace $1../$1- for the rest of that script -- set/restored around each Dispatch() call from ExecCmd
+    bool m_starting = false;   // $starting: 1 only while on START fires at real client startup
     CString m_vhist[9];   // $v1..$v9: see EvalCond's own comment where these get filled in
     CString m_lastExecLine;   // the raw text of whatever script line most recently started executing -- surfaced by the watchdog message in ExecNodes so "taking too long" says WHAT it was stuck on, not just that it happened
     bool m_silentCmd = false;   // true while running a "."-prefixed command -- see Dispatch's SilentGuard; individual command handlers that show their own confirmation/status line (CmdTimer's "activated", etc.) check this and skip it
@@ -8156,6 +8160,52 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"avoice") { val = m_avoiceOn ? L"$true" : L"$false"; return true; }
         if (name == L"protect") { val = m_protectOn ? L"$true" : L"$false"; return true; }
         if (name == L"highlight") { val = m_highlightOn ? L"$true" : L"$false"; return true; }
+        // ---- Identifier-audit batch: simple state/config readers (no arguments) ----
+        if (name == L"bits") { val = (sizeof(void*) == 8) ? L"64" : L"32"; return true; }
+        if (name == L"beta") { val.Empty(); return true; }   // $null: this is never a beta build
+        if (name == L"comchar") { val = L"/"; return true; }
+        if (name == L"appstate") {
+            CWnd* mw = AfxGetMainWnd();
+            if (!mw || !mw->IsWindowVisible()) val = L"hidden"; else if (mw->IsIconic()) val = L"minimized"; else if (mw->IsZoomed()) val = L"maximized"; else val = L"full";
+            return true;
+        }
+        if (name == L"auto") { val = m_aopOn ? L"$true" : L"$false"; return true; }
+        if (name == L"creq" || name == L"sreq") { int m = name == L"creq" ? m_creqMode : m_sreqMode; val = m == 1 ? L"auto" : m == 2 ? L"ignore" : L"ask"; return true; }
+        if (name == L"passivedcc") { val = m_dccUsePassive ? L"$true" : L"$false"; return true; }
+        if (name == L"port") { if (net && net->conn) val.Format(L"%d", net->o.port); else val.Empty(); return true; }
+        if (name == L"servertarget") { val = (net && net->conn) ? net->o.host : CString(); return true; }
+        if (name == L"mircpid") { val.Format(L"%lu", (unsigned long)GetCurrentProcessId()); return true; }
+        if (name == L"portable") { val = L"$false"; return true; }
+        if (name == L"fullscreen") {
+            val = L"0";
+            HWND fg = ::GetForegroundWindow(); RECT r;
+            if (fg && fg != ::GetDesktopWindow() && fg != ::GetShellWindow() && ::GetWindowRect(fg, &r)) {
+                HMONITOR hm = ::MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof(mi) };
+                if (::GetMonitorInfo(hm, &mi) && r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom && !(::GetWindowLong(fg, GWL_STYLE) & WS_CAPTION)) val = L"1";
+            }
+            return true;
+        }
+        if (name == L"ebeeps") { val = m_ebeepsOn ? L"$true" : L"$false"; return true; }
+        if (name == L"donotdisturb") { val = m_dnd ? L"$true" : L"$false"; return true; }
+        if (name == L"fupdate") { val.Format(L"%d", m_fupdateN); return true; }
+        if (name == L"dlevel") { val.Format(L"%d", m_defaultLevel); return true; }
+        if (name == L"dccport") { if (m_dccServerOn) val.Format(L"%u", m_dccServerPort); else val.Empty(); return true; }
+        if (name == L"dccignore") { val = L"$false"; return true; }   // this client has no DCC-ignore-types option
+        if (name == L"dbuh") { val.Format(L"%d", (int)HIWORD(::GetDialogBaseUnits())); return true; }
+        if (name == L"dbuw") { val.Format(L"%d", (int)LOWORD(::GetDialogBaseUnits())); return true; }
+        if (name == L"chantypes") { val = net ? net->chantypes : CString(L"#"); return true; }
+        if (name == L"modespl") { val.Format(L"%d", net ? net->modespl : 3); return true; }
+        if (name == L"compact") { val = L"$false"; return true; }
+        if (name == L"starting") { val = m_starting ? L"1" : L"0"; return true; }
+        if (name == L"dqwindow") { val = m_dqWindowOn ? L"1" : L"0"; return true; }
+        if (name == L"debug") { val = net ? net->debugTarget : CString(); return true; }
+        if (name == L"ifmatch") { val = m_vhist[0]; return true; }
+        if (name == L"ifmatch2") { val = m_vhist[1]; return true; }
+        if (name == L"stripped") { val = L"0"; return true; }
+        if (name == L"nonstdmsg") { val = L"$false"; return true; }
+        // Subsystems this client does not have (Microsoft Agent, COM, DDE, DLLs, speech recognition): the same "nothing there" answer real mIRC gives when the feature is unavailable.
+        if (name == L"agent" || name == L"agentname" || name == L"agentver" || name == L"ddename" || name == L"vcmdver") { val = name == L"agentver" ? CString(L"0") : CString(); return true; }
+        if (name == L"agentstat" || name == L"comerr" || name == L"vcmdstat") { val = L"0"; return true; }
         // ---- File and directory identifiers: the bare (no-argument) ones ----
         if (name == L"ircdir") { val = ExeDir(); return true; }
         if (name == L"ircexe") { val = ExePath(); return true; }
@@ -8207,6 +8257,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"ssldll" || name == L"ssllibdll") { val = ExePath(); return true; }   // see the banner comment above
         if (name == L"sslcertsha1" || name == L"sslcertsha256") { val.Empty(); return true; }   // the fingerprint of the CLIENT certificate currently loaded -- this client has no client-certificate/mutual-TLS feature at all (CTls::Init never supplies one), so there's never one loaded; blank is the doc's own documented behavior for that case, not a cop-out
         if (name == L"sslcertvalid") { val = (net && net->sock.tls && net->sock.tls->ready && !net->o.lax) ? L"$true" : L"$false"; return true; }   // $true only when SChannel actually validated the chain -- under "Accept invalid certificates" (lax), validation was deliberately skipped, so even a live connection honestly reports $false here rather than claiming a check that never happened
+        if (name == L"email" || name == L"emailaddr") { val = net ? net->o.email : m_defOpts.email; return true; }   // the Email address field in the Connect dialog (or /emailaddr) -- not sent over IRC, kept for scripts
         if (name == L"anick") { val = net ? net->o.anick : m_defOpts.anick; return true; }   // the alternate nickname to fall back to if the main one is taken at registration -- set via the Connect dialog's "Alt nick" field, same source the 433 handler itself reads
         if (name == L"mnick") { val = net ? net->o.nick : m_defOpts.nick; return true; }   // the nickname set in this network's (or the default) connection options, same source $fullname's own nick half uses
         if (name == L"hnick") { val = m_evHnick; return true; }   // on HELP/DEHELP only: the nick who was given/removed halfop ($nick is who made the change)
@@ -8362,7 +8413,7 @@ class CMainFrame : public CMDIFrameWnd {
         if (name == L"maxlenl") { val = L"10240"; return true; }   // the safe per-statement character limit this client enforces nowhere else yet -- these three are just the reported constants real mIRC v7.62+ uses
         if (name == L"maxlenm") { val = L"2048"; return true; }
         if (name == L"maxlens") { val = L"512"; return true; }
-        if (name == L"chan") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
+        if (name == L"chan" || name == L"channel") { val = !m_evChan.IsEmpty() ? m_evChan : ((w && w->m_chan) ? w->m_name : CString()); return true; }
         if (name == L"nick") { val = m_evNick; return true; }   // the nick a remote event fired for (who joined, who spoke, who kicked, etc.) -- empty outside an event
         if (name == L"address") { val = m_evAddress; return true; }
         if (name == L"signal") { val = m_evSignal; return true; }
@@ -8820,6 +8871,106 @@ class CMainFrame : public CMDIFrameWnd {
             val = EvalIds(w, rawArgs, params);
             m_parseLineRewrite = val; m_parseLineRewritten = true;
             return true;
+        }
+        // ---- Identifier-audit batch: function-style ----
+        if (name == L"modinv") {   // $modinv(N,m): modular multiplicative inverse of N mod m, or -1 if none exists
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            double a = 0, m = 0; if (p.size() < 2 || !ParseNum(p[0], a) || !ParseNum(p[1], m) || m < 2) { val = L"-1"; return true; }
+            long long M = (long long)m, A = (((long long)a % M) + M) % M, t = 0, nt = 1, r = M, nr = A;
+            while (nr) { long long q = r / nr, x = t - q * nt; t = nt; nt = x; x = r - q * nr; r = nr; nr = x; }
+            if (r != 1) { val = L"-1"; return true; }
+            if (t < 0) t += M;
+            val.Format(L"%lld", t); return true;
+        }
+        if (name == L"numbits") {   // $numbits(N): bit length of |N| (see KB: equals $len($base(N,10,2)), so 0 -> 1)
+            CString a = EvalIds(w, rawArgs, params); double d; if (!ParseNum(a, d)) return false;
+            long long n = (long long)d; unsigned long long u = n < 0 ? (unsigned long long)(-n) : (unsigned long long)n; int bits = 0;
+            if (n < 0) { /* KB: negatives are "unexpected"; mirror the documented N<=-2^32 -> 1 floor */ if (n <= -4294967296LL) { val = L"1"; return true; } }
+            if (n >= 4294967296LL) { val = L"32"; return true; }
+            while (u) { bits++; u >>= 1; }
+            val.Format(L"%d", bits ? bits : 1); return true;
+        }
+        if (name == L"notags") {   // $notags(text): strips \tag\ style speech tags (the same shape /gtalk takes)
+            CString a = EvalIds(w, rawArgs, params), o; int i = 0, n = a.GetLength();
+            while (i < n) {
+                if (a[i] == L'\\') { int j = a.Find(L'\\', i + 1); if (j > i) { i = j + 1; continue; } }
+                o += a[i++];
+            }
+            val = o; return true;
+        }
+        if (name == L"ansi2mirc") {   // $ansi2mirc(text): ESC[..m SGR sequences -> mIRC colour codes (0 -> ^O reset, 1 -> bold, 4 -> underline, 30-37/90-97 fg, 40-47/100-107 bg)
+            CString a = EvalIds(w, rawArgs, params), o; int n = a.GetLength();
+            static const int map[8] = { 1, 4, 3, 8, 2, 6, 10, 0 };   // ANSI black,red,green,yellow,blue,magenta,cyan,white -> mIRC
+            for (int i = 0; i < n; i++) {
+                if (a[i] == 0x1B && i + 1 < n && a[i + 1] == L'[') {
+                    int j = i + 2; CString codes; while (j < n && a[j] != L'm' && a[j] >= 0x20 && a[j] < 0x40) codes += a[j++];
+                    if (j < n && a[j] == L'm') {
+                        int pos = 0; CString tok; if (codes.IsEmpty()) codes = L"0";
+                        while (pos >= 0) {
+                            tok = codes.Tokenize(L";", pos); if (pos < 0 && tok.IsEmpty()) break;
+                            int c = _wtoi(tok);
+                            if (c == 0) o += (wchar_t)0x0F; else if (c == 1) o += (wchar_t)0x02; else if (c == 4) o += (wchar_t)0x1F;
+                            else if (c >= 30 && c <= 37) { CString f; f.Format(L"%c%d", 3, map[c - 30]); o += f; }
+                            else if (c >= 90 && c <= 97) { CString f; f.Format(L"%c%d", 3, map[c - 90] + (map[c - 90] < 8 ? 8 : 0)); o += f; }
+                            else if (c >= 40 && c <= 47) { CString f; f.Format(L"%c,%d", 3, map[c - 40]); o += f; }
+                            if (pos < 0) break;
+                        }
+                        i = j; continue;
+                    }
+                }
+                o += a[i];
+            }
+            val = o; return true;
+        }
+        if (name == L"inellipse") {   // $inellipse(x1,y1,x,y,w,h): $true if point (x1,y1) is inside the ellipse bounded by rect x,y,w,h
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            double v[6]; if (p.size() < 6) return false; for (int i = 0; i < 6; i++) if (!ParseNum(p[i], v[i])) return false;
+            double rx = v[4] / 2, ry = v[5] / 2; if (rx <= 0 || ry <= 0) { val = L"$false"; return true; }
+            double dx = (v[0] - (v[2] + rx)) / rx, dy = (v[1] - (v[3] + ry)) / ry;
+            val = (dx * dx + dy * dy <= 1.0) ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"inroundrect") {   // $inroundrect(x1,y1,x,y,w,h,w1,h1): point in a rounded rectangle whose corners are ellipses of width w1 / height h1
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            double v[8]; if (p.size() < 8) return false; for (int i = 0; i < 8; i++) if (!ParseNum(p[i], v[i])) return false;
+            double px = v[0], py = v[1], x = v[2], y = v[3], W = v[4], H = v[5], cw = v[6] / 2, ch = v[7] / 2;
+            bool in = px >= x && px <= x + W && py >= y && py <= y + H;
+            if (in && cw > 0 && ch > 0) {
+                double cx = px < x + cw ? x + cw : (px > x + W - cw ? x + W - cw : px), cy = py < y + ch ? y + ch : (py > y + H - ch ? y + H - ch : py);
+                if (cx != px && cy != py) { double dx = (px - cx) / cw, dy = (py - cy) / ch; in = dx * dx + dy * dy <= 1.0; }
+            }
+            val = in ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"inpoly") {   // $inpoly(x,y,x1,y1,x2,y2,...): even-odd ray-casting point-in-polygon
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            if (p.size() < 8 || (p.size() & 1)) { val = L"$false"; return true; }
+            std::vector<double> v; for (auto& s2 : p) { double d; if (!ParseNum(s2, d)) return false; v.push_back(d); }
+            double px = v[0], py = v[1]; bool in = false; size_t n = (v.size() - 2) / 2;
+            for (size_t i = 0, j = n - 1; i < n; j = i++) {
+                double xi = v[2 + 2 * i], yi = v[3 + 2 * i], xj = v[2 + 2 * j], yj = v[3 + 2 * j];
+                if (((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) in = !in;
+            }
+            val = in ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"portfree") {   // $portfree(N[,ip]): $true if a TCP bind to that port succeeds right now
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            double d; if (p.empty() || !ParseNum(p[0], d) || d < 0 || d > 65535) return false;
+            SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); if (s == INVALID_SOCKET) { val = L"$false"; return true; }
+            BOOL ex = TRUE; ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&ex, sizeof(ex));
+            sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)d); a.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (p.size() > 1 && !p[1].IsEmpty()) { CStringA ia(p[1]); unsigned long ip = ::inet_addr(ia); if (ip != INADDR_NONE) a.sin_addr.s_addr = ip; }
+            bool ok = ::bind(s, (sockaddr*)&a, sizeof(a)) == 0; ::closesocket(s);
+            val = ok ? L"$true" : L"$false"; return true;
+        }
+        if (name == L"iel" || name == L"iil" || name == L"iql") {   // exception / invite / quiet lists: this client only tracks the ban list ($ibl), so these report an empty list (N=0 -> 0) rather than guess
+            std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
+            double d; val = (p.size() >= 2 && ParseNum(p[1], d) && (int)d == 0) ? CString(L"0") : CString(); return true;
+        }
+        if (name == L"lock") { val = L"$false"; return true; }   // $lock(item): no lockable-item feature in this client
+        if (name == L"isdde") { CString a = EvalIds(w, rawArgs, params); val = (a.CompareNoCase(L"mIRC") == 0) ? L"$true" : L"$false"; return true; }
+        if (name == L"com" || name == L"vcmd" || name == L"vc" || name == L"dde" || name == L"dll" || name == L"dllcall" || name == L"comcall" || name == L"comval") {
+            // COM / voice commands / DDE / DLL: none of these subsystems exist here. $com/$vcmd/$vc(0) report an empty list; the rest return nothing.
+            CString a = EvalIds(w, rawArgs, params); a.Trim();
+            val = ((name == L"com" || name == L"vcmd" || name == L"vc") && a == L"0") ? CString(L"0") : CString(); return true;
         }
         if (name == L"width" || name == L"height") {   // $width(text,font,size[,bold]) / $height(text,font,size[,bold]) -- Tetris uses both to center/right-align drawn text
             std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
@@ -9393,7 +9544,8 @@ class CMainFrame : public CMDIFrameWnd {
                 val.Format(L"%d", matchCount); return true;
             } catch (std::regex_error& re) { m_regErrStr = CA2W(re.what(), CP_ACP); return false; }
         }
-        if (name == L"regml") {   // $regml([name],N) -- the Nth backreference from the last $regex (or $regsub/$regsubex) call under that name; N=0 returns the total backreference count. The optional trailing &binvar form (copy into a binary variable) isn't implemented.
+        if (name == L"regml" || name == L"regbr") {   // $regbr is the deprecated name for $regml
+          // $regml([name],N) -- the Nth backreference from the last $regex (or $regsub/$regsubex) call under that name; N=0 returns the total backreference count. The optional trailing &binvar form (copy into a binary variable) isn't implemented.
             CString a = EvalIds(w, rawArgs, params);
             CString matchName, nStr;
             int c = a.ReverseFind(L',');
@@ -9671,7 +9823,7 @@ class CMainFrame : public CMDIFrameWnd {
             }
             return false;
         }
-        if (name == L"color") {   // $color(N) -- the packed RGB of mIRC's numbered colour-palette entry N (0-98), in the same layout $rgb()/drawrect/$getdot all use, so round-tripping a colour through a hash table (as PixelEditor.mrc's pe.colours/pe.mirc tables do: hadd pe.colours $rgb($color(%c)) $color(%c)) comes back out consistently. A handful of UI scheme keywords are also recognized; anything else falls through unevaluated like any other unrecognized identifier.
+        if (name == L"color" || name == L"colour") {   // $color(N) -- the packed RGB of mIRC's numbered colour-palette entry N (0-98), in the same layout $rgb()/drawrect/$getdot all use, so round-tripping a colour through a hash table (as PixelEditor.mrc's pe.colours/pe.mirc tables do: hadd pe.colours $rgb($color(%c)) $color(%c)) comes back out consistently. A handful of UI scheme keywords are also recognized; anything else falls through unevaluated like any other unrecognized identifier.
             CString a = EvalIds(w, rawArgs, params);
             double nD;
             if (ParseNum(a, nD)) {
@@ -10183,7 +10335,7 @@ class CMainFrame : public CMDIFrameWnd {
             else val = it->second[idx].mark;
             return true;
         }
-        if (name == L"ibl") {   // $ibl(#chan,N)[.by/.date/.ctime] -- the Nth tracked ban-list entry for that channel (via /channel's internal ban list, numeric 367/368 and live +b/-b MODE changes); N=0 is the count
+        if (name == L"ibl" || name == L"banlist") {   // ($banlist is the documented newer name for $ibl) $ibl(#chan,N)[.by/.date/.ctime] -- the Nth tracked ban-list entry for that channel (via /channel's internal ban list, numeric 367/368 and live +b/-b MODE changes); N=0 is the count
             Net* net = (w && w->net) ? w->net : nullptr;
             std::vector<CString> p; for (auto& raw : SplitTopLevelCommasParen(rawArgs)) p.push_back(EvalIds(w, raw, params));
             if (p.size() < 2) return false;
@@ -14637,6 +14789,11 @@ class CMainFrame : public CMDIFrameWnd {
             else Send(net, arg);
         }
         else if (cmd == L"quote") Send(net, arg);
+        else if (cmd == L"kill") {   // /kill <nick> [reason] -- IRC operators only. Had no handler at all, so it fell through to the raw-server catch-all and sent "KILL nick reason words :)" with NO ':' before the reason: a server takes only the FIRST word after the nick as the reason, and a reason that itself contains ':' (a smiley) gets split at the wrong place. The reason is now always sent as proper trailing text, exactly like /kick's.
+            CString reason = arg, target = Word(reason); reason.Trim();   // Word() consumes its argument in place, leaving just the reason behind
+            if (target.IsEmpty()) { Show(w, L"* /kill: usage: /kill <nick> [reason]", cPart); return; }
+            Send(net, L"KILL " + target + L" :" + (reason.IsEmpty() ? CString(L"Killed") : reason));
+        }
         // ---------------- mIRC command-reference pass: everything below was added to cover the standard mIRC
         // command list, skipping only what has no supporting feature in this client at all (see the chat reply
         // for the full list of what's skipped and why -- DCC, treebar, URL-list window, per-window transparency,
@@ -15620,7 +15777,7 @@ class CMainFrame : public CMDIFrameWnd {
         }
         else if (cmd == L"flushini") { arg.Trim(); if (!arg.IsEmpty()) WritePrivateProfileStringW(nullptr, nullptr, nullptr, arg); }
         else if (cmd == L"saveini") { SaveOpts(); SaveAliases(); SaveVars(); SavePopups(); SaveRemote(); SaveLogging(); Show(w, L"* Settings saved.", cInfo); }
-        else if (cmd == L"emailaddr") { arg.Trim(); net->o.email = arg; Show(w, L"* Email address set to " + arg, cInfo); }
+        else if (cmd == L"emailaddr") { arg.Trim(); if (net) net->o.email = arg; m_defOpts.email = arg; SaveOpts(); Show(w, L"* Email address set to " + arg, cInfo); }
         else if (cmd == L"fullname") { arg.Trim(); net->o.real = arg; m_defOpts.real = arg; SaveOpts(); Show(w, L"* Full name set to " + arg, cInfo); }
         else if (cmd == L"username") {   // real mIRC: sets the username/ident field in the Connect dialog; with no parameter it instead reports the email address (an odd, but documented, real-mIRC quirk -- not this implementation's own invention)
             arg.Trim();
@@ -16315,6 +16472,8 @@ class CMainFrame : public CMDIFrameWnd {
             size_t last = hasT ? p.size() - 1 : p.size();   // the trailing "are supported by this server" isn't a token
             for (size_t i = 1; i < last; i++) {
                 if (p[i].Left(8).CompareNoCase(L"NETWORK=") == 0) net->network = p[i].Mid(8);
+                if (p[i].Left(10).CompareNoCase(L"CHANTYPES=") == 0) net->chantypes = p[i].Mid(10);
+                if (p[i].Left(6).CompareNoCase(L"MODES=") == 0) net->modespl = _wtoi(p[i].Mid(6));
                 if (p[i].Left(10).CompareNoCase(L"CHANMODES=") == 0) net->chanmodes = p[i].Mid(10);   // e.g. beI,k,l,imnpst  (a comma-separated four groups)
                 if (p[i].Left(7).CompareNoCase(L"PREFIX=") == 0) {   // e.g. PREFIX=(qaohv)~&@%+ -- the parenthesized half is the mode letters ($nickmode), the rest is their matching symbols, same positional order -- used to find the owner/help letters dynamically in FireModeEvents
                     CString pf = p[i].Mid(7);
@@ -20743,7 +20902,7 @@ class CMainFrame : public CMDIFrameWnd {
         CWinApp* a = AfxGetApp();
         m_defOpts.host = a->GetProfileString(L"Conn", L"Host", m_defOpts.host); m_defOpts.port = a->GetProfileInt(L"Conn", L"Port", m_defOpts.port);
         m_defOpts.nick = a->GetProfileString(L"Conn", L"Nick", m_defOpts.nick); m_defOpts.anick = a->GetProfileString(L"Conn", L"AltNick", m_defOpts.anick); m_defOpts.user = a->GetProfileString(L"Conn", L"User", m_defOpts.user);
-        m_defOpts.real = a->GetProfileString(L"Conn", L"Real", m_defOpts.real); m_defOpts.autojoin = a->GetProfileString(L"Conn", L"Join", m_defOpts.autojoin);
+        m_defOpts.real = a->GetProfileString(L"Conn", L"Real", m_defOpts.real); m_defOpts.email = a->GetProfileString(L"Conn", L"Email", m_defOpts.email); m_defOpts.autojoin = a->GetProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         m_defOpts.tls = a->GetProfileInt(L"Conn", L"TLS", 0); m_defOpts.lax = a->GetProfileInt(L"Conn", L"Lax", 0);
         m_swPos = a->GetProfileInt(L"Conn", L"SwPos", a->GetProfileInt(L"Conn", L"SwTop", 1) != 0 ? 0 : 1);   // falls back to the old SwTop bool if SwPos was never saved, so existing ini files upgrade smoothly
         m_barsLocked = a->GetProfileInt(L"Conn", L"BarsLocked", 0) != 0;
@@ -20753,7 +20912,7 @@ class CMainFrame : public CMDIFrameWnd {
         CWinApp* a = AfxGetApp();
         a->WriteProfileString(L"Conn", L"Host", m_defOpts.host); a->WriteProfileInt(L"Conn", L"Port", m_defOpts.port);
         a->WriteProfileString(L"Conn", L"Nick", m_defOpts.nick); a->WriteProfileString(L"Conn", L"AltNick", m_defOpts.anick); a->WriteProfileString(L"Conn", L"User", m_defOpts.user);
-        a->WriteProfileString(L"Conn", L"Real", m_defOpts.real); a->WriteProfileString(L"Conn", L"Join", m_defOpts.autojoin);
+        a->WriteProfileString(L"Conn", L"Real", m_defOpts.real); a->WriteProfileString(L"Conn", L"Email", m_defOpts.email); a->WriteProfileString(L"Conn", L"Join", m_defOpts.autojoin);
         a->WriteProfileInt(L"Conn", L"TLS", m_defOpts.tls); a->WriteProfileInt(L"Conn", L"Lax", m_defOpts.lax);
     }
     void LoadBookmarks() {   // servers.ini is separate from MiniIRC.ini � a plain bookmark list, not app settings
@@ -20771,6 +20930,7 @@ class CMainFrame : public CMDIFrameWnd {
             GetPrivateProfileStringW(sec, L"AltNick", L"", buf, 256, path); e.o.anick = buf;
             GetPrivateProfileStringW(sec, L"User", L"irc", buf, 256, path); e.o.user = buf;
             GetPrivateProfileStringW(sec, L"Real", L"IRC user", buf, 256, path); e.o.real = buf;
+            GetPrivateProfileStringW(sec, L"Email", L"", buf, 256, path); e.o.email = buf;
             GetPrivateProfileStringW(sec, L"Join", L"", buf, 256, path); e.o.autojoin = buf;
             e.o.tls = GetPrivateProfileIntW(sec, L"TLS", 0, path); e.o.lax = GetPrivateProfileIntW(sec, L"Lax", 0, path);
             if (!e.name.IsEmpty() || !e.o.host.IsEmpty()) m_bookmarks.push_back(e);
@@ -20786,7 +20946,7 @@ class CMainFrame : public CMDIFrameWnd {
             WritePrivateProfileStringW(sec, L"Name", e.name, path); WritePrivateProfileStringW(sec, L"Host", e.o.host, path);
             CString ps; ps.Format(L"%d", e.o.port); WritePrivateProfileStringW(sec, L"Port", ps, path);
             WritePrivateProfileStringW(sec, L"Nick", e.o.nick, path); WritePrivateProfileStringW(sec, L"AltNick", e.o.anick, path); WritePrivateProfileStringW(sec, L"User", e.o.user, path);
-            WritePrivateProfileStringW(sec, L"Real", e.o.real, path); WritePrivateProfileStringW(sec, L"Join", e.o.autojoin, path);
+            WritePrivateProfileStringW(sec, L"Real", e.o.real, path); WritePrivateProfileStringW(sec, L"Email", e.o.email, path); WritePrivateProfileStringW(sec, L"Join", e.o.autojoin, path);
             WritePrivateProfileStringW(sec, L"TLS", e.o.tls ? L"1" : L"0", path); WritePrivateProfileStringW(sec, L"Lax", e.o.lax ? L"1" : L"0", path);
         }
     }
@@ -21469,7 +21629,9 @@ public:
         Note(net, L"IRC ready. Not connected use File > Connect, the toolbar, or /server [-m] host [+port] to connect. "
              L"Ctrl+K/B/U/O/I insert color/bold/underline/reset/italic codes.");
         FireScriptLoadEvent(startupStatus, L"LOAD", CString());   // real mIRC fires on LOAD for every script already in the Remote file list when mIRC itself starts, before any server connection -- sourceFile empty means every script, not just one
+        m_starting = true;
         FireScriptLoadEvent(startupStatus, L"START", CString(), true);   // on START: same startup moment as on LOAD above, capped at one handler per script file (see FireScriptLoadEvent's onePerFile)
+        m_starting = false;
     }
 };
 
